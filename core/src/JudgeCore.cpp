@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -46,7 +47,6 @@ struct ProcessResult {
 struct ProblemSettings {
     std::uint64_t time_limit_ms = 1000;
     std::uint64_t memory_limit_mb = 256;
-    std::uint64_t stack_limit_mb = 64;
     double default_points = 1.0;
     std::string checker = "token";
     std::map<std::string, double> test_points;
@@ -238,7 +238,8 @@ ProcessResult run_command(const std::string& command,
                           const fs::path* stderr_path,
                           std::uint64_t timeout_ms,
                           std::uint64_t memory_limit_mb = 0,
-                          std::uint64_t stack_limit_mb = 0) {
+                          std::uint64_t stack_limit_mb = 0,
+                          const std::function<bool()>& should_cancel = {}) {
     fs::path absolute_working_dir;
     fs::path absolute_stdin;
     fs::path absolute_stdout;
@@ -308,6 +309,12 @@ ProcessResult run_command(const std::string& command,
 
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
+        if (should_cancel && should_cancel()) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            throw std::runtime_error("judging cancelled");
+        }
         if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
             timed_out = true;
             kill(-pid, SIGKILL);
@@ -375,7 +382,8 @@ ProcessResult run_command(const std::string& command,
 
     PROCESS_INFORMATION pi{};
     std::string cmd = "cmd.exe /C " + command;
-    BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+    BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW | CREATE_SUSPENDED,
                              nullptr, working_dir ? working_dir->string().c_str() : nullptr, &si, &pi);
     if (!ok) {
         if (opened_stdin != INVALID_HANDLE_VALUE) CloseHandle(opened_stdin);
@@ -384,11 +392,47 @@ ProcessResult run_command(const std::string& command,
         throw std::runtime_error("CreateProcess failed");
     }
 
-    DWORD wait_ms = timeout_ms == 0 ? INFINITE : static_cast<DWORD>(timeout_ms);
-    DWORD wait_result = WaitForSingleObject(pi.hProcess, wait_ms);
-    bool timed_out = wait_result == WAIT_TIMEOUT;
+    HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    bool has_job = job != nullptr && AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+
+    bool timed_out = false;
+    while (true) {
+        DWORD wait_result = WaitForSingleObject(pi.hProcess, 50);
+        if (wait_result == WAIT_OBJECT_0) {
+            break;
+        }
+        if (wait_result != WAIT_TIMEOUT) {
+            break;
+        }
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
+        if (should_cancel && should_cancel()) {
+            if (has_job) {
+                TerminateJobObject(job, 125);
+            } else {
+                TerminateProcess(pi.hProcess, 125);
+            }
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (job) CloseHandle(job);
+            if (opened_stdin != INVALID_HANDLE_VALUE) CloseHandle(opened_stdin);
+            if (opened_stdout != INVALID_HANDLE_VALUE) CloseHandle(opened_stdout);
+            if (opened_stderr != INVALID_HANDLE_VALUE) CloseHandle(opened_stderr);
+            throw std::runtime_error("judging cancelled");
+        }
+        if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
+            timed_out = true;
+            break;
+        }
+    }
     if (timed_out) {
-        TerminateProcess(pi.hProcess, 124);
+        if (has_job) {
+            TerminateJobObject(job, 124);
+        } else {
+            TerminateProcess(pi.hProcess, 124);
+        }
         WaitForSingleObject(pi.hProcess, INFINITE);
     }
 
@@ -396,6 +440,7 @@ ProcessResult run_command(const std::string& command,
     GetExitCodeProcess(pi.hProcess, &exit_code);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    if (job) CloseHandle(job);
     if (opened_stdin != INVALID_HANDLE_VALUE) CloseHandle(opened_stdin);
     if (opened_stdout != INVALID_HANDLE_VALUE) CloseHandle(opened_stdout);
     if (opened_stderr != INVALID_HANDLE_VALUE) CloseHandle(opened_stderr);
@@ -413,7 +458,8 @@ ProcessResult run_program(const std::vector<std::string>& args,
                           const fs::path* stderr_path,
                           std::uint64_t timeout_ms,
                           std::uint64_t memory_limit_mb,
-                          std::uint64_t stack_limit_mb = 0) {
+                          std::uint64_t stack_limit_mb = 0,
+                          const std::function<bool()>& should_cancel = {}) {
     if (args.empty() || args.front().empty()) {
         throw std::runtime_error("empty program command");
     }
@@ -483,6 +529,12 @@ ProcessResult run_program(const std::vector<std::string>& args,
 
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
+        if (should_cancel && should_cancel()) {
+            kill(-pid, SIGKILL);
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            throw std::runtime_error("judging cancelled");
+        }
         if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
             timed_out = true;
             kill(-pid, SIGKILL);
@@ -516,7 +568,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
         command += quote_path(arg);
     }
     return run_command(command, working_dir, nullptr, stdout_path, stderr_path, timeout_ms,
-                       memory_limit_mb, stack_limit_mb);
+                       memory_limit_mb, stack_limit_mb, should_cancel);
 #endif
 }
 
@@ -555,6 +607,11 @@ std::string quote_command_token(const std::string& token) {
     if (token.empty() || has_shell_metachar(token)) {
         throw std::runtime_error("unsafe compiler setting: " + token);
     }
+#ifdef _WIN32
+    if (token.find_first_of(" \t\"") == std::string::npos) {
+        return token;
+    }
+#endif
     return quote_path(fs::path(token));
 }
 
@@ -565,6 +622,43 @@ std::string quote_command_tokens(const std::vector<std::string>& values) {
             result += ' ';
         }
         result += quote_command_token(value);
+    }
+    return result;
+}
+
+std::string stack_compile_flags(const std::string& compiler, std::uint64_t stack_limit_mb) {
+    if (stack_limit_mb == 0) {
+        return {};
+    }
+
+#ifdef _WIN32
+    constexpr std::uint64_t bytes_per_mb = 1024ULL * 1024ULL;
+    std::string lower_compiler = lower_ascii(fs::path(compiler).filename().string());
+    std::uint64_t bytes = stack_limit_mb * bytes_per_mb;
+    if (lower_compiler == "cl" || lower_compiler == "cl.exe") {
+        return quote_command_token("/F" + std::to_string(bytes)) + " " +
+               quote_command_token("/link") + " " +
+               quote_command_token("/STACK:" + std::to_string(bytes));
+    }
+    return quote_command_token("-Wl,--stack," + std::to_string(bytes));
+#else
+    (void)compiler;
+    (void)stack_limit_mb;
+    return {};
+#endif
+}
+
+std::string stack_guard_compile_flags(const std::string& compiler, std::uint64_t stack_limit_mb) {
+    if (stack_limit_mb == 0) {
+        return {};
+    }
+    std::string result = stack_compile_flags(compiler, stack_limit_mb);
+    std::string lower_compiler = lower_ascii(fs::path(compiler).filename().string());
+    if (lower_compiler != "cl" && lower_compiler != "cl.exe") {
+        if (!result.empty()) {
+            result += ' ';
+        }
+        result += quote_command_token("-fno-optimize-sibling-calls");
     }
     return result;
 }
@@ -951,9 +1045,11 @@ fs::path compile_checker(const ProblemSettings& settings,
     fs::path compile_log = problem_dir / "checker-compile.err";
     std::string compile_cmd = quote_command_token(options.compiler) + " " +
                               quote_command_tokens(split_words(options.compile_flags)) + " " +
+                              stack_guard_compile_flags(options.compiler, options.stack_limit_mb) + " " +
                               "-I " + quote_path(options.testlib_dir) + " " +
                               quote_path(checker_source) + " -o " + quote_path(checker_executable);
-    ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log, 0);
+    ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log,
+                                        0, 0, 0, options.should_cancel);
     if (compile.exit_code != 0) {
         throw std::runtime_error("checker compile failed: " + read_checker_message(compile_log));
     }
@@ -972,7 +1068,6 @@ void write_default_problem_settings(const fs::path& settings_path,
     out << "# NeoThemis problem settings\n"
         << "time_limit_ms=1000\n"
         << "memory_limit_mb=256\n"
-        << "stack_limit_mb=64\n"
         << "default_points=1\n"
         << "checker=token\n"
         << "\n"
@@ -1012,7 +1107,8 @@ void apply_problem_setting(ProblemSettings& settings,
     } else if (key == "memory_limit_mb") {
         settings.memory_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
     } else if (key == "stack_limit_mb") {
-        settings.stack_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
+        (void)value;
+        // Legacy per-problem stack settings are ignored; stack_limit_mb is contest-wide.
     } else if (key == "default_points") {
         settings.default_points = std::stod(value);
     } else if (key == "checker") {
@@ -1131,8 +1227,10 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
     fs::path compile_log = build_dir / "compile.err";
     std::string compile_cmd = quote_command_token(options.compiler) + " " +
                               quote_command_tokens(split_words(options.compile_flags)) + " " +
+                              stack_guard_compile_flags(options.compiler, options.stack_limit_mb) + " " +
                               quote_path(source) + " -o " + quote_path(prepared.executable);
-    ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log, 0);
+    ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log,
+                                        0, 0, 0, options.should_cancel);
     if (compile.exit_code != 0) {
         prepared.immediate_results =
             rows_for_problem_tests(prepared.contestant, problem, Verdict::CompileError,
@@ -1145,7 +1243,7 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
     return prepared;
 }
 
-TestResult judge_test_job(const TestJob& job) {
+TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
     const ProblemContext& problem = *job.problem;
     std::string test_name = job.test.path().filename().string();
     fs::path input = find_test_file(job.test.path(), problem.name, ".inp");
@@ -1180,7 +1278,8 @@ TestResult judge_test_job(const TestJob& job) {
     ProcessResult run = run_program({executable_path.string()}, &run_dir, nullptr, &run_log,
                                     problem.settings.time_limit_ms,
                                     problem.settings.memory_limit_mb,
-                                    problem.settings.stack_limit_mb);
+                                    options.stack_limit_mb,
+                                    options.should_cancel);
     row.time_ms = run.elapsed_ms;
     row.exit_code = run.exit_code;
     if (run.timed_out) {
@@ -1214,7 +1313,8 @@ TestResult judge_test_job(const TestJob& job) {
                 ProcessResult retry = run_program({executable_path.string()}, &run_dir, nullptr,
                                                   &run_log, problem.settings.time_limit_ms,
                                                   problem.settings.memory_limit_mb,
-                                                  problem.settings.stack_limit_mb);
+                                                  options.stack_limit_mb,
+                                                  options.should_cancel);
                 fs::path retry_actual = retry.exit_code == 0 && !retry.timed_out &&
                                                 !retry.memory_exceeded
                                             ? find_actual_output(run_dir, problem.name, test_name)
@@ -1245,7 +1345,8 @@ TestResult judge_test_job(const TestJob& job) {
                             &run_dir, &checker_stdout, &checker_stderr,
                             problem.settings.time_limit_ms,
                             problem.settings.memory_limit_mb,
-                            problem.settings.stack_limit_mb);
+                            options.stack_limit_mb,
+                            options.should_cancel);
             row.exit_code = checker.exit_code;
             row.message = first_existing_file_text({checker_stdout, checker_stderr});
             if (checker.timed_out) {
@@ -1326,6 +1427,9 @@ public:
         std::vector<TestResult> results;
         std::vector<ProblemContext> problems;
         for (const auto& problem_entry : sorted_directories(tests_root)) {
+            if (options.should_cancel && options.should_cancel()) {
+                throw std::runtime_error("judging cancelled");
+            }
             ProblemContext problem;
             problem.name = problem_entry.path().filename().string();
             if (!selection_allows(options.selected_problems, problem.name)) {
@@ -1357,6 +1461,12 @@ public:
         prepare_state.total_jobs = contestants.size() * problems.size();
         ProgressState progress_state;
 
+        auto publish_result = [&](const TestResult& result) {
+            if (options.result) {
+                options.result(result);
+            }
+        };
+
         auto run_contestant_jobs = [&](std::vector<TestJob> contestant_jobs) {
             if (contestant_jobs.empty()) {
                 return;
@@ -1381,41 +1491,59 @@ public:
             }
 
             std::mutex jobs_mutex;
+            std::mutex worker_error_mutex;
+            std::exception_ptr worker_error;
+            std::atomic<bool> stop_workers{false};
             std::atomic<bool> progress_done{false};
             auto worker = [&](unsigned int worker_id) {
-                while (true) {
-                    TestJob job;
-                    {
-                        std::lock_guard<std::mutex> lock(jobs_mutex);
-                        if (jobs.empty()) {
+                try {
+                    while (true) {
+                        if (stop_workers.load() ||
+                            (options.should_cancel && options.should_cancel())) {
                             std::lock_guard<std::mutex> progress_lock(progress_mutex);
                             progress_state.worker_labels[worker_id - 1] = "done";
                             return;
                         }
-                        job = jobs.front();
-                        jobs.pop();
-                    }
+                        TestJob job;
+                        {
+                            std::lock_guard<std::mutex> lock(jobs_mutex);
+                            if (jobs.empty()) {
+                                std::lock_guard<std::mutex> progress_lock(progress_mutex);
+                                progress_state.worker_labels[worker_id - 1] = "done";
+                                return;
+                            }
+                            job = jobs.front();
+                            jobs.pop();
+                        }
 
-                    std::string label = job.contestant + "/" + job.problem->name + "/" +
-                                        job.test.path().filename().string();
-                    {
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        progress_state.worker_labels[worker_id - 1] = label;
-                    }
+                        std::string label = job.contestant + "/" + job.problem->name + "/" +
+                                            job.test.path().filename().string();
+                        {
+                            std::lock_guard<std::mutex> lock(progress_mutex);
+                            progress_state.worker_labels[worker_id - 1] = label;
+                        }
 
-                    TestResult job_result = judge_test_job(job);
-                    if (!options.keep_workdir) {
-                        std::error_code ignored;
-                        fs::remove_all(job.executable.parent_path() /
-                                       job.test.path().filename(), ignored);
+                        TestResult job_result = judge_test_job(job, options);
+                        if (!options.keep_workdir) {
+                            std::error_code ignored;
+                            fs::remove_all(job.executable.parent_path() /
+                                           job.test.path().filename(), ignored);
+                        }
+                        publish_result(job_result);
+                        {
+                            std::lock_guard<std::mutex> lock(results_mutex);
+                            results.push_back(std::move(job_result));
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(progress_mutex);
+                            ++progress_state.completed_jobs;
+                        }
                     }
-                    {
-                        std::lock_guard<std::mutex> lock(results_mutex);
-                        results.push_back(std::move(job_result));
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        ++progress_state.completed_jobs;
+                } catch (...) {
+                    stop_workers.store(true);
+                    std::lock_guard<std::mutex> lock(worker_error_mutex);
+                    if (!worker_error) {
+                        worker_error = std::current_exception();
                     }
                 }
             };
@@ -1448,9 +1576,15 @@ public:
             if (progress_monitor.joinable()) {
                 progress_monitor.join();
             }
+            if (worker_error) {
+                std::rethrow_exception(worker_error);
+            }
         };
 
         for (const auto& contestant : contestants) {
+            if (options.should_cancel && options.should_cancel()) {
+                throw std::runtime_error("judging cancelled");
+            }
             std::vector<PrepTask> prep_tasks;
             for (const auto& problem : problems) {
                 prep_tasks.push_back(PrepTask{&contestant, &problem});
@@ -1467,42 +1601,62 @@ public:
                 }
                 std::atomic<std::size_t> next_prep_task{0};
                 std::atomic<bool> prepare_progress_done{false};
+                std::atomic<bool> stop_prepare_workers{false};
                 std::mutex contestant_jobs_mutex;
+                std::mutex prepare_error_mutex;
+                std::exception_ptr prepare_error;
 
                 auto prepare_worker = [&](unsigned int worker_id) {
-                    while (true) {
-                        std::size_t index = next_prep_task.fetch_add(1);
-                        if (index >= prep_tasks.size()) {
-                            std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
-                            prepare_state.worker_labels[worker_id - 1] = "done";
-                            return;
-                        }
+                    try {
+                        while (true) {
+                            if (stop_prepare_workers.load() ||
+                                (options.should_cancel && options.should_cancel())) {
+                                std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                                prepare_state.worker_labels[worker_id - 1] = "done";
+                                return;
+                            }
+                            std::size_t index = next_prep_task.fetch_add(1);
+                            if (index >= prep_tasks.size()) {
+                                std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                                prepare_state.worker_labels[worker_id - 1] = "done";
+                                return;
+                            }
 
-                        const PrepTask& task = prep_tasks[index];
-                        {
-                            std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
-                            prepare_state.worker_labels[worker_id - 1] =
-                                task.contestant->name + "/" + task.problem->name;
-                        }
+                            const PrepTask& task = prep_tasks[index];
+                            {
+                                std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                                prepare_state.worker_labels[worker_id - 1] =
+                                    task.contestant->name + "/" + task.problem->name;
+                            }
 
-                        PreparedSubmission prepared =
-                            prepare_submission(options, work_root, *task.contestant, *task.problem);
-                        {
-                            std::lock_guard<std::mutex> lock(results_mutex);
-                            results.insert(results.end(), prepared.immediate_results.begin(),
-                                           prepared.immediate_results.end());
-                        }
-                        if (prepared.ready) {
-                            std::lock_guard<std::mutex> lock(contestant_jobs_mutex);
-                            for (const auto& test : task.problem->tests) {
-                                contestant_jobs.push_back(
-                                    TestJob{prepared.contestant, task.problem, test,
-                                            prepared.executable});
+                            PreparedSubmission prepared =
+                                prepare_submission(options, work_root, *task.contestant, *task.problem);
+                            for (const auto& result : prepared.immediate_results) {
+                                publish_result(result);
+                            }
+                            {
+                                std::lock_guard<std::mutex> lock(results_mutex);
+                                results.insert(results.end(), prepared.immediate_results.begin(),
+                                               prepared.immediate_results.end());
+                            }
+                            if (prepared.ready) {
+                                std::lock_guard<std::mutex> lock(contestant_jobs_mutex);
+                                for (const auto& test : task.problem->tests) {
+                                    contestant_jobs.push_back(
+                                        TestJob{prepared.contestant, task.problem, test,
+                                                prepared.executable});
+                                }
+                            }
+                            {
+                                std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                                ++prepare_state.completed_jobs;
                             }
                         }
-                        {
-                            std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
-                            ++prepare_state.completed_jobs;
+                    } catch (...) {
+                        stop_prepare_workers.store(true);
+                        std::lock_guard<std::mutex> lock(prepare_error_mutex);
+                        if (!prepare_error) {
+                            prepare_error = std::current_exception();
                         }
                     }
                 };
@@ -1534,6 +1688,9 @@ public:
                 prepare_progress_done.store(true);
                 if (prepare_progress_monitor.joinable()) {
                     prepare_progress_monitor.join();
+                }
+                if (prepare_error) {
+                    std::rethrow_exception(prepare_error);
                 }
             }
             run_contestant_jobs(std::move(contestant_jobs));

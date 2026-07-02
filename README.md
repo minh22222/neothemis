@@ -57,6 +57,7 @@ keep_workdir=false
 compiler=g++
 compile_flags=-std=c++17 -O2 -pipe
 testlib_dir=testlib
+stack_limit_mb=64
 parallel_jobs=0
 
 forbidden_pattern=system(
@@ -111,6 +112,13 @@ The path may be absolute or relative. Relative paths are searched from the
 contest folder, the current working directory, and the parent of the current
 working directory. If the testlib repository was cloned as `testlib/testlib/`,
 NeoThemis uses that nested folder automatically.
+
+`stack_limit_mb`
+: Contest-wide maximum stack size, in megabytes. Default: `64`. Use `0` to
+disable the stack limit. On Linux this is enforced at runtime with
+`RLIMIT_STACK`; NeoThemis also appends `-fno-optimize-sibling-calls` when a
+stack limit is enabled so simple recursive submissions cannot be optimized into
+a loop. On Windows, supported compilers receive a stack reserve linker flag.
 
 `parallel_jobs`
 : Number of worker jobs used for compilation preparation and test judging.

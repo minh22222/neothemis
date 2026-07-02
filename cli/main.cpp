@@ -70,6 +70,10 @@ void print_contest_config_reference(std::ostream& out) {
         << "      Compiler flags used for submissions and checkers.\n"
         << "  testlib_dir=testlib\n"
         << "      Folder containing testlib.h and checkers/. Relative paths also search cwd and cwd/..\n"
+        << "  stack_limit_mb=64\n"
+        << "      Contest-wide maximum stack size in megabytes. Use 0 for unlimited.\n"
+        << "      Linux enforces this at runtime with RLIMIT_STACK and disables sibling-call optimization.\n"
+        << "      Windows passes a compiler/linker stack reserve flag where supported.\n"
         << "  parallel_jobs=0\n"
         << "      Worker count for compile preparation and judging. 0 auto-detects CPU cores.\n"
         << "  forbidden_pattern=<text>\n"
@@ -82,8 +86,6 @@ void print_problem_config_reference(std::ostream& out) {
         << "      Per-test runtime limit in milliseconds. Custom checkers use this limit too.\n"
         << "  memory_limit_mb=256\n"
         << "      Per-test memory limit in megabytes. Use 0 for unlimited.\n"
-        << "  stack_limit_mb=64\n"
-        << "      Per-test stack limit in megabytes. Use 0 for unlimited.\n"
         << "  default_points=1\n"
         << "      Points for each accepted test unless test_points.<test> overrides it.\n"
         << "  checker=token\n"
@@ -255,6 +257,7 @@ void write_default_settings(const fs::path& settings_path) {
         << "compiler=g++\n"
         << "compile_flags=-std=c++17 -O2 -pipe\n"
         << "testlib_dir=testlib\n"
+        << "stack_limit_mb=64\n"
         << "parallel_jobs=0\n"
         << "\n"
         << "# Submissions containing these text patterns are rejected with SV.\n";
@@ -319,6 +322,8 @@ void apply_setting(neothemis::JudgeOptions& options,
         options.compile_flags = value;
     } else if (key == "testlib_dir") {
         options.testlib_dir = value;
+    } else if (key == "stack_limit_mb") {
+        options.stack_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
     } else if (key == "parallel_jobs") {
         options.parallel_jobs = static_cast<unsigned int>(std::stoul(value));
     } else if (key == "forbidden_pattern") {
@@ -542,7 +547,6 @@ int handle_config(int argc, char** argv) {
         }
         out << "time_limit_ms=1000\n"
             << "memory_limit_mb=256\n"
-            << "stack_limit_mb=64\n"
             << "default_points=1\n"
             << "checker=token\n";
     }

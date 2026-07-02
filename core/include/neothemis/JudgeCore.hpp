@@ -22,6 +22,8 @@ enum class Verdict {
     InternalError
 };
 
+struct TestResult;
+
 struct JudgeOptions {
     std::filesystem::path contest_root;
     std::filesystem::path contestants_dir = "contestants";
@@ -32,11 +34,14 @@ struct JudgeOptions {
     std::string compiler = "g++";
     std::string compile_flags = "-std=c++17 -O2 -pipe";
     std::filesystem::path testlib_dir = "testlib";
+    std::uint64_t stack_limit_mb = 64;
     unsigned int parallel_jobs = 0;
     std::vector<std::string> selected_problems;
     std::vector<std::string> selected_contestants;
     std::vector<std::string> forbidden_patterns;
     std::function<void(const std::string&)> progress;
+    std::function<void(const TestResult&)> result;
+    std::function<bool()> should_cancel;
     bool keep_workdir = false;
 };
 
