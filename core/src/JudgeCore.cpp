@@ -610,6 +610,10 @@ fs::path find_case_insensitive_file(const fs::path& dir, const std::set<std::str
 fs::path find_actual_output(const fs::path& run_dir,
                             const std::string& problem,
                             const std::string& test_name) {
+    if (!fs::exists(run_dir) || !fs::is_directory(run_dir)) {
+        return {};
+    }
+
     std::set<std::string> candidates;
     auto add_output_names = [&](const std::string& stem) {
         if (stem.empty()) {
@@ -636,7 +640,12 @@ fs::path find_actual_output(const fs::path& run_dir,
     }
 
     std::vector<fs::path> out_files;
-    for (const auto& entry : fs::directory_iterator(run_dir)) {
+    std::error_code iter_ec;
+    fs::directory_iterator begin(run_dir, iter_ec);
+    if (iter_ec) {
+        return {};
+    }
+    for (const auto& entry : begin) {
         std::error_code ec;
         if (!fs::is_symlink(entry.symlink_status(ec)) &&
             entry.is_regular_file() &&
@@ -865,14 +874,20 @@ fs::path compile_checker(const ProblemSettings& settings,
     fs::path checker_executable = problem_dir / "checker";
 #endif
     if (fs::exists(checker_executable)) {
+        std::error_code checker_time_ec;
+        std::error_code source_time_ec;
+        auto checker_time = fs::last_write_time(checker_executable, checker_time_ec);
+        auto source_time = fs::last_write_time(checker_source, source_time_ec);
+        if (!checker_time_ec && !source_time_ec && checker_time >= source_time) {
 #ifndef _WIN32
-        std::error_code ec;
-        fs::permissions(checker_executable,
-                        fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
-                        fs::perm_options::add,
-                        ec);
+            std::error_code ec;
+            fs::permissions(checker_executable,
+                            fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                            fs::perm_options::add,
+                            ec);
 #endif
-        return checker_executable;
+            return checker_executable;
+        }
     }
 
     fs::path compile_log = problem_dir / "checker-compile.err";
