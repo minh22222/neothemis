@@ -323,6 +323,9 @@ private:
         settings_menu->addAction("Application Settings", [this]() { open_settings_dialog(0); });
         settings_menu->addAction("Contest Config", [this]() { open_settings_dialog(1); });
         settings_menu->addAction("Problem Config", [this]() { open_settings_dialog(2); });
+
+        auto* help_menu = bar->addMenu("Help");
+        help_menu->addAction("About", [this]() { show_about_dialog(); });
     }
 
     void apply_dark_theme() {
@@ -345,18 +348,18 @@ private:
             QMenuBar {
                 background: transparent; border: 0; padding: 0;
             }
-            QMenuBar::item { background: transparent; padding: 6px 12px; border-radius: 2px; }
+            QMenuBar::item { background: transparent; padding: 6px 12px; border-radius: 4px; }
             QMenuBar::item:selected {
                 background: #1c2b34; color: #7df9ff; border-bottom: 1px solid #ff2a6d;
             }
             QToolButton#WindowButton, QToolButton#WindowCloseButton {
                 background: transparent; border: 1px solid transparent; color: #cbd5e1;
-                min-width: 34px; min-height: 26px; border-radius: 2px; font-weight: 700;
+                min-width: 34px; min-height: 26px; border-radius: 4px; font-weight: 700;
             }
             QToolButton#WindowButton:hover { background: #1d2732; border-color: #2de2e6; color: #f8fafc; }
             QToolButton#WindowCloseButton:hover { background: #7f1d2d; border-color: #ff3864; color: #ffffff; }
             QPushButton {
-                background: #121b22; color: #e7fbff; border: 1px solid #2de2e6; border-radius: 3px;
+                background: #121b22; color: #e7fbff; border: 1px solid #2de2e6; border-radius: 5px;
                 padding: 8px 10px; font-weight: 700;
             }
             QPushButton:hover { background: #182932; border-color: #7df9ff; color: #ffffff; }
@@ -365,10 +368,10 @@ private:
             QPushButton#StopButton { background: #29131a; border-color: #ff3864; }
             QPushButton#StopButton:hover { background: #401923; border-color: #ff6b8a; }
             QMenu { background: #181b21; border: 1px solid #343a45; padding: 4px; }
-            QMenu::item { padding: 7px 24px; border-radius: 2px; }
+            QMenu::item { padding: 7px 24px; border-radius: 4px; }
             QMenu::item:selected { background: #20313a; color: #7df9ff; }
             QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QComboBox {
-                background: #171a20; border: 1px solid #303640; border-radius: 3px;
+                background: #171a20; border: 1px solid #303640; border-radius: 5px;
                 padding: 4px; color: #e5e7eb;
             }
             QTableWidget {
@@ -385,24 +388,24 @@ private:
                 padding: 8px; font-weight: 700;
             }
             QGroupBox {
-                border: 1px solid #303640; border-radius: 4px; margin-top: 10px;
+                border: 1px solid #303640; border-radius: 6px; margin-top: 10px;
                 padding-top: 12px; background: #151820;
             }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
             QProgressBar {
-                background: #171a20; border: 1px solid #303640; border-radius: 3px;
+                background: #171a20; border: 1px solid #303640; border-radius: 5px;
                 height: 18px; text-align: center;
             }
-            QProgressBar::chunk { background: #2de2e6; border-radius: 2px; }
+            QProgressBar::chunk { background: #2de2e6; border-radius: 4px; }
             QLabel { color: #cbd5e1; }
             QLabel#ContestTitle { color: #94a3b8; }
-            QTabWidget::pane { border: 1px solid #303640; border-radius: 3px; }
-            QTabBar::tab { background: #181b21; padding: 8px 12px; border-top-left-radius: 3px; border-top-right-radius: 3px; }
+            QTabWidget::pane { border: 1px solid #303640; border-radius: 5px; }
+            QTabBar::tab { background: #181b21; padding: 8px 12px; border-top-left-radius: 5px; border-top-right-radius: 5px; }
             QTabBar::tab:selected { background: #20313a; color: #7df9ff; }
             QScrollBar:vertical, QScrollBar:horizontal { background: #10131a; border: 0; margin: 0; }
             QScrollBar:vertical { width: 10px; }
             QScrollBar:horizontal { height: 10px; }
-            QScrollBar::handle { background: #3a4452; border-radius: 2px; }
+            QScrollBar::handle { background: #3a4452; border-radius: 4px; }
             QScrollBar::handle:hover { background: #566274; }
             QScrollBar::handle:vertical { min-height: 26px; }
             QScrollBar::handle:horizontal { min-width: 26px; }
@@ -1200,6 +1203,38 @@ private:
         layout->addWidget(tabs);
         auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
         QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+        layout->addWidget(buttons);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->show();
+    }
+
+    void show_about_dialog() {
+        auto* dialog = new QDialog(this);
+        dialog->setWindowTitle("About NeoThemis");
+        dialog->resize(520, 360);
+        auto* layout = new QVBoxLayout(dialog);
+
+        auto* title = new QLabel("NeoThemis", dialog);
+        title->setObjectName("WindowAppName");
+        auto* details = new QPlainTextEdit(dialog);
+        details->setReadOnly(true);
+        details->setPlainText(
+            "NeoThemis\n\n"
+            "A local competitive-programming contest judge for C++ submissions.\n\n"
+            "Features:\n"
+            "- Contest and per-problem configuration\n"
+            "- Parallel judging with live progress\n"
+            "- Custom checkers stored in each problem folder\n"
+            "- CSV result and scoreboard output\n"
+            "- Qt desktop interface for Windows and Linux\n\n"
+            "Checker note:\n"
+            "Custom checkers that include testlib.h must keep testlib.h in the same problem folder.\n\n"
+            "Build: Qt Widgets desktop application");
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+
+        layout->addWidget(title);
+        layout->addWidget(details, 1);
         layout->addWidget(buttons);
         dialog->setAttribute(Qt::WA_DeleteOnClose);
         dialog->show();
