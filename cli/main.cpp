@@ -68,8 +68,6 @@ void print_contest_config_reference(std::ostream& out) {
         << "      C++ compiler command used for submissions and checkers.\n"
         << "  compile_flags=-std=c++17 -O2 -pipe\n"
         << "      Compiler flags used for submissions and checkers.\n"
-        << "  testlib_dir=testlib\n"
-        << "      Folder containing testlib.h and checkers/. Relative paths also search cwd and cwd/..\n"
         << "  stack_limit_mb=64\n"
         << "      Contest-wide maximum stack size in megabytes. Use 0 for unlimited.\n"
         << "      Linux enforces this at runtime with RLIMIT_STACK and disables sibling-call optimization.\n"
@@ -90,10 +88,9 @@ void print_problem_config_reference(std::ostream& out) {
         << "      Points for each accepted test unless test_points.<test> overrides it.\n"
         << "  checker=token\n"
         << "      Built-in whitespace-token checker.\n"
-        << "  checker=testlib:<name>\n"
-        << "      Compile testlib/checkers/<name>.cpp, for example testlib:wcmp.\n"
         << "  checker=custom\n"
         << "      Compile checker.cpp in this problem folder.\n"
+        << "      If it includes testlib.h, put testlib.h in this problem folder.\n"
         << "  checker=custom:<path>\n"
         << "      Compile checker source relative to this problem folder.\n"
         << "  test_points.<test>=<points>\n"
@@ -256,7 +253,6 @@ void write_default_settings(const fs::path& settings_path) {
         << "keep_workdir=false\n"
         << "compiler=g++\n"
         << "compile_flags=-std=c++17 -O2 -pipe\n"
-        << "testlib_dir=testlib\n"
         << "stack_limit_mb=64\n"
         << "parallel_jobs=0\n"
         << "\n"
@@ -264,41 +260,6 @@ void write_default_settings(const fs::path& settings_path) {
     for (const auto& pattern : default_forbidden_patterns()) {
         out << "forbidden_pattern=" << pattern << '\n';
     }
-}
-
-fs::path testlib_dir_with_header(const fs::path& candidate) {
-    if (fs::exists(candidate / "testlib.h")) {
-        return candidate;
-    }
-
-    fs::path nested = candidate / "testlib";
-    if (fs::exists(nested / "testlib.h")) {
-        return nested;
-    }
-
-    return {};
-}
-
-fs::path resolve_testlib_dir(const fs::path& configured, const fs::path& contest_root) {
-    if (configured.is_absolute()) {
-        fs::path found = testlib_dir_with_header(configured);
-        return found.empty() ? configured : found;
-    }
-
-    std::vector<fs::path> candidates = {
-        contest_root / configured,
-        fs::current_path() / configured,
-        fs::current_path().parent_path() / configured
-    };
-
-    for (const auto& candidate : candidates) {
-        fs::path found = testlib_dir_with_header(candidate);
-        if (!found.empty()) {
-            return fs::absolute(found);
-        }
-    }
-
-    return fs::absolute(fs::current_path() / configured);
 }
 
 void apply_setting(neothemis::JudgeOptions& options,
@@ -321,7 +282,8 @@ void apply_setting(neothemis::JudgeOptions& options,
     } else if (key == "compile_flags") {
         options.compile_flags = value;
     } else if (key == "testlib_dir") {
-        options.testlib_dir = value;
+        (void)value;
+        // Legacy setting kept harmless while global testlib support is removed.
     } else if (key == "stack_limit_mb") {
         options.stack_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
     } else if (key == "parallel_jobs") {
@@ -640,7 +602,6 @@ neothemis::JudgeOptions parse_judge_args(int argc, char** argv) {
     if (options.scoreboard_csv.is_relative()) {
         options.scoreboard_csv = options.contest_root / options.scoreboard_csv;
     }
-    options.testlib_dir = resolve_testlib_dir(options.testlib_dir, options.contest_root);
     return options;
 }
 

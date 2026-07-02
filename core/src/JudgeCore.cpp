@@ -947,23 +947,13 @@ bool starts_with(const std::string& value, const std::string& prefix) {
 }
 
 fs::path resolve_checker_source(const ProblemSettings& settings,
-                                const JudgeOptions& options,
                                 const fs::path& problem_dir) {
     if (settings.checker == "token") {
         return {};
     }
 
     if (starts_with(settings.checker, "testlib:")) {
-        std::string checker_name = settings.checker.substr(std::string("testlib:").size());
-        if (checker_name.empty() || checker_name.find('/') != std::string::npos ||
-            checker_name.find('\\') != std::string::npos) {
-            throw std::runtime_error("invalid testlib checker name: " + checker_name);
-        }
-        fs::path source = options.testlib_dir / "checkers" / (checker_name + ".cpp");
-        if (!fs::exists(source)) {
-            throw std::runtime_error("testlib checker not found: " + source.string());
-        }
-        return source;
+        throw std::runtime_error("checker=testlib:<name> was removed; use checker=custom and put checker.cpp plus testlib.h in the problem folder");
     }
 
     if (settings.checker == "custom" || starts_with(settings.checker, "custom:")) {
@@ -1012,12 +1002,24 @@ bool parse_first_number(const std::string& text, double& value) {
     return false;
 }
 
+bool checker_source_includes_testlib(const fs::path& checker_source) {
+    std::string source = read_file(checker_source);
+    return source.find("#include \"testlib.h\"") != std::string::npos ||
+           source.find("#include <testlib.h>") != std::string::npos;
+}
+
 fs::path compile_checker(const ProblemSettings& settings,
                          const JudgeOptions& options,
                          const fs::path& problem_dir) {
-    fs::path checker_source = resolve_checker_source(settings, options, problem_dir);
+    fs::path checker_source = resolve_checker_source(settings, problem_dir);
     if (checker_source.empty()) {
         return {};
+    }
+    bool needs_testlib = checker_source_includes_testlib(checker_source);
+    fs::path local_testlib = problem_dir / "testlib.h";
+    if (needs_testlib && !fs::exists(local_testlib)) {
+        throw std::runtime_error("checker includes testlib.h but " + local_testlib.string() +
+                                 " was not found");
     }
 
 #ifdef _WIN32
@@ -1030,7 +1032,13 @@ fs::path compile_checker(const ProblemSettings& settings,
         std::error_code source_time_ec;
         auto checker_time = fs::last_write_time(checker_executable, checker_time_ec);
         auto source_time = fs::last_write_time(checker_source, source_time_ec);
-        if (!checker_time_ec && !source_time_ec && checker_time >= source_time) {
+        bool testlib_current = true;
+        if (needs_testlib && !checker_time_ec) {
+            std::error_code testlib_time_ec;
+            auto testlib_time = fs::last_write_time(local_testlib, testlib_time_ec);
+            testlib_current = !testlib_time_ec && checker_time >= testlib_time;
+        }
+        if (!checker_time_ec && !source_time_ec && checker_time >= source_time && testlib_current) {
 #ifndef _WIN32
             std::error_code ec;
             fs::permissions(checker_executable,
@@ -1046,7 +1054,7 @@ fs::path compile_checker(const ProblemSettings& settings,
     std::string compile_cmd = quote_command_token(options.compiler) + " " +
                               quote_command_tokens(split_words(options.compile_flags)) + " " +
                               stack_guard_compile_flags(options.compiler, options.stack_limit_mb) + " " +
-                              "-I " + quote_path(options.testlib_dir) + " " +
+                              "-I " + quote_path(problem_dir) + " " +
                               quote_path(checker_source) + " -o " + quote_path(checker_executable);
     ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log,
                                         0, 0, 0, options.should_cancel);
@@ -1071,8 +1079,9 @@ void write_default_problem_settings(const fs::path& settings_path,
         << "default_points=1\n"
         << "checker=token\n"
         << "\n"
-        << "# Checker options: token, testlib:<name>, custom:<path-in-this-problem-folder>\n"
-        << "# Examples: checker=testlib:wcmp or checker=custom:checker.cpp\n"
+        << "# Checker options: token, custom:<path-in-this-problem-folder>\n"
+        << "# Examples: checker=custom or checker=custom:checker.cpp\n"
+        << "# Custom checkers that include testlib.h must keep testlib.h in this problem folder.\n"
         << "\n"
         << "# Optional per-test overrides. Test names match the test folder names.\n"
         << "# Example: test_points.1=2\n";

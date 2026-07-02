@@ -33,7 +33,6 @@ struct JudgeOptions {
     std::string core_name = "builtin";
     std::string compiler = "g++";
     std::string compile_flags = "-std=c++17 -O2 -pipe";
-    std::filesystem::path testlib_dir = "testlib";
     std::uint64_t stack_limit_mb = 64;
     unsigned int parallel_jobs = 0;
     std::vector<std::string> selected_problems;

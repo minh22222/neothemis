@@ -56,7 +56,6 @@ scoreboard_csv=scoreboard.csv
 keep_workdir=false
 compiler=g++
 compile_flags=-std=c++17 -O2 -pipe
-testlib_dir=testlib
 stack_limit_mb=64
 parallel_jobs=0
 
@@ -105,13 +104,6 @@ submissions and checker sources.
 : Compiler flags used for submissions and checker sources. Default:
 `-std=c++17 -O2 -pipe`. Use this for language version, optimization, warnings,
 or extra include paths.
-
-`testlib_dir`
-: Folder containing `testlib.h` and optionally `checkers/`. Default: `testlib`.
-The path may be absolute or relative. Relative paths are searched from the
-contest folder, the current working directory, and the parent of the current
-working directory. If the testlib repository was cloned as `testlib/testlib/`,
-NeoThemis uses that nested folder automatically.
 
 `stack_limit_mb`
 : Contest-wide maximum stack size, in megabytes. Default: `64`. Use `0` to
@@ -169,17 +161,16 @@ Default: `1`. Decimal values are allowed, for example `2.5`.
 
 ```text
 checker=token
-checker=testlib:wcmp
 checker=custom
 checker=custom:checker.cpp
 ```
 
 `checker=token` uses NeoThemis' built-in whitespace-token comparison.
-`checker=testlib:<name>` compiles `testlib/checkers/<name>.cpp`, such as
-`wcmp`, `icmp`, or `fcmp`, using `testlib/testlib.h`. `checker=custom` compiles
-`checker.cpp` from the problem folder. `checker=custom:<path>` compiles a
-checker source relative to that same problem folder. Testlib checkers and custom
-checkers are run as `checker input output answer`.
+`checker=custom` compiles `checker.cpp` from the problem folder.
+`checker=custom:<path>` compiles a checker source relative to that same problem
+folder. Custom checkers are run as `checker input output answer`. If a custom
+checker includes `testlib.h`, place `testlib.h` inside that same problem folder,
+for example `tests/A/testlib.h`.
 
 `test_points.<test>`
 : Points override for one test folder. Example: `test_points.1=2`. The key
@@ -227,7 +218,6 @@ Contest settings can be edited from the CLI:
 ./build/neothemis-cli config /path/to/contest problem A set time_limit_ms 3000
 ./build/neothemis-cli config /path/to/contest problem A set memory_limit_mb 512
 ./build/neothemis-cli config /path/to/contest problem A set checker custom
-./build/neothemis-cli config /path/to/contest problem A set checker testlib:wcmp
 ./build/neothemis-cli config /path/to/contest problem A points 2 1-10
 ./build/neothemis-cli config /path/to/contest problem A points 5 1 5 3 12
 ```

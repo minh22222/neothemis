@@ -4,6 +4,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QColor>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -20,6 +21,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QPixmap>
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
@@ -104,6 +106,28 @@ QString format_points(double value) {
     return QString::fromStdString(text);
 }
 
+QPixmap load_logo_pixmap() {
+    QPixmap resource_pixmap(":/materials/logo.png");
+    if (!resource_pixmap.isNull()) {
+        return resource_pixmap;
+    }
+
+    std::vector<fs::path> candidates = {
+        fs::path(QApplication::applicationDirPath().toStdString()) / "materials" / "logo.png",
+        fs::current_path() / "materials" / "logo.png",
+        fs::current_path().parent_path() / "materials" / "logo.png"
+    };
+    for (const auto& candidate : candidates) {
+        if (fs::exists(candidate)) {
+            QPixmap pixmap(QString::fromStdString(candidate.string()));
+            if (!pixmap.isNull()) {
+                return pixmap;
+            }
+        }
+    }
+    return {};
+}
+
 class MainWindow : public QMainWindow {
 public:
     MainWindow() {
@@ -120,11 +144,20 @@ public:
         title_bar_->setObjectName("WindowTitleBar");
         title_bar_->installEventFilter(this);
         auto* title_layout = new QHBoxLayout(title_bar_);
-        title_layout->setContentsMargins(8, 0, 6, 0);
-        title_layout->setSpacing(6);
-        menu_bar_ = new QMenuBar(title_bar_);
-        menu_bar_->setNativeMenuBar(false);
-        title_layout->addWidget(menu_bar_);
+        title_layout->setContentsMargins(10, 0, 6, 0);
+        title_layout->setSpacing(8);
+        auto* logo = new QLabel(title_bar_);
+        logo->setObjectName("AppLogo");
+        QPixmap pixmap = load_logo_pixmap();
+        if (!pixmap.isNull()) {
+            logo->setPixmap(pixmap.scaled(24, 24, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        }
+        logo->installEventFilter(this);
+        auto* app_name = new QLabel("NeoThemis", title_bar_);
+        app_name->setObjectName("WindowAppName");
+        app_name->installEventFilter(this);
+        title_layout->addWidget(logo);
+        title_layout->addWidget(app_name);
         title_layout->addStretch(1);
         contest_title_ = new QLabel("No contest open", title_bar_);
         contest_title_->setObjectName("ContestTitle");
@@ -144,6 +177,17 @@ public:
         title_layout->addWidget(close);
         root->addWidget(title_bar_);
 
+        auto* menu_row = new QWidget(central);
+        menu_row->setObjectName("MenuRow");
+        auto* menu_layout = new QHBoxLayout(menu_row);
+        menu_layout->setContentsMargins(10, 0, 10, 0);
+        menu_layout->setSpacing(0);
+        menu_bar_ = new QMenuBar(menu_row);
+        menu_bar_->setNativeMenuBar(false);
+        menu_layout->addWidget(menu_bar_, 0, Qt::AlignLeft);
+        menu_layout->addStretch(1);
+        root->addWidget(menu_row);
+
         build_toolbar();
 
         auto* content = new QHBoxLayout;
@@ -151,6 +195,7 @@ public:
         content->setSpacing(10);
 
         table_ = new QTableWidget(central);
+        table_->setAlternatingRowColors(true);
         table_->setSelectionBehavior(QAbstractItemView::SelectRows);
         table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
         table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -218,7 +263,11 @@ public:
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override {
-        if (watched == title_bar_ || watched == contest_title_) {
+        if (watched == title_bar_ || watched == contest_title_ ||
+            (watched->isWidgetType() &&
+             static_cast<QWidget*>(watched)->objectName() == "WindowAppName") ||
+            (watched->isWidgetType() &&
+             static_cast<QWidget*>(watched)->objectName() == "AppLogo")) {
             if (event->type() == QEvent::MouseButtonDblClick) {
                 auto* mouse = static_cast<QMouseEvent*>(event);
                 if (mouse->button() == Qt::LeftButton) {
@@ -281,13 +330,25 @@ private:
             QWidget { background: #111318; color: #e5e7eb; font-size: 13px; }
             QMainWindow, QDialog { background: #111318; }
             QWidget#WindowTitleBar {
-                background: #0d1015; border-bottom: 1px solid #29303a; min-height: 34px;
+                background: #0d1015; border-bottom: 1px solid #29303a; min-height: 36px;
+            }
+            QWidget#MenuRow {
+                background: #12161d; border-bottom: 1px solid #22313c; min-height: 30px;
+            }
+            QLabel#WindowAppName {
+                color: #f8fafc; font-size: 14px; font-weight: 800;
+                padding-right: 10px;
+            }
+            QLabel#AppLogo {
+                min-width: 28px; min-height: 28px;
             }
             QMenuBar {
                 background: transparent; border: 0; padding: 0;
             }
-            QMenuBar::item { background: transparent; padding: 7px 10px; border-radius: 2px; }
-            QMenuBar::item:selected { background: #202832; color: #7df9ff; }
+            QMenuBar::item { background: transparent; padding: 6px 12px; border-radius: 2px; }
+            QMenuBar::item:selected {
+                background: #1c2b34; color: #7df9ff; border-bottom: 1px solid #ff2a6d;
+            }
             QToolButton#WindowButton, QToolButton#WindowCloseButton {
                 background: transparent; border: 1px solid transparent; color: #cbd5e1;
                 min-width: 34px; min-height: 26px; border-radius: 2px; font-weight: 700;
@@ -310,9 +371,19 @@ private:
                 background: #171a20; border: 1px solid #303640; border-radius: 3px;
                 padding: 4px; color: #e5e7eb;
             }
-            QTableWidget { gridline-color: #252a33; }
-            QTableWidget::item:selected { background: #2c5660; color: #ffffff; }
-            QHeaderView::section { background: #1f232b; border: 0; padding: 7px; font-weight: 600; }
+            QTableWidget {
+                background: #12161d; alternate-background-color: #151b23;
+                gridline-color: #28404b; selection-background-color: #263a44;
+            }
+            QTableWidget::item { border-bottom: 1px solid #1f2d36; }
+            QTableWidget::item:selected {
+                background: #243946; color: #ffffff; border: 1px solid #2de2e6;
+            }
+            QHeaderView::section {
+                background: #17212a; color: #7df9ff; border: 0;
+                border-right: 1px solid #28404b; border-bottom: 1px solid #ff2a6d;
+                padding: 8px; font-weight: 700;
+            }
             QGroupBox {
                 border: 1px solid #303640; border-radius: 4px; margin-top: 10px;
                 padding-top: 12px; background: #151820;
@@ -345,7 +416,6 @@ private:
         options.contest_root = contest_root_;
         options.compiler = compiler_;
         options.compile_flags = compile_flags_;
-        options.testlib_dir = testlib_dir_;
         options.contestants_dir = contestants_dir_;
         options.tests_dir = tests_dir_;
         options.parallel_jobs = parallel_jobs_;
@@ -397,7 +467,6 @@ private:
         auto values = read_config_file(contest_root_ / "neothemis.conf");
         if (values.count("compiler")) compiler_ = values["compiler"];
         if (values.count("compile_flags")) compile_flags_ = values["compile_flags"];
-        if (values.count("testlib_dir")) testlib_dir_ = values["testlib_dir"];
         if (values.count("contestants_dir")) contestants_dir_ = values["contestants_dir"];
         if (values.count("tests_dir")) tests_dir_ = values["tests_dir"];
         if (values.count("stack_limit_mb")) stack_limit_mb_ = std::stoull(values["stack_limit_mb"]);
@@ -424,7 +493,6 @@ private:
             << "keep_workdir=" << (keep_workdir_ ? "true" : "false") << '\n'
             << "compiler=" << compiler_ << '\n'
             << "compile_flags=" << compile_flags_ << '\n'
-            << "testlib_dir=" << testlib_dir_ << '\n'
             << "stack_limit_mb=" << stack_limit_mb_ << '\n'
             << "parallel_jobs=" << parallel_jobs_ << '\n'
             << "forbidden_pattern=system(\n"
@@ -547,10 +615,12 @@ private:
         for (std::size_t row = 0; row < contestants_.size(); ++row) {
             const std::string& contestant = contestants_[row];
             auto* name_item = new QTableWidgetItem(QString::fromStdString(contestant));
+            style_name_item(name_item);
             table_->setItem(static_cast<int>(row), 0, name_item);
             for (std::size_t col = 0; col < problems_.size(); ++col) {
                 auto* item = new QTableWidgetItem(problem_cell_text(contestant, problems_[col]));
                 item->setTextAlignment(Qt::AlignCenter);
+                style_problem_item(contestant, problems_[col], item);
                 table_->setItem(static_cast<int>(row), static_cast<int>(col + 1), item);
             }
             update_total_cell(contestant);
@@ -628,6 +698,7 @@ private:
         cell_texts_[cell_key(contestant, problem)] = text;
         item->setText(text);
         item->setTextAlignment(Qt::AlignCenter);
+        style_problem_item(contestant, problem, item);
     }
 
     void update_total_cell(const std::string& contestant) {
@@ -643,6 +714,80 @@ private:
         item->setText(format_points(total_earned_for(contestant)) + "/" +
                       format_points(total_max_for(contestant)));
         item->setTextAlignment(Qt::AlignCenter);
+        style_total_item(contestant, item);
+    }
+
+    void style_name_item(QTableWidgetItem* item) const {
+        if (!item) {
+            return;
+        }
+        item->setForeground(QColor("#e7fbff"));
+        item->setBackground(QColor("#151b23"));
+    }
+
+    void style_problem_item(const std::string& contestant,
+                            const std::string& problem,
+                            QTableWidgetItem* item) const {
+        if (!item) {
+            return;
+        }
+        std::string key = cell_key(contestant, problem);
+        auto score_it = score_cells_.find(key);
+        if (score_it != score_cells_.end()) {
+            const CellScore& score = score_it->second;
+            int expected = 1;
+            auto expected_it = problem_test_counts_.find(problem);
+            if (expected_it != problem_test_counts_.end()) {
+                expected = expected_it->second;
+            }
+            if (score.completed < expected) {
+                item->setForeground(QColor("#7df9ff"));
+                item->setBackground(QColor("#122631"));
+            } else if (score.max > 0.0 && score.earned + 1e-9 >= score.max) {
+                item->setForeground(QColor("#99ffcc"));
+                item->setBackground(QColor("#123028"));
+            } else if (score.earned > 0.0) {
+                item->setForeground(QColor("#ffe680"));
+                item->setBackground(QColor("#302512"));
+            } else {
+                item->setForeground(QColor("#ff8fab"));
+                item->setBackground(QColor("#30151f"));
+            }
+            return;
+        }
+
+        QString text = item->text().toLower();
+        if (text.contains("queued")) {
+            item->setForeground(QColor("#ffe680"));
+            item->setBackground(QColor("#2a2412"));
+            return;
+        }
+        auto source_it = source_ready_.find(key);
+        if (source_it != source_ready_.end() && source_it->second) {
+            item->setForeground(QColor("#7df9ff"));
+            item->setBackground(QColor("#122631"));
+        } else {
+            item->setForeground(QColor("#ff8fab"));
+            item->setBackground(QColor("#281821"));
+        }
+    }
+
+    void style_total_item(const std::string& contestant, QTableWidgetItem* item) const {
+        if (!item) {
+            return;
+        }
+        double earned = total_earned_for(contestant);
+        double max = total_max_for(contestant);
+        if (max > 0.0 && earned + 1e-9 >= max) {
+            item->setForeground(QColor("#99ffcc"));
+            item->setBackground(QColor("#102a24"));
+        } else if (earned > 0.0) {
+            item->setForeground(QColor("#ffe680"));
+            item->setBackground(QColor("#2c2312"));
+        } else {
+            item->setForeground(QColor("#7df9ff"));
+            item->setBackground(QColor("#121f2a"));
+        }
     }
 
     void handle_result(const neothemis::TestResult& result) {
@@ -952,7 +1097,6 @@ private:
         auto* form = new QFormLayout(tab);
         auto* compiler = new QLineEdit(QString::fromStdString(compiler_), tab);
         auto* flags = new QLineEdit(QString::fromStdString(compile_flags_), tab);
-        auto* testlib = new QLineEdit(QString::fromStdString(testlib_dir_), tab);
         auto* contestants = new QLineEdit(QString::fromStdString(contestants_dir_), tab);
         auto* tests = new QLineEdit(QString::fromStdString(tests_dir_), tab);
         auto* stack = new QSpinBox(tab);
@@ -967,7 +1111,6 @@ private:
 
         form->addRow("Compiler", compiler);
         form->addRow("Compile flags", flags);
-        form->addRow("testlib dir", testlib);
         form->addRow("Contestants dir", contestants);
         form->addRow("Tests dir", tests);
         form->addRow("Stack MB", stack);
@@ -975,11 +1118,10 @@ private:
         form->addRow("Keep workdir", keep);
         form->addRow(save);
 
-        QObject::connect(save, &QPushButton::clicked, [this, compiler, flags, testlib,
+        QObject::connect(save, &QPushButton::clicked, [this, compiler, flags,
                                                        contestants, tests, stack, parallel, keep]() {
             compiler_ = compiler->text().toStdString();
             compile_flags_ = flags->text().toStdString();
-            testlib_dir_ = testlib->text().toStdString();
             contestants_dir_ = contestants->text().toStdString();
             tests_dir_ = tests->text().toStdString();
             stack_limit_mb_ = static_cast<std::uint64_t>(stack->value());
@@ -1078,7 +1220,6 @@ private:
 
     std::string compiler_ = "g++";
     std::string compile_flags_ = "-std=c++17 -O2 -pipe";
-    std::string testlib_dir_ = "testlib";
     std::string contestants_dir_ = "contestants";
     std::string tests_dir_ = "tests";
     std::uint64_t stack_limit_mb_ = 64;
