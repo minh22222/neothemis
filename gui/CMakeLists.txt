@@ -22,4 +22,5 @@ target_link_libraries(neothemis-gui PRIVATE neothemis_core Qt6::Widgets)
 target_compile_definitions(neothemis-gui PRIVATE QT_NO_KEYWORDS)
 set_target_properties(neothemis-gui PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    WIN32_EXECUTABLE TRUE
 )

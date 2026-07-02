@@ -736,6 +736,10 @@ bool outputs_match(const fs::path& actual, const fs::path& expected) {
 }
 
 void copy_file_alias(const fs::path& from, const fs::path& to) {
+    std::error_code equivalent_ec;
+    if (fs::equivalent(from, to, equivalent_ec)) {
+        return;
+    }
     std::error_code ec;
     fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
     if (ec) {
@@ -749,6 +753,17 @@ void copy_input_aliases(const fs::path& input,
                         const std::string& problem,
                         const std::string& test_name) {
     std::set<std::string> names;
+    std::set<std::string> seen_names;
+    auto insert_name = [&](const std::string& name) {
+#ifdef _WIN32
+        std::string key = lower_ascii(name);
+#else
+        const std::string& key = name;
+#endif
+        if (seen_names.insert(key).second) {
+            names.insert(name);
+        }
+    };
     auto add_name = [&](const std::string& stem) {
         if (stem.empty()) {
             return;
@@ -758,12 +773,12 @@ void copy_input_aliases(const fs::path& input,
         std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char ch) {
             return static_cast<char>(std::toupper(ch));
         });
-        names.insert(stem + ".inp");
-        names.insert(stem + ".INP");
-        names.insert(lower + ".inp");
-        names.insert(lower + ".INP");
-        names.insert(upper + ".inp");
-        names.insert(upper + ".INP");
+        insert_name(stem + ".inp");
+        insert_name(stem + ".INP");
+        insert_name(lower + ".inp");
+        insert_name(lower + ".INP");
+        insert_name(upper + ".inp");
+        insert_name(upper + ".INP");
     };
 
     add_name(problem);
