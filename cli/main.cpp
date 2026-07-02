@@ -82,6 +82,8 @@ void print_problem_config_reference(std::ostream& out) {
         << "      Per-test runtime limit in milliseconds. Custom checkers use this limit too.\n"
         << "  memory_limit_mb=256\n"
         << "      Per-test memory limit in megabytes. Use 0 for unlimited.\n"
+        << "  stack_limit_mb=64\n"
+        << "      Per-test stack limit in megabytes. Use 0 for unlimited.\n"
         << "  default_points=1\n"
         << "      Points for each accepted test unless test_points.<test> overrides it.\n"
         << "  checker=token\n"
@@ -540,6 +542,7 @@ int handle_config(int argc, char** argv) {
         }
         out << "time_limit_ms=1000\n"
             << "memory_limit_mb=256\n"
+            << "stack_limit_mb=64\n"
             << "default_points=1\n"
             << "checker=token\n";
     }

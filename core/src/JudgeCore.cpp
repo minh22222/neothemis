@@ -46,6 +46,7 @@ struct ProcessResult {
 struct ProblemSettings {
     std::uint64_t time_limit_ms = 1000;
     std::uint64_t memory_limit_mb = 256;
+    std::uint64_t stack_limit_mb = 64;
     double default_points = 1.0;
     std::string checker = "token";
     std::map<std::string, double> test_points;
@@ -196,26 +197,34 @@ std::string quote_path(const fs::path& path) {
 #endif
 }
 
-void apply_child_memory_limit(std::uint64_t memory_limit_mb) {
+void apply_child_limits(std::uint64_t memory_limit_mb, std::uint64_t stack_limit_mb) {
 #ifndef _WIN32
-    if (memory_limit_mb == 0) {
-        return;
-    }
     constexpr std::uint64_t bytes_per_mb = 1024ULL * 1024ULL;
-    rlimit limit{};
-    limit.rlim_cur = static_cast<rlim_t>(memory_limit_mb * bytes_per_mb);
-    limit.rlim_max = limit.rlim_cur;
-    if (setrlimit(RLIMIT_AS, &limit) != 0) {
-        _exit(124);
+    if (memory_limit_mb > 0) {
+        rlimit limit{};
+        limit.rlim_cur = static_cast<rlim_t>(memory_limit_mb * bytes_per_mb);
+        limit.rlim_max = limit.rlim_cur;
+        if (setrlimit(RLIMIT_AS, &limit) != 0) {
+            _exit(124);
+        }
+    }
+    if (stack_limit_mb > 0) {
+        rlimit limit{};
+        limit.rlim_cur = static_cast<rlim_t>(stack_limit_mb * bytes_per_mb);
+        limit.rlim_max = limit.rlim_cur;
+        if (setrlimit(RLIMIT_STACK, &limit) != 0) {
+            _exit(124);
+        }
     }
 #else
     (void)memory_limit_mb;
+    (void)stack_limit_mb;
 #endif
 }
 
 bool signal_can_indicate_memory_limit(int signal_number) {
 #ifndef _WIN32
-    return signal_number == SIGABRT || signal_number == SIGKILL || signal_number == SIGSEGV;
+    return signal_number == SIGKILL;
 #else
     (void)signal_number;
     return false;
@@ -228,7 +237,8 @@ ProcessResult run_command(const std::string& command,
                           const fs::path* stdout_path,
                           const fs::path* stderr_path,
                           std::uint64_t timeout_ms,
-                          std::uint64_t memory_limit_mb = 0) {
+                          std::uint64_t memory_limit_mb = 0,
+                          std::uint64_t stack_limit_mb = 0) {
     fs::path absolute_working_dir;
     fs::path absolute_stdin;
     fs::path absolute_stdout;
@@ -258,6 +268,7 @@ ProcessResult run_command(const std::string& command,
     }
 
     if (pid == 0) {
+        setpgid(0, 0);
         if (working_dir && chdir(working_dir->c_str()) != 0) {
             _exit(125);
         }
@@ -279,7 +290,7 @@ ProcessResult run_command(const std::string& command,
             dup2(fd, STDERR_FILENO);
             close(fd);
         }
-        apply_child_memory_limit(memory_limit_mb);
+        apply_child_limits(memory_limit_mb, stack_limit_mb);
         execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
         _exit(127);
     }
@@ -299,6 +310,7 @@ ProcessResult run_command(const std::string& command,
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
         if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
             timed_out = true;
+            kill(-pid, SIGKILL);
             kill(pid, SIGKILL);
             waitpid(pid, &status, 0);
             break;
@@ -397,19 +409,26 @@ ProcessResult run_command(const std::string& command,
 
 ProcessResult run_program(const std::vector<std::string>& args,
                           const fs::path* working_dir,
+                          const fs::path* stdout_path,
                           const fs::path* stderr_path,
                           std::uint64_t timeout_ms,
-                          std::uint64_t memory_limit_mb) {
+                          std::uint64_t memory_limit_mb,
+                          std::uint64_t stack_limit_mb = 0) {
     if (args.empty() || args.front().empty()) {
         throw std::runtime_error("empty program command");
     }
 
 #ifndef _WIN32
     fs::path absolute_working_dir;
+    fs::path absolute_stdout;
     fs::path absolute_stderr;
     if (working_dir) {
         absolute_working_dir = fs::absolute(*working_dir);
         working_dir = &absolute_working_dir;
+    }
+    if (stdout_path) {
+        absolute_stdout = fs::absolute(*stdout_path);
+        stdout_path = &absolute_stdout;
     }
     if (stderr_path) {
         absolute_stderr = fs::absolute(*stderr_path);
@@ -423,8 +442,15 @@ ProcessResult run_program(const std::vector<std::string>& args,
     }
 
     if (pid == 0) {
+        setpgid(0, 0);
         if (working_dir && chdir(working_dir->c_str()) != 0) {
             _exit(125);
+        }
+        if (stdout_path) {
+            int fd = open(stdout_path->c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) _exit(126);
+            dup2(fd, STDOUT_FILENO);
+            close(fd);
         }
         if (stderr_path) {
             int fd = open(stderr_path->c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -432,7 +458,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
             dup2(fd, STDERR_FILENO);
             close(fd);
         }
-        apply_child_memory_limit(memory_limit_mb);
+        apply_child_limits(memory_limit_mb, stack_limit_mb);
 
         std::vector<char*> argv;
         argv.reserve(args.size() + 1);
@@ -459,6 +485,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
         if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
             timed_out = true;
+            kill(-pid, SIGKILL);
             kill(pid, SIGKILL);
             waitpid(pid, &status, 0);
             break;
@@ -488,8 +515,8 @@ ProcessResult run_program(const std::vector<std::string>& args,
         }
         command += quote_path(arg);
     }
-    return run_command(command, working_dir, nullptr, nullptr, stderr_path, timeout_ms,
-                       memory_limit_mb);
+    return run_command(command, working_dir, nullptr, stdout_path, stderr_path, timeout_ms,
+                       memory_limit_mb, stack_limit_mb);
 #endif
 }
 
@@ -503,7 +530,7 @@ std::string read_file(const fs::path& path) {
     return buffer.str();
 }
 
-std::vector<std::string> tokens(const std::string& text) {
+std::vector<std::string> split_words(const std::string& text) {
     std::istringstream in(text);
     std::vector<std::string> result;
     std::string token;
@@ -511,10 +538,6 @@ std::vector<std::string> tokens(const std::string& text) {
         result.push_back(token);
     }
     return result;
-}
-
-std::vector<std::string> split_words(const std::string& text) {
-    return tokens(text);
 }
 
 std::string lower_ascii(std::string value) {
@@ -547,12 +570,33 @@ std::string quote_command_tokens(const std::vector<std::string>& values) {
 }
 
 bool outputs_match(const fs::path& actual, const fs::path& expected) {
-    return tokens(read_file(actual)) == tokens(read_file(expected));
+    std::ifstream actual_in(actual, std::ios::binary);
+    std::ifstream expected_in(expected, std::ios::binary);
+    if (!actual_in || !expected_in) {
+        return false;
+    }
+
+    std::string actual_token;
+    std::string expected_token;
+    while (true) {
+        bool actual_ok = static_cast<bool>(actual_in >> actual_token);
+        bool expected_ok = static_cast<bool>(expected_in >> expected_token);
+        if (!actual_ok || !expected_ok) {
+            return actual_ok == expected_ok;
+        }
+        if (actual_token != expected_token) {
+            return false;
+        }
+    }
 }
 
 void copy_file_alias(const fs::path& from, const fs::path& to) {
-    std::error_code ignored;
-    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ignored);
+    std::error_code ec;
+    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        throw std::runtime_error("failed to copy " + from.string() + " to " + to.string() +
+                                 ": " + ec.message());
+    }
 }
 
 void copy_input_aliases(const fs::path& input,
@@ -580,8 +624,19 @@ void copy_input_aliases(const fs::path& input,
     add_name(problem);
     add_name(test_name);
     add_name(input.stem().string());
+    fs::path primary;
     for (const auto& name : names) {
-        copy_file_alias(input, run_dir / name);
+        fs::path target = run_dir / name;
+        if (primary.empty()) {
+            copy_file_alias(input, target);
+            primary = target;
+            continue;
+        }
+        std::error_code ec;
+        fs::create_hard_link(primary, target, ec);
+        if (ec) {
+            copy_file_alias(primary, target);
+        }
     }
 }
 
@@ -756,6 +811,9 @@ std::string first_existing_file_text(const std::initializer_list<fs::path>& path
         if (fs::exists(path)) {
             try {
                 std::string text = read_file(path);
+                if (text.empty()) {
+                    continue;
+                }
                 constexpr std::size_t max_len = 300;
                 if (text.size() > max_len) {
                     text.resize(max_len);
@@ -914,6 +972,7 @@ void write_default_problem_settings(const fs::path& settings_path,
     out << "# NeoThemis problem settings\n"
         << "time_limit_ms=1000\n"
         << "memory_limit_mb=256\n"
+        << "stack_limit_mb=64\n"
         << "default_points=1\n"
         << "checker=token\n"
         << "\n"
@@ -952,6 +1011,8 @@ void apply_problem_setting(ProblemSettings& settings,
         settings.time_limit_ms = static_cast<std::uint64_t>(std::stoull(value));
     } else if (key == "memory_limit_mb") {
         settings.memory_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
+    } else if (key == "stack_limit_mb") {
+        settings.stack_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
     } else if (key == "default_points") {
         settings.default_points = std::stod(value);
     } else if (key == "checker") {
@@ -1107,12 +1168,19 @@ TestResult judge_test_job(const TestJob& job) {
 
     fs::remove_all(run_dir);
     fs::create_directories(run_dir);
-    copy_input_aliases(input, run_dir, problem.name, test_name);
+    try {
+        copy_input_aliases(input, run_dir, problem.name, test_name);
+    } catch (const std::exception& ex) {
+        row.verdict = Verdict::InternalError;
+        row.message = ex.what();
+        return row;
+    }
 
     fs::path executable_path = fs::absolute(job.executable);
-    ProcessResult run = run_program({executable_path.string()}, &run_dir, &run_log,
+    ProcessResult run = run_program({executable_path.string()}, &run_dir, nullptr, &run_log,
                                     problem.settings.time_limit_ms,
-                                    problem.settings.memory_limit_mb);
+                                    problem.settings.memory_limit_mb,
+                                    problem.settings.stack_limit_mb);
     row.time_ms = run.elapsed_ms;
     row.exit_code = run.exit_code;
     if (run.timed_out) {
@@ -1134,18 +1202,52 @@ TestResult judge_test_job(const TestJob& job) {
                 row.verdict = Verdict::Accepted;
                 row.earned_points = row.max_points;
             } else {
-                row.verdict = Verdict::WrongAnswer;
+                fs::remove_all(run_dir);
+                fs::create_directories(run_dir);
+                try {
+                    copy_input_aliases(input, run_dir, problem.name, test_name);
+                } catch (const std::exception& ex) {
+                    row.verdict = Verdict::InternalError;
+                    row.message = ex.what();
+                    return row;
+                }
+                ProcessResult retry = run_program({executable_path.string()}, &run_dir, nullptr,
+                                                  &run_log, problem.settings.time_limit_ms,
+                                                  problem.settings.memory_limit_mb,
+                                                  problem.settings.stack_limit_mb);
+                fs::path retry_actual = retry.exit_code == 0 && !retry.timed_out &&
+                                                !retry.memory_exceeded
+                                            ? find_actual_output(run_dir, problem.name, test_name)
+                                            : fs::path{};
+                if (!retry_actual.empty() && outputs_match(retry_actual, expected)) {
+                    row.verdict = Verdict::Accepted;
+                    row.earned_points = row.max_points;
+                    row.time_ms = retry.elapsed_ms;
+                    row.exit_code = retry.exit_code;
+                    row.message = "accepted after retry";
+                } else {
+                    row.verdict = Verdict::WrongAnswer;
+                }
             }
         } else {
-            fs::path checker_log = run_dir / (test_name + ".checker.err");
+            fs::path checker_stdout = run_dir / (test_name + ".checker.out");
+            fs::path checker_stderr = run_dir / (test_name + ".checker.err");
             fs::path checker_executable = fs::absolute(problem.checker_executable);
+            fs::path checker_input = find_case_insensitive_file(run_dir, {input.filename().string()});
+            if (checker_input.empty()) {
+                checker_input = input;
+            }
+            fs::path checker_expected = run_dir / (test_name + ".answer");
+            copy_file_alias(expected, checker_expected);
             ProcessResult checker =
-                run_program({checker_executable.string(), input.string(), actual.string(),
-                             expected.string()},
-                            nullptr, &checker_log, problem.settings.time_limit_ms,
-                            problem.settings.memory_limit_mb);
+                run_program({checker_executable.string(), checker_input.filename().string(),
+                             actual.filename().string(), checker_expected.filename().string()},
+                            &run_dir, &checker_stdout, &checker_stderr,
+                            problem.settings.time_limit_ms,
+                            problem.settings.memory_limit_mb,
+                            problem.settings.stack_limit_mb);
             row.exit_code = checker.exit_code;
-            row.message = read_checker_message(checker_log);
+            row.message = first_existing_file_text({checker_stdout, checker_stderr});
             if (checker.timed_out) {
                 row.verdict = Verdict::InternalError;
                 row.message = "checker time limit exceeded";
@@ -1189,12 +1291,17 @@ unsigned int configured_worker_count(const JudgeOptions& options) {
 }
 
 fs::path work_root_for_contest(const JudgeOptions& options) {
-    if (options.keep_workdir) {
-        return options.contest_root / ".neothemis-work";
-    }
     std::string contest_key = fs::absolute(options.contest_root).string();
     std::size_t hash = std::hash<std::string>{}(contest_key);
-    return fs::temp_directory_path() / ("neothemis-work-" + std::to_string(hash));
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+#ifndef _WIN32
+    auto process_id = static_cast<unsigned long long>(getpid());
+#else
+    auto process_id = static_cast<unsigned long long>(GetCurrentProcessId());
+#endif
+    fs::path root = options.contest_root / ".neothemis-work";
+    return root / ("run-" + std::to_string(hash) + "-" +
+                   std::to_string(process_id) + "-" + std::to_string(now));
 }
 
 class BuiltinJudgeCore final : public JudgeCore {
@@ -1243,173 +1350,193 @@ public:
                           contestants.end());
         unsigned int base_worker_count = configured_worker_count(options);
 
-        std::vector<PrepTask> prep_tasks;
-        for (const auto& contestant : contestants) {
-            for (const auto& problem : problems) {
-                prep_tasks.push_back(PrepTask{&contestant, &problem});
+        std::mutex results_mutex;
+        std::mutex prepare_progress_mutex;
+        std::mutex progress_mutex;
+        ProgressState prepare_state;
+        prepare_state.total_jobs = contestants.size() * problems.size();
+        ProgressState progress_state;
+
+        auto run_contestant_jobs = [&](std::vector<TestJob> contestant_jobs) {
+            if (contestant_jobs.empty()) {
+                return;
             }
-        }
+            std::sort(contestant_jobs.begin(), contestant_jobs.end(),
+                      [](const TestJob& a, const TestJob& b) {
+                          return std::make_tuple(a.problem->name, a.test.path().string()) <
+                                 std::make_tuple(b.problem->name, b.test.path().string());
+                      });
+            std::queue<TestJob> jobs;
+            for (const auto& job : contestant_jobs) {
+                jobs.push(job);
+            }
 
-        std::vector<TestJob> prepared_jobs;
-        if (!prep_tasks.empty()) {
-            unsigned int prepare_worker_count =
+            unsigned int worker_count =
                 std::min<unsigned int>(base_worker_count,
-                                       static_cast<unsigned int>(prep_tasks.size()));
-            ProgressState prepare_state;
-            prepare_state.total_jobs = prep_tasks.size();
-            prepare_state.worker_labels.assign(prepare_worker_count, "idle");
-            std::atomic<std::size_t> next_prep_task{0};
-            std::atomic<bool> prepare_progress_done{false};
-            std::mutex prepare_results_mutex;
-            std::mutex prepared_jobs_mutex;
-            std::mutex prepare_progress_mutex;
+                                       static_cast<unsigned int>(jobs.size()));
+            {
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                progress_state.total_jobs += contestant_jobs.size();
+                progress_state.worker_labels.assign(worker_count, "idle");
+            }
 
-            auto prepare_worker = [&](unsigned int worker_id) {
+            std::mutex jobs_mutex;
+            std::atomic<bool> progress_done{false};
+            auto worker = [&](unsigned int worker_id) {
                 while (true) {
-                    std::size_t index = next_prep_task.fetch_add(1);
-                    if (index >= prep_tasks.size()) {
-                        std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
-                        prepare_state.worker_labels[worker_id - 1] = "done";
-                        return;
-                    }
-
-                    const PrepTask& task = prep_tasks[index];
+                    TestJob job;
                     {
-                        std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
-                        prepare_state.worker_labels[worker_id - 1] =
-                            task.contestant->name + "/" + task.problem->name;
-                    }
-
-                    PreparedSubmission prepared =
-                        prepare_submission(options, work_root, *task.contestant, *task.problem);
-                    {
-                        std::lock_guard<std::mutex> lock(prepare_results_mutex);
-                        results.insert(results.end(), prepared.immediate_results.begin(),
-                                       prepared.immediate_results.end());
-                    }
-                    if (prepared.ready) {
-                        std::lock_guard<std::mutex> lock(prepared_jobs_mutex);
-                        for (const auto& test : task.problem->tests) {
-                            prepared_jobs.push_back(
-                                TestJob{prepared.contestant, task.problem, test, prepared.executable});
+                        std::lock_guard<std::mutex> lock(jobs_mutex);
+                        if (jobs.empty()) {
+                            std::lock_guard<std::mutex> progress_lock(progress_mutex);
+                            progress_state.worker_labels[worker_id - 1] = "done";
+                            return;
                         }
+                        job = jobs.front();
+                        jobs.pop();
+                    }
+
+                    std::string label = job.contestant + "/" + job.problem->name + "/" +
+                                        job.test.path().filename().string();
+                    {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        progress_state.worker_labels[worker_id - 1] = label;
+                    }
+
+                    TestResult job_result = judge_test_job(job);
+                    if (!options.keep_workdir) {
+                        std::error_code ignored;
+                        fs::remove_all(job.executable.parent_path() /
+                                       job.test.path().filename(), ignored);
                     }
                     {
-                        std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
-                        ++prepare_state.completed_jobs;
+                        std::lock_guard<std::mutex> lock(results_mutex);
+                        results.push_back(std::move(job_result));
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        ++progress_state.completed_jobs;
                     }
                 }
             };
 
-            std::thread prepare_progress_monitor;
-            if (options.progress && prepare_worker_count > 0) {
-                prepare_progress_monitor = std::thread([&]() {
-                    while (!prepare_progress_done.load()) {
+            std::thread progress_monitor;
+            if (options.progress && worker_count > 0) {
+                progress_monitor = std::thread([&]() {
+                    while (!progress_done.load()) {
                         {
-                            std::lock_guard<std::mutex> lock(prepare_progress_mutex);
-                            emit_progress_summary(options, prepare_state, "prepare");
+                            std::lock_guard<std::mutex> lock(progress_mutex);
+                            emit_progress_summary(options, progress_state, "judge");
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     }
                     {
-                        std::lock_guard<std::mutex> lock(prepare_progress_mutex);
-                        emit_progress_summary(options, prepare_state, "prepare");
+                        std::lock_guard<std::mutex> lock(progress_mutex);
+                        emit_progress_summary(options, progress_state, "judge");
                     }
                 });
             }
 
-            std::vector<std::thread> prepare_workers;
-            for (unsigned int i = 0; i < prepare_worker_count; ++i) {
-                prepare_workers.emplace_back(prepare_worker, i + 1);
+            std::vector<std::thread> workers;
+            for (unsigned int i = 0; i < worker_count; ++i) {
+                workers.emplace_back(worker, i + 1);
             }
-            for (auto& thread : prepare_workers) {
+            for (auto& thread : workers) {
                 thread.join();
             }
-            prepare_progress_done.store(true);
-            if (prepare_progress_monitor.joinable()) {
-                prepare_progress_monitor.join();
-            }
-        }
-
-        std::queue<TestJob> jobs;
-        for (const auto& job : prepared_jobs) {
-            jobs.push(job);
-        }
-
-        unsigned int worker_count = jobs.empty()
-                                        ? 0
-                                        : std::min<unsigned int>(base_worker_count,
-                                                                 static_cast<unsigned int>(jobs.size()));
-
-        ProgressState progress_state;
-        progress_state.total_jobs = jobs.size();
-        progress_state.worker_labels.assign(worker_count, "idle");
-        std::mutex jobs_mutex;
-        std::mutex results_mutex;
-        std::mutex progress_mutex;
-        std::atomic<bool> progress_done{false};
-        auto worker = [&](unsigned int worker_id) {
-            while (true) {
-                TestJob job;
-                {
-                    std::lock_guard<std::mutex> lock(jobs_mutex);
-                    if (jobs.empty()) {
-                        if (worker_id > 0) {
-                            std::lock_guard<std::mutex> progress_lock(progress_mutex);
-                            progress_state.worker_labels[worker_id - 1] = "done";
-                        }
-                        return;
-                    }
-                    job = jobs.front();
-                    jobs.pop();
-                }
-
-                std::string label = job.contestant + "/" + job.problem->name + "/" +
-                                    job.test.path().filename().string();
-                {
-                    std::lock_guard<std::mutex> lock(progress_mutex);
-                    progress_state.worker_labels[worker_id - 1] = label;
-                }
-
-                TestResult job_result = judge_test_job(job);
-                {
-                    std::lock_guard<std::mutex> lock(results_mutex);
-                    results.push_back(std::move(job_result));
-                }
-                {
-                    std::lock_guard<std::mutex> lock(progress_mutex);
-                    ++progress_state.completed_jobs;
-                }
+            progress_done.store(true);
+            if (progress_monitor.joinable()) {
+                progress_monitor.join();
             }
         };
 
-        std::thread progress_monitor;
-        if (options.progress && worker_count > 0) {
-            progress_monitor = std::thread([&]() {
-                while (!progress_done.load()) {
-                    {
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        emit_progress_summary(options, progress_state, "judge");
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                }
-                {
-                    std::lock_guard<std::mutex> lock(progress_mutex);
-                    emit_progress_summary(options, progress_state, "judge");
-                }
-            });
-        }
+        for (const auto& contestant : contestants) {
+            std::vector<PrepTask> prep_tasks;
+            for (const auto& problem : problems) {
+                prep_tasks.push_back(PrepTask{&contestant, &problem});
+            }
 
-        std::vector<std::thread> workers;
-        for (unsigned int i = 0; i < worker_count; ++i) {
-            workers.emplace_back(worker, i + 1);
-        }
-        for (auto& thread : workers) {
-            thread.join();
-        }
-        progress_done.store(true);
-        if (progress_monitor.joinable()) {
-            progress_monitor.join();
+            std::vector<TestJob> contestant_jobs;
+            if (!prep_tasks.empty()) {
+                unsigned int prepare_worker_count =
+                    std::min<unsigned int>(base_worker_count,
+                                           static_cast<unsigned int>(prep_tasks.size()));
+                {
+                    std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                    prepare_state.worker_labels.assign(prepare_worker_count, "idle");
+                }
+                std::atomic<std::size_t> next_prep_task{0};
+                std::atomic<bool> prepare_progress_done{false};
+                std::mutex contestant_jobs_mutex;
+
+                auto prepare_worker = [&](unsigned int worker_id) {
+                    while (true) {
+                        std::size_t index = next_prep_task.fetch_add(1);
+                        if (index >= prep_tasks.size()) {
+                            std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                            prepare_state.worker_labels[worker_id - 1] = "done";
+                            return;
+                        }
+
+                        const PrepTask& task = prep_tasks[index];
+                        {
+                            std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                            prepare_state.worker_labels[worker_id - 1] =
+                                task.contestant->name + "/" + task.problem->name;
+                        }
+
+                        PreparedSubmission prepared =
+                            prepare_submission(options, work_root, *task.contestant, *task.problem);
+                        {
+                            std::lock_guard<std::mutex> lock(results_mutex);
+                            results.insert(results.end(), prepared.immediate_results.begin(),
+                                           prepared.immediate_results.end());
+                        }
+                        if (prepared.ready) {
+                            std::lock_guard<std::mutex> lock(contestant_jobs_mutex);
+                            for (const auto& test : task.problem->tests) {
+                                contestant_jobs.push_back(
+                                    TestJob{prepared.contestant, task.problem, test,
+                                            prepared.executable});
+                            }
+                        }
+                        {
+                            std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
+                            ++prepare_state.completed_jobs;
+                        }
+                    }
+                };
+
+                std::thread prepare_progress_monitor;
+                if (options.progress && prepare_worker_count > 0) {
+                    prepare_progress_monitor = std::thread([&]() {
+                        while (!prepare_progress_done.load()) {
+                            {
+                                std::lock_guard<std::mutex> lock(prepare_progress_mutex);
+                                emit_progress_summary(options, prepare_state, "prepare");
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(prepare_progress_mutex);
+                            emit_progress_summary(options, prepare_state, "prepare");
+                        }
+                    });
+                }
+
+                std::vector<std::thread> prepare_workers;
+                for (unsigned int i = 0; i < prepare_worker_count; ++i) {
+                    prepare_workers.emplace_back(prepare_worker, i + 1);
+                }
+                for (auto& thread : prepare_workers) {
+                    thread.join();
+                }
+                prepare_progress_done.store(true);
+                if (prepare_progress_monitor.joinable()) {
+                    prepare_progress_monitor.join();
+                }
+            }
+            run_contestant_jobs(std::move(contestant_jobs));
         }
 
         std::sort(results.begin(), results.end(), [](const TestResult& a, const TestResult& b) {
@@ -1462,6 +1589,78 @@ std::unique_ptr<JudgeCore> make_judge_core(const std::string& name) {
         return std::make_unique<BuiltinJudgeCore>();
     }
     throw std::runtime_error("unknown judge core: " + name);
+}
+
+ContestOverview inspect_contest(const JudgeOptions& options) {
+    auto lower = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        return value;
+    };
+    auto list_dirs = [](const fs::path& path) {
+        std::vector<fs::path> dirs;
+        if (!fs::exists(path)) {
+            return dirs;
+        }
+        for (const auto& entry : fs::directory_iterator(path)) {
+            if (entry.is_directory()) {
+                dirs.push_back(entry.path());
+            }
+        }
+        std::sort(dirs.begin(), dirs.end());
+        return dirs;
+    };
+    auto allowed = [&](const std::vector<std::string>& selected, const std::string& name) {
+        if (selected.empty()) {
+            return true;
+        }
+        std::string wanted = lower(name);
+        for (const auto& item : selected) {
+            if (lower(item) == wanted) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    ContestOverview overview;
+    std::vector<std::string> problem_keys;
+    for (const auto& problem_dir : list_dirs(options.contest_root / options.tests_dir)) {
+        std::string problem = problem_dir.filename().string();
+        if (!allowed(options.selected_problems, problem)) {
+            continue;
+        }
+        overview.problems.push_back(problem);
+        problem_keys.push_back(lower(problem));
+    }
+
+    for (const auto& contestant_dir : list_dirs(options.contest_root / options.contestants_dir)) {
+        std::string contestant = contestant_dir.filename().string();
+        if (!allowed(options.selected_contestants, contestant)) {
+            continue;
+        }
+
+        std::set<std::string> source_stems;
+        for (const auto& entry : fs::directory_iterator(contestant_dir)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+            std::string ext = lower(entry.path().extension().string());
+            if (ext == ".cpp" || ext == ".cc" || ext == ".cxx") {
+                source_stems.insert(lower(entry.path().stem().string()));
+            }
+        }
+
+        overview.contestants.push_back(contestant);
+        std::vector<bool> row;
+        row.reserve(problem_keys.size());
+        for (const auto& problem_key : problem_keys) {
+            row.push_back(source_stems.find(problem_key) != source_stems.end());
+        }
+        overview.has_source.push_back(std::move(row));
+    }
+    return overview;
 }
 
 void write_csv(std::ostream& output, const std::vector<TestResult>& results) {

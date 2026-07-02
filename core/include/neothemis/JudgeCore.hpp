@@ -52,6 +52,12 @@ struct TestResult {
     std::string message;
 };
 
+struct ContestOverview {
+    std::vector<std::string> contestants;
+    std::vector<std::string> problems;
+    std::vector<std::vector<bool>> has_source;
+};
+
 class JudgeCore {
 public:
     virtual ~JudgeCore() = default;
@@ -60,6 +66,7 @@ public:
 
 std::string to_string(Verdict verdict);
 std::unique_ptr<JudgeCore> make_judge_core(const std::string& name);
+ContestOverview inspect_contest(const JudgeOptions& options);
 void write_csv(std::ostream& output, const std::vector<TestResult>& results);
 void write_scoreboard_csv(std::ostream& output, const std::vector<TestResult>& results);
 

@@ -6,25 +6,22 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(neothemis_core
-    core/src/JudgeCore.cpp
-)
+option(NEOTHEMIS_BUILD_GUI "Build the Qt desktop GUI" ON)
 
-target_include_directories(neothemis_core
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/core/include
-)
-
-add_executable(neothemis-cli
-    cli/main.cpp
-)
-
-target_link_libraries(neothemis-cli PRIVATE neothemis_core)
+add_subdirectory(core)
+add_subdirectory(cli)
+add_subdirectory(gui)
 
 if (MSVC)
     target_compile_options(neothemis_core PRIVATE /W4)
     target_compile_options(neothemis-cli PRIVATE /W4)
+    if (TARGET neothemis-gui)
+        target_compile_options(neothemis-gui PRIVATE /W4)
+    endif()
 else()
     target_compile_options(neothemis_core PRIVATE -Wall -Wextra -pedantic)
     target_compile_options(neothemis-cli PRIVATE -Wall -Wextra -pedantic)
+    if (TARGET neothemis-gui)
+        target_compile_options(neothemis-gui PRIVATE -Wall -Wextra -pedantic)
+    endif()
 endif()
