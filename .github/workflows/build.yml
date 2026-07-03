@@ -1,0 +1,89 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ninja-build qt6-base-dev zlib1g-dev
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Smoke test CLI
+        run: ./build/neothemis-cli --help
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/neothemis-cli build/neothemis-gui dist/
+          tar -czf neothemis-linux-x64.tar.gz -C dist .
+
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v7
+        with:
+          name: neothemis-linux-x64
+          path: neothemis-linux-x64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Qt and MinGW
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.11.1
+          arch: win64_mingw
+          tools: tools_mingw1310,qt.tools.win64_mingw1310
+          cache: true
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++.exe
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Smoke test CLI
+        run: .\build\neothemis-cli.exe --help
+
+      - name: Deploy and package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\neothemis-cli.exe, build\neothemis-gui.exe dist\
+          windeployqt --release --dir dist build\neothemis-gui.exe
+          Compress-Archive -Path dist\* -DestinationPath neothemis-windows-x64.zip
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v7
+        with:
+          name: neothemis-windows-x64
+          path: neothemis-windows-x64.zip
+          if-no-files-found: error

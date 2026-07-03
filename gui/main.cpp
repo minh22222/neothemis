@@ -885,6 +885,10 @@ const UiTextEntry kUiText[] = {
     {"judge_selected", "Judge Selected", u8"Chấm đã chọn"},
     {"judge_all", "Judge All", u8"Chấm tất cả"},
     {"stop", "Stop", u8"Dừng"},
+    {"detail_view", "Detail View", u8"Xem chi tiết"},
+    {"judge_details", "Judge Details", u8"Chi tiết chấm bài"},
+    {"core", "Core", u8"Luồng"},
+    {"task", "Task", u8"Tác vụ"},
     {"export", "Export", u8"Xuất"},
     {"export_scoreboard", "Export Scoreboard (xlsx)", u8"Xuất bảng điểm (xlsx)"},
     {"export_data", "Export Data (xlsx)", u8"Xuất dữ liệu (xlsx)"},
@@ -903,8 +907,8 @@ const UiTextEntry kUiText[] = {
     {"idle", "Idle", u8"Đang nghỉ"},
     {"contestant", "Contestant", u8"Thí sinh"},
     {"total", "Total", u8"Tổng"},
-    {"ready", "Ready", u8"Sẵn sàng"},
-    {"missing", "Missing", u8"Thiếu"},
+    {"ready", "OK", "OK"},
+    {"missing", "MS", "MS"},
     {"done", "Done", u8"Xong"},
     {"running", "Running", u8"Đang chạy"},
     {"queued", "Queued", u8"Đang chờ"},
@@ -936,6 +940,11 @@ const UiTextEntry kUiText[] = {
     {"checker", "Checker", u8"Trình chấm"},
     {"test_points", "Test points", u8"Điểm từng test"},
     {"test", "Test", u8"Test"},
+    {"maximum_test_time", "Maximum test time", u8"Thời gian test lâu nhất"},
+    {"run_time", "Run time", u8"Thời gian chạy"},
+    {"point", "Point", u8"Điểm"},
+    {"description", "Description", u8"Mô tả"},
+    {"no_judged_tests", "No judged tests for this cell yet.", u8"Ô này chưa có test nào được chấm."},
     {"point_override", "Point override", u8"Điểm riêng"},
     {"selected_point", "Selected point", u8"Điểm cho test đã chọn"},
     {"apply_to_selected", "Apply to selected tests", u8"Áp dụng cho test đã chọn"},
@@ -1083,7 +1092,7 @@ public:
         table_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
         table_->horizontalHeader()->setContextMenuPolicy(Qt::CustomContextMenu);
         table_->verticalHeader()->setVisible(false);
-        table_->verticalHeader()->setDefaultSectionSize(54);
+        table_->verticalHeader()->setDefaultSectionSize(42);
         content->addWidget(table_, 1);
 
         auto* side = new QWidget(central);
@@ -1099,11 +1108,13 @@ public:
         judge_selected_button_ = new QPushButton(text("judge_selected"), judge_group_);
         judge_all_button_ = new QPushButton(text("judge_all"), judge_group_);
         stop_button_ = new QPushButton(text("stop"), judge_group_);
+        detail_view_button_ = new QPushButton(text("detail_view"), judge_group_);
         stop_button_->setObjectName("StopButton");
         stop_button_->setEnabled(false);
         action_layout->addWidget(judge_selected_button_);
         action_layout->addWidget(judge_all_button_);
         action_layout->addWidget(stop_button_);
+        action_layout->addWidget(detail_view_button_);
         side_layout->addWidget(judge_group_);
 
         run_status_ = new QLabel(text("no_active_run"), side);
@@ -1131,6 +1142,8 @@ public:
         QObject::connect(judge_selected_button_, &QPushButton::clicked, [this]() { start_judge(true); });
         QObject::connect(judge_all_button_, &QPushButton::clicked, [this]() { start_judge(false); });
         QObject::connect(stop_button_, &QPushButton::clicked, [this]() { request_stop_judge(); });
+        QObject::connect(detail_view_button_, &QPushButton::clicked,
+                         [this]() { show_judge_detail_view(); });
         QObject::connect(table_, &QTableWidget::cellDoubleClicked, [this](int row, int col) {
             show_result_details(row, col);
         });
@@ -1250,6 +1263,15 @@ private:
         }
         if (stop_button_) {
             stop_button_->setText(text("stop"));
+        }
+        if (detail_view_button_) {
+            detail_view_button_->setText(text("detail_view"));
+        }
+        if (detail_dialog_) {
+            detail_dialog_->setWindowTitle(text("judge_details"));
+        }
+        if (core_tasks_table_) {
+            core_tasks_table_->setHorizontalHeaderLabels({text("core"), text("task")});
         }
         if (!judging_.load()) {
             if (run_status_) {
@@ -1450,12 +1472,34 @@ private:
                 border-radius: 14px;
                 outline: 0;
             }
+            QTableWidget#CoreTasksTable {
+                background: rgba(17, 24, 31, 235);
+                alternate-background-color: rgba(17, 24, 31, 235);
+                gridline-color: transparent;
+                outline: 0;
+            }
+            QTableWidget#CoreTasksTable::item {
+                background: rgba(17, 24, 31, 235);
+                border: 0;
+            }
+            QTableWidget#CoreTasksTable::item:selected {
+                background: rgba(62, 118, 124, 174);
+                border: 0;
+                outline: 0;
+            }
+            QTableWidget#CoreTasksTable::item:focus {
+                border: 0;
+                outline: 0;
+            }
             QPlainTextEdit#LogPanel {
                 background: rgba(7, 12, 17, 178);
             }
             QTableWidget::item {
                 border-bottom: 1px solid rgba(255, 255, 255, 22);
                 padding: 6px;
+            }
+            QTableWidget#ScoreTable::item {
+                padding: 2px 6px;
             }
             QTableWidget::item:selected {
                 background: rgba(62, 118, 124, 174);
@@ -2211,6 +2255,18 @@ private:
         return status;
     }
 
+    QString terminal_status_for_cell(const std::string& contestant,
+                                     const std::string& problem) const {
+        std::string status = status_for_scoreboard_cell(contestant, problem);
+        if (status == "CE") {
+            return "CE";
+        }
+        if (status == "MS") {
+            return text("missing");
+        }
+        return {};
+    }
+
     fs::path choose_export_path(const std::string& filename) {
         QString default_path = contest_root_.empty()
                                    ? QString::fromStdString(filename)
@@ -2386,6 +2442,15 @@ private:
         return total;
     }
 
+    QString score_cell_text(const CellScore& score, int expected) const {
+        QString score_text = format_points(score.earned) + "/" + format_points(score.max);
+        if (score.completed >= expected) {
+            return format_points(score.earned);
+        }
+        return score_text + "\n" + text("running") + " " +
+               QString::number(score.completed) + "/" + QString::number(expected);
+    }
+
     QString problem_cell_text(const std::string& contestant, const std::string& problem) const {
         std::string key = cell_key(contestant, problem);
         auto text_it = cell_texts_.find(key);
@@ -2400,19 +2465,17 @@ private:
                        ? text("ready")
                        : text("missing");
         }
+        QString terminal_status = terminal_status_for_cell(contestant, problem);
+        if (!terminal_status.isEmpty()) {
+            return terminal_status;
+        }
         const CellScore& score = score_it->second;
         int expected = 1;
         auto expected_it = problem_test_counts_.find(problem);
         if (expected_it != problem_test_counts_.end()) {
             expected = expected_it->second;
         }
-        QString status = score.completed >= expected ? text("done") : text("running");
-        return QString("%1/%2\n%3 %4/%5")
-            .arg(format_points(score.earned))
-            .arg(format_points(score.max))
-            .arg(status)
-            .arg(score.completed)
-            .arg(expected);
+        return score_cell_text(score, expected);
     }
 
     void populate_table() {
@@ -2543,6 +2606,12 @@ private:
             return;
         }
         std::string key = cell_key(contestant, problem);
+        QString terminal_status = terminal_status_for_cell(contestant, problem);
+        if (!terminal_status.isEmpty()) {
+            item->setForeground(QColor("#ff8fab"));
+            item->setBackground(QColor("#30151f"));
+            return;
+        }
         auto score_it = score_cells_.find(key);
         if (score_it != score_cells_.end()) {
             const CellScore& score = score_it->second;
@@ -2605,15 +2674,15 @@ private:
         record_result(result);
         const CellScore& score = score_cells_[cell_key(result.contestant, result.problem)];
 
+        QString terminal_status = terminal_status_for_cell(result.contestant, result.problem);
+        if (!terminal_status.isEmpty()) {
+            set_table_cell(result.contestant, result.problem, terminal_status);
+            update_total_cell(result.contestant);
+            return;
+        }
+
         int expected = problem_test_counts_[result.problem];
-        QString status = score.completed >= expected ? text("done") : text("running");
-        QString text = QString("%1/%2\n%3 %4/%5")
-                           .arg(format_points(score.earned))
-                           .arg(format_points(score.max))
-                           .arg(status)
-                           .arg(score.completed)
-                           .arg(expected);
-        set_table_cell(result.contestant, result.problem, text);
+        set_table_cell(result.contestant, result.problem, score_cell_text(score, expected));
         update_total_cell(result.contestant);
     }
 
@@ -2633,8 +2702,12 @@ private:
         });
 
         QString text;
+        std::uint64_t maximum_time_ms = 0;
+        for (const auto& result : rows) {
+            maximum_time_ms = std::max(maximum_time_ms, result.time_ms);
+        }
         if (rows.empty()) {
-            text = "No judged tests for this cell yet.";
+            text = this->text("no_judged_tests");
         } else {
             for (const auto& result : rows) {
                 QString description = QString::fromStdString(neothemis::to_string(result.verdict));
@@ -2643,8 +2716,9 @@ private:
                 }
                 text += QString::fromStdString(result.test) + ": " +
                         format_points(result.earned_points) + "/" +
-                        format_points(result.max_points) + " Point\n";
-                text += "Description: " + description + "\n\n";
+                        format_points(result.max_points) + " " + this->text("point") + "\n";
+                text += this->text("run_time") + ": " + QString::number(result.time_ms) + " ms\n";
+                text += this->text("description") + ": " + description + "\n\n";
             }
         }
 
@@ -2654,12 +2728,16 @@ private:
         auto* layout = new QVBoxLayout(dialog);
         auto* title = new QLabel(QString::fromStdString(contestant + " / " + problem), dialog);
         title->setObjectName("AppTitle");
+        auto* maximum_time = new QLabel(
+            this->text("maximum_test_time") + ": " + QString::number(maximum_time_ms) + " ms",
+            dialog);
         auto* details = new QPlainTextEdit(dialog);
         details->setReadOnly(true);
         details->setPlainText(text);
         auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
         QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
         layout->addWidget(title);
+        layout->addWidget(maximum_time);
         layout->addWidget(details, 1);
         layout->addWidget(buttons);
         dialog->setAttribute(Qt::WA_DeleteOnClose);
@@ -2719,6 +2797,70 @@ private:
         menu.exec(table_->horizontalHeader()->mapToGlobal(pos));
     }
 
+    void refresh_judge_detail_view() {
+        if (detail_progress_label_) {
+            detail_progress_label_->setText(
+                detail_progress_text_.isEmpty() ? text("idle") : detail_progress_text_);
+        }
+        if (!core_tasks_table_) {
+            return;
+        }
+
+        core_tasks_table_->setRowCount(static_cast<int>(core_tasks_.size()));
+        for (std::size_t row = 0; row < core_tasks_.size(); ++row) {
+            auto* core_item = new QTableWidgetItem(core_tasks_[row].first);
+            auto* task_item = new QTableWidgetItem(core_tasks_[row].second);
+            core_item->setTextAlignment(Qt::AlignCenter);
+            core_tasks_table_->setItem(static_cast<int>(row), 0, core_item);
+            core_tasks_table_->setItem(static_cast<int>(row), 1, task_item);
+        }
+    }
+
+    void show_judge_detail_view() {
+        if (detail_dialog_) {
+            detail_dialog_->show();
+            detail_dialog_->raise();
+            detail_dialog_->activateWindow();
+            return;
+        }
+
+        auto* dialog = new QDialog(this);
+        detail_dialog_ = dialog;
+        dialog->setWindowTitle(text("judge_details"));
+        dialog->resize(680, 420);
+        auto* layout = new QVBoxLayout(dialog);
+        detail_progress_label_ = new QLabel(dialog);
+        detail_progress_label_->setWordWrap(true);
+
+        core_tasks_table_ = new QTableWidget(dialog);
+        core_tasks_table_->setObjectName("CoreTasksTable");
+        core_tasks_table_->setColumnCount(2);
+        core_tasks_table_->setHorizontalHeaderLabels({text("core"), text("task")});
+        core_tasks_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        core_tasks_table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        core_tasks_table_->verticalHeader()->setVisible(false);
+        core_tasks_table_->setAlternatingRowColors(false);
+        core_tasks_table_->setShowGrid(false);
+        core_tasks_table_->setFocusPolicy(Qt::NoFocus);
+        core_tasks_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        core_tasks_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
+        QObject::connect(dialog, &QObject::destroyed, this, [this]() {
+            detail_dialog_ = nullptr;
+            detail_progress_label_ = nullptr;
+            core_tasks_table_ = nullptr;
+        });
+
+        layout->addWidget(detail_progress_label_);
+        layout->addWidget(core_tasks_table_, 1);
+        layout->addWidget(buttons);
+        refresh_judge_detail_view();
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->show();
+    }
+
     void handle_progress_line(const std::string& raw) {
         QString line = QString::fromStdString(raw);
         QStringList parts = line.split(' ', Qt::SkipEmptyParts);
@@ -2755,7 +2897,23 @@ private:
         progress_label_->setText(phase + " " + QString::number(done) + "/" +
                                  QString::number(total) +
                                  (elapsed.isEmpty() ? QString() : " elapsed " + elapsed));
-        run_status_->setText(line);
+
+        QStringList sections = line.split('|');
+        detail_progress_text_ = sections.value(0).trimmed();
+        core_tasks_.clear();
+        for (int i = 1; i < sections.size(); ++i) {
+            QString worker = sections[i].trimmed();
+            int colon = worker.indexOf(':');
+            if (colon < 0) {
+                continue;
+            }
+            QString core_name = worker.left(colon).trimmed();
+            if (core_name.startsWith("core ")) {
+                core_name = text("core") + " " + core_name.mid(5);
+            }
+            core_tasks_.push_back({core_name, worker.mid(colon + 1).trimmed()});
+        }
+        refresh_judge_detail_view();
     }
 
     void start_judge(bool selected_only, const std::string& selected_problem = {}) {
@@ -2794,6 +2952,9 @@ private:
         reset_run_cells(selected, selected_problem);
         progress_->setRange(0, 0);
         progress_label_->setText(text("starting"));
+        detail_progress_text_ = text("starting");
+        core_tasks_.clear();
+        refresh_judge_detail_view();
         QString scope = selected_only ? text("selected_contestants") : text("all_contestants");
         run_status_->setText(selected_problem.empty()
                                  ? text("judging") + " " + scope
@@ -3013,7 +3174,9 @@ private:
         auto* memory = new QSpinBox(tab);
         memory->setRange(0, 1024 * 1024);
         auto* points = new QLineEdit(tab);
-        auto* checker = new QLineEdit(tab);
+        auto* checker = new QComboBox(tab);
+        checker->addItem("custom");
+        checker->addItem("token");
         auto* test_table = new QTableWidget(tab);
         test_table->setColumnCount(2);
         test_table->setHorizontalHeaderItem(0, new QTableWidgetItem(text("test")));
@@ -3045,7 +3208,8 @@ private:
             time->setValue(values.count("time_limit_ms") ? std::stoi(values["time_limit_ms"]) : 1000);
             memory->setValue(values.count("memory_limit_mb") ? std::stoi(values["memory_limit_mb"]) : 256);
             points->setText(QString::fromStdString(values.count("default_points") ? values["default_points"] : "1"));
-            checker->setText(QString::fromStdString(values.count("checker") ? values["checker"] : "token"));
+            std::string checker_value = values.count("checker") ? values["checker"] : "token";
+            checker->setCurrentText(checker_value.rfind("custom", 0) == 0 ? "custom" : "token");
 
             std::vector<std::string> tests = test_names_for_problem(contest_root_ / tests_dir_ / name);
             test_table->setRowCount(static_cast<int>(tests.size()));
@@ -3121,7 +3285,7 @@ private:
                 write_problem_config(contest_root_ / tests_dir_ / name / "problem.conf",
                                      time->value(), memory->value(),
                                      default_points.empty() ? std::string("1") : default_points,
-                                     checker->text().toStdString(), overrides);
+                                     checker->currentText().toStdString(), overrides);
                 mark_contest_dirty();
                 log_->appendPlainText(text("saved_problem_config") + problem->currentText());
             } catch (const std::exception& ex) {
@@ -3224,6 +3388,7 @@ private:
     QPushButton* judge_selected_button_ = nullptr;
     QPushButton* judge_all_button_ = nullptr;
     QPushButton* stop_button_ = nullptr;
+    QPushButton* detail_view_button_ = nullptr;
     QAction* judge_selected_action_ = nullptr;
     QAction* judge_all_action_ = nullptr;
     QAction* stop_action_ = nullptr;
@@ -3231,6 +3396,11 @@ private:
     QLabel* progress_label_ = nullptr;
     QProgressBar* progress_ = nullptr;
     QPlainTextEdit* log_ = nullptr;
+    QDialog* detail_dialog_ = nullptr;
+    QLabel* detail_progress_label_ = nullptr;
+    QTableWidget* core_tasks_table_ = nullptr;
+    QString detail_progress_text_;
+    std::vector<std::pair<QString, QString>> core_tasks_;
     QPoint drag_offset_;
     bool dragging_title_bar_ = false;
 };

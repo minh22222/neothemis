@@ -13,7 +13,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -1864,11 +1863,11 @@ public:
             }
         };
 
-        auto run_contestant_jobs = [&](std::vector<TestJob> contestant_jobs) {
-            if (contestant_jobs.empty()) {
+        auto run_test_jobs = [&](std::vector<TestJob> test_jobs) {
+            if (test_jobs.empty()) {
                 return;
             }
-            std::sort(contestant_jobs.begin(), contestant_jobs.end(),
+            std::sort(test_jobs.begin(), test_jobs.end(),
                       [](const TestJob& a, const TestJob& b) {
                           return std::make_tuple(a.problem->name,
                                                  a.test.path().filename().string(),
@@ -1880,10 +1879,10 @@ public:
 
             unsigned int worker_count =
                 std::min<unsigned int>(base_worker_count,
-                                       static_cast<unsigned int>(contestant_jobs.size()));
+                                       static_cast<unsigned int>(test_jobs.size()));
             {
                 std::lock_guard<std::mutex> lock(progress_mutex);
-                progress_state.total_jobs += contestant_jobs.size();
+                progress_state.total_jobs = test_jobs.size();
                 progress_state.worker_labels.assign(worker_count, "idle");
             }
 
@@ -1902,12 +1901,12 @@ public:
                             return;
                         }
                         std::size_t job_index = next_job.fetch_add(1);
-                        if (job_index >= contestant_jobs.size()) {
+                        if (job_index >= test_jobs.size()) {
                             std::lock_guard<std::mutex> progress_lock(progress_mutex);
                             progress_state.worker_labels[worker_id - 1] = "done";
                             return;
                         }
-                        TestJob job = contestant_jobs[job_index];
+                        TestJob job = test_jobs[job_index];
 
                         std::string label = job.contestant + "/" + job.problem->name + "/" +
                                             job.test.path().filename().string();
@@ -2085,23 +2084,7 @@ public:
             }
         }
 
-        std::sort(all_jobs.begin(), all_jobs.end(), [](const TestJob& a, const TestJob& b) {
-            return std::make_tuple(a.contestant, a.problem->name,
-                                   a.test.path().filename().string()) <
-                   std::make_tuple(b.contestant, b.problem->name,
-                                   b.test.path().filename().string());
-        });
-        std::vector<TestJob> job_group;
-        for (const auto& job : all_jobs) {
-            if (!job_group.empty() &&
-                (job_group.back().contestant != job.contestant ||
-                 job_group.back().problem != job.problem)) {
-                run_contestant_jobs(std::move(job_group));
-                job_group.clear();
-            }
-            job_group.push_back(job);
-        }
-        run_contestant_jobs(std::move(job_group));
+        run_test_jobs(std::move(all_jobs));
 
         std::sort(results.begin(), results.end(), [](const TestResult& a, const TestResult& b) {
             return std::tie(a.contestant, a.problem, a.test) < std::tie(b.contestant, b.problem, b.test);

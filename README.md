@@ -200,12 +200,12 @@ directly instead of rebuilding the checker source.
 `parallel_jobs=0` uses the number of physical CPU cores, or half the logical
 thread count if physical-core detection is unavailable. Set it to `1` for
 serial judging or to another positive number to cap the test worker queue.
-NeoThemis compiles each contestant/problem once, then runs that submission's
-tests in parallel workers. Each worker runs one test process at a time. On an
-interactive terminal, the CLI redraws one fixed progress area with worker
-states, completed item count, a progress bar, and total elapsed runtime.
-Compilation preparation is also parallelized and shown as a separate `prepare`
-phase before the `judge` phase.
+NeoThemis compiles each contestant/problem once, then puts every runnable test
+across all contestants and problems into one shared worker queue. Each worker
+runs one test process at a time. On an interactive terminal, the CLI redraws one
+fixed progress area with worker states, completed item count, a progress bar,
+and total elapsed runtime. Compilation preparation is also parallelized and
+shown as a separate `prepare` phase before the `judge` phase.
 
 Each test folder stores its official input and answer using the problem name,
 such as `tests/A/1/A.inp` and `tests/A/1/A.out`.
