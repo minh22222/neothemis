@@ -33,8 +33,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
@@ -126,6 +128,317 @@ QPixmap load_logo_pixmap() {
         }
     }
     return {};
+}
+
+struct XlsxCell {
+    bool is_number = false;
+    double number = 0.0;
+    std::string text;
+};
+
+using XlsxRow = std::vector<XlsxCell>;
+
+XlsxCell xlsx_text(std::string text) {
+    XlsxCell cell;
+    cell.text = std::move(text);
+    return cell;
+}
+
+XlsxCell xlsx_number(double value) {
+    XlsxCell cell;
+    cell.is_number = true;
+    cell.number = value;
+    return cell;
+}
+
+std::string xlsx_xml_escape(const std::string& value) {
+    std::string escaped;
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '&': escaped += "&amp;"; break;
+            case '<': escaped += "&lt;"; break;
+            case '>': escaped += "&gt;"; break;
+            case '"': escaped += "&quot;"; break;
+            case '\'': escaped += "&apos;"; break;
+            default:
+                if ((ch < 0x20 && ch != '\n' && ch != '\r' && ch != '\t') || ch == 0x7f) {
+                    escaped += ' ';
+                } else {
+                    escaped.push_back(static_cast<char>(ch));
+                }
+                break;
+        }
+    }
+    return escaped;
+}
+
+std::string xlsx_column_name(std::size_t index) {
+    std::string name;
+    ++index;
+    while (index > 0) {
+        std::size_t remainder = (index - 1) % 26;
+        name.push_back(static_cast<char>('A' + remainder));
+        index = (index - 1) / 26;
+    }
+    std::reverse(name.begin(), name.end());
+    return name;
+}
+
+std::string xlsx_number_text(double value) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(15) << value;
+    return out.str();
+}
+
+std::string xlsx_sheet_xml(const std::vector<XlsxRow>& rows,
+                           const std::vector<double>& widths) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
+        << R"(<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">)"
+        << R"(<sheetViews><sheetView workbookViewId="0">)";
+    if (!rows.empty()) {
+        out << R"(<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>)";
+    }
+    out << R"(</sheetView></sheetViews>)";
+    if (!widths.empty()) {
+        out << "<cols>";
+        for (std::size_t i = 0; i < widths.size(); ++i) {
+            out << "<col min=\"" << (i + 1) << "\" max=\"" << (i + 1)
+                << "\" width=\"" << widths[i] << "\" customWidth=\"1\"/>";
+        }
+        out << "</cols>";
+    }
+    out << "<sheetData>";
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        out << "<row r=\"" << (r + 1) << "\">";
+        const auto& row = rows[r];
+        for (std::size_t c = 0; c < row.size(); ++c) {
+            std::string ref = xlsx_column_name(c) + std::to_string(r + 1);
+            const XlsxCell& cell = row[c];
+            if (cell.is_number) {
+                out << "<c r=\"" << ref << "\"><v>" << xlsx_number_text(cell.number)
+                    << "</v></c>";
+            } else {
+                out << "<c r=\"" << ref << "\" t=\"inlineStr\"";
+                if (r == 0) {
+                    out << " s=\"1\"";
+                }
+                out << "><is><t>" << xlsx_xml_escape(cell.text) << "</t></is></c>";
+            }
+        }
+        out << "</row>";
+    }
+    out << "</sheetData></worksheet>";
+    return out.str();
+}
+
+std::uint32_t crc32_bytes(const std::string& data) {
+    static std::uint32_t table[256]{};
+    static bool initialized = false;
+    if (!initialized) {
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t value = i;
+            for (int bit = 0; bit < 8; ++bit) {
+                value = (value & 1U) ? (0xedb88320U ^ (value >> 1U)) : (value >> 1U);
+            }
+            table[i] = value;
+        }
+        initialized = true;
+    }
+
+    std::uint32_t crc = 0xffffffffU;
+    for (unsigned char ch : data) {
+        crc = table[(crc ^ ch) & 0xffU] ^ (crc >> 8U);
+    }
+    return crc ^ 0xffffffffU;
+}
+
+void write_le16(std::ostream& out, std::uint16_t value) {
+    out.put(static_cast<char>(value & 0xffU));
+    out.put(static_cast<char>((value >> 8U) & 0xffU));
+}
+
+void write_le32(std::ostream& out, std::uint32_t value) {
+    out.put(static_cast<char>(value & 0xffU));
+    out.put(static_cast<char>((value >> 8U) & 0xffU));
+    out.put(static_cast<char>((value >> 16U) & 0xffU));
+    out.put(static_cast<char>((value >> 24U) & 0xffU));
+}
+
+struct ZipEntry {
+    std::string name;
+    std::string data;
+    std::uint32_t crc = 0;
+    std::uint32_t offset = 0;
+};
+
+void write_zip_store(const fs::path& path, std::vector<ZipEntry> entries) {
+    if (!path.parent_path().empty()) {
+        fs::create_directories(path.parent_path());
+    }
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("failed to write " + path.string());
+    }
+
+    for (auto& entry : entries) {
+        entry.crc = crc32_bytes(entry.data);
+        entry.offset = static_cast<std::uint32_t>(out.tellp());
+        write_le32(out, 0x04034b50U);
+        write_le16(out, 20);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le32(out, entry.crc);
+        write_le32(out, static_cast<std::uint32_t>(entry.data.size()));
+        write_le32(out, static_cast<std::uint32_t>(entry.data.size()));
+        write_le16(out, static_cast<std::uint16_t>(entry.name.size()));
+        write_le16(out, 0);
+        out.write(entry.name.data(), static_cast<std::streamsize>(entry.name.size()));
+        out.write(entry.data.data(), static_cast<std::streamsize>(entry.data.size()));
+    }
+
+    std::uint32_t central_offset = static_cast<std::uint32_t>(out.tellp());
+    for (const auto& entry : entries) {
+        write_le32(out, 0x02014b50U);
+        write_le16(out, 20);
+        write_le16(out, 20);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le32(out, entry.crc);
+        write_le32(out, static_cast<std::uint32_t>(entry.data.size()));
+        write_le32(out, static_cast<std::uint32_t>(entry.data.size()));
+        write_le16(out, static_cast<std::uint16_t>(entry.name.size()));
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le16(out, 0);
+        write_le32(out, 0);
+        write_le32(out, entry.offset);
+        out.write(entry.name.data(), static_cast<std::streamsize>(entry.name.size()));
+    }
+    std::uint32_t central_size = static_cast<std::uint32_t>(out.tellp()) - central_offset;
+
+    write_le32(out, 0x06054b50U);
+    write_le16(out, 0);
+    write_le16(out, 0);
+    write_le16(out, static_cast<std::uint16_t>(entries.size()));
+    write_le16(out, static_cast<std::uint16_t>(entries.size()));
+    write_le32(out, central_size);
+    write_le32(out, central_offset);
+    write_le16(out, 0);
+}
+
+void write_xlsx_file(const fs::path& path,
+                     const std::string& sheet_name,
+                     const std::vector<XlsxRow>& rows,
+                     const std::vector<double>& widths) {
+    std::vector<ZipEntry> entries;
+    entries.push_back({"[Content_Types].xml",
+        R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
+        R"(<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">)"
+        R"(<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>)"
+        R"(<Default Extension="xml" ContentType="application/xml"/>)"
+        R"(<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>)"
+        R"(<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>)"
+        R"(<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>)"
+        R"(</Types>)"});
+    entries.push_back({"_rels/.rels",
+        R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
+        R"(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">)"
+        R"(<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>)"
+        R"(</Relationships>)"});
+    entries.push_back({"xl/workbook.xml",
+        std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)") +
+        R"(<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" )" +
+        R"(xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">)" +
+        R"(<sheets><sheet name=")" + xlsx_xml_escape(sheet_name) +
+        R"(" sheetId="1" r:id="rId1"/></sheets></workbook>)"});
+    entries.push_back({"xl/_rels/workbook.xml.rels",
+        R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
+        R"(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">)"
+        R"(<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>)"
+        R"(<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>)"
+        R"(</Relationships>)"});
+    entries.push_back({"xl/styles.xml",
+        R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
+        R"(<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">)"
+        R"(<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>)"
+        R"(<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>)"
+        R"(<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>)"
+        R"(<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>)"
+        R"(<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>)"
+        R"(<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>)"
+        R"(</styleSheet>)"});
+    entries.push_back({"xl/worksheets/sheet1.xml", xlsx_sheet_xml(rows, widths)});
+    write_zip_store(path, std::move(entries));
+}
+
+std::vector<std::vector<std::string>> read_csv_records(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    std::string text = buffer.str();
+
+    std::vector<std::vector<std::string>> records;
+    std::vector<std::string> row;
+    std::string cell;
+    bool in_quotes = false;
+    bool have_data = false;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+        have_data = true;
+        if (in_quotes) {
+            if (ch == '"' && i + 1 < text.size() && text[i + 1] == '"') {
+                cell.push_back('"');
+                ++i;
+            } else if (ch == '"') {
+                in_quotes = false;
+            } else {
+                cell.push_back(ch);
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_quotes = true;
+        } else if (ch == ',') {
+            row.push_back(cell);
+            cell.clear();
+        } else if (ch == '\n') {
+            row.push_back(cell);
+            cell.clear();
+            records.push_back(row);
+            row.clear();
+            have_data = false;
+        } else if (ch != '\r') {
+            cell.push_back(ch);
+        }
+    }
+    if (have_data || !cell.empty() || !row.empty()) {
+        row.push_back(cell);
+        records.push_back(row);
+    }
+    return records;
+}
+
+neothemis::Verdict verdict_from_string(const std::string& value) {
+    if (value == "AC") return neothemis::Verdict::Accepted;
+    if (value == "WA") return neothemis::Verdict::WrongAnswer;
+    if (value == "CE") return neothemis::Verdict::CompileError;
+    if (value == "RE") return neothemis::Verdict::RuntimeError;
+    if (value == "TLE") return neothemis::Verdict::TimeLimitExceeded;
+    if (value == "MLE") return neothemis::Verdict::MemoryLimitExceeded;
+    if (value == "MS") return neothemis::Verdict::MissingSource;
+    if (value == "SV") return neothemis::Verdict::SecurityViolation;
+    return neothemis::Verdict::InternalError;
 }
 
 class MainWindow : public QMainWindow {
@@ -318,6 +631,10 @@ private:
         judge_all_action_ = judge_menu->addAction("Judge All", [this]() { start_judge(false); });
         stop_action_ = judge_menu->addAction("Stop", [this]() { request_stop_judge(); });
         stop_action_->setEnabled(false);
+
+        auto* export_menu = bar->addMenu("Export");
+        export_menu->addAction("Export Scoreboard (xlsx)", [this]() { export_scoreboard_xlsx(); });
+        export_menu->addAction("Export Data (xlsx)", [this]() { export_data_xlsx(); });
 
         auto* settings_menu = bar->addMenu("Settings");
         settings_menu->addAction("Application Settings", [this]() { open_settings_dialog(0); });
@@ -524,10 +841,250 @@ private:
                 }
             }
             load_problem_test_counts();
+            load_existing_results();
             populate_table();
             log_->appendPlainText("Opened " + QString::fromStdString(contest_root_.string()));
         } catch (const std::exception& ex) {
             QMessageBox::critical(this, "Open failed", ex.what());
+        }
+    }
+
+    fs::path contest_output_path(const fs::path& path) const {
+        return path.is_relative() ? contest_root_ / path : path;
+    }
+
+    void record_result(const neothemis::TestResult& result) {
+        std::string key = cell_key(result.contestant, result.problem);
+        result_details_[key].push_back(result);
+        CellScore& score = score_cells_[key];
+        score.earned += result.earned_points;
+        score.max += result.max_points;
+        ++score.completed;
+    }
+
+    std::vector<neothemis::TestResult> all_recorded_results() const {
+        std::vector<neothemis::TestResult> rows;
+        for (const auto& entry : result_details_) {
+            rows.insert(rows.end(), entry.second.begin(), entry.second.end());
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+            return std::tie(a.contestant, a.problem, a.test) <
+                   std::tie(b.contestant, b.problem, b.test);
+        });
+        return rows;
+    }
+
+    void load_existing_results() {
+        score_cells_.clear();
+        result_details_.clear();
+
+        neothemis::JudgeOptions options = options_from_ui();
+        fs::path details_path = contest_output_path(options.output_csv);
+        if (!fs::exists(details_path)) {
+            return;
+        }
+
+        std::set<std::string> known_contestants(contestants_.begin(), contestants_.end());
+        std::set<std::string> known_problems(problems_.begin(), problems_.end());
+        auto records = read_csv_records(details_path);
+        if (records.size() <= 1) {
+            return;
+        }
+        for (std::size_t i = 1; i < records.size(); ++i) {
+            const auto& fields = records[i];
+            if (fields.size() < 9 ||
+                known_contestants.count(fields[0]) == 0 ||
+                known_problems.count(fields[1]) == 0) {
+                continue;
+            }
+            try {
+                neothemis::TestResult result;
+                result.contestant = fields[0];
+                result.problem = fields[1];
+                result.test = fields[2];
+                result.verdict = verdict_from_string(fields[3]);
+                result.time_ms = static_cast<std::uint64_t>(std::stoull(fields[4]));
+                result.exit_code = std::stoi(fields[5]);
+                result.max_points = std::stod(fields[6]);
+                result.earned_points = std::stod(fields[7]);
+                result.message = fields[8];
+                record_result(result);
+            } catch (...) {
+                log_->appendPlainText("Skipped one malformed row in results.csv.");
+            }
+        }
+    }
+
+    void write_current_csv_outputs() const {
+        neothemis::JudgeOptions options = options_from_ui();
+        std::vector<neothemis::TestResult> rows = all_recorded_results();
+
+        fs::path details_path = contest_output_path(options.output_csv);
+        fs::create_directories(details_path.parent_path());
+        std::ofstream details(details_path);
+        if (!details) {
+            throw std::runtime_error("failed to open CSV output: " + details_path.string());
+        }
+        neothemis::write_csv(details, rows);
+
+        fs::path scoreboard_path = contest_output_path(options.scoreboard_csv);
+        fs::create_directories(scoreboard_path.parent_path());
+        std::ofstream scoreboard(scoreboard_path);
+        if (!scoreboard) {
+            throw std::runtime_error("failed to open scoreboard CSV output: " +
+                                     scoreboard_path.string());
+        }
+        neothemis::write_scoreboard_csv(scoreboard, rows);
+    }
+
+    std::string status_for_scoreboard_cell(const std::string& contestant,
+                                           const std::string& problem) const {
+        auto found = result_details_.find(cell_key(contestant, problem));
+        if (found == result_details_.end()) {
+            return {};
+        }
+        std::string status;
+        int priority = 0;
+        for (const auto& result : found->second) {
+            int candidate_priority = 0;
+            std::string candidate;
+            if (result.verdict == neothemis::Verdict::CompileError) {
+                candidate = "CE";
+                candidate_priority = 2;
+            } else if (result.verdict == neothemis::Verdict::MissingSource) {
+                candidate = "MS";
+                candidate_priority = 1;
+            }
+            if (candidate_priority > priority) {
+                status = candidate;
+                priority = candidate_priority;
+            }
+        }
+        return status;
+    }
+
+    fs::path choose_export_path(const std::string& filename) {
+        QString default_path = contest_root_.empty()
+                                   ? QString::fromStdString(filename)
+                                   : QString::fromStdString((contest_root_ / filename).string());
+        QString selected = QFileDialog::getSaveFileName(
+            this, "Export workbook", default_path, "Excel workbook (*.xlsx)");
+        if (selected.isEmpty()) {
+            return {};
+        }
+        fs::path path = selected.toStdString();
+        if (path.extension().string() != ".xlsx") {
+            path += ".xlsx";
+        }
+        return path;
+    }
+
+    bool export_is_available() {
+        if (judging_.load()) {
+            QMessageBox::information(this, "Judge running",
+                                     "Wait for the active judge run to finish before exporting.");
+            return false;
+        }
+        if (contest_root_.empty()) {
+            QMessageBox::information(this, "No contest",
+                                     "Open or create a contest folder first.");
+            return false;
+        }
+        if (all_recorded_results().empty()) {
+            QMessageBox::information(this, "No results",
+                                     "No judged results are available to export yet.");
+            return false;
+        }
+        return true;
+    }
+
+    void export_scoreboard_xlsx() {
+        if (!export_is_available()) {
+            return;
+        }
+        fs::path path = choose_export_path("scoreboard.xlsx");
+        if (path.empty()) {
+            return;
+        }
+
+        std::vector<XlsxRow> rows;
+        XlsxRow header{xlsx_text("Contestant")};
+        for (const auto& problem : problems_) {
+            header.push_back(xlsx_text(problem));
+        }
+        header.push_back(xlsx_text("Total"));
+        rows.push_back(std::move(header));
+
+        for (const auto& contestant : contestants_) {
+            XlsxRow row{xlsx_text(contestant)};
+            for (const auto& problem : problems_) {
+                double score = earned_for_problem(contestant, problem);
+                std::string status = status_for_scoreboard_cell(contestant, problem);
+                if (score == 0.0 && !status.empty()) {
+                    row.push_back(xlsx_text(status + "(0)"));
+                } else {
+                    row.push_back(xlsx_number(score));
+                }
+            }
+            row.push_back(xlsx_number(total_earned_for(contestant)));
+            rows.push_back(std::move(row));
+        }
+
+        std::vector<double> widths(rows.front().size(), 14.0);
+        widths[0] = 28.0;
+        try {
+            write_xlsx_file(path, "Scoreboard", rows, widths);
+            log_->appendPlainText("Exported " + QString::fromStdString(path.string()));
+            QMessageBox::information(this, "Export complete",
+                                     "Exported " + QString::fromStdString(path.string()));
+        } catch (const std::exception& ex) {
+            QMessageBox::critical(this, "Export failed", ex.what());
+        }
+    }
+
+    void export_data_xlsx() {
+        if (!export_is_available()) {
+            return;
+        }
+        fs::path path = choose_export_path("results-data.xlsx");
+        if (path.empty()) {
+            return;
+        }
+
+        std::vector<XlsxRow> rows;
+        rows.push_back({
+            xlsx_text("contestant"),
+            xlsx_text("problem"),
+            xlsx_text("test"),
+            xlsx_text("verdict"),
+            xlsx_text("time_ms"),
+            xlsx_text("exit_code"),
+            xlsx_text("max_points"),
+            xlsx_text("earned_points"),
+            xlsx_text("message")
+        });
+        for (const auto& result : all_recorded_results()) {
+            rows.push_back({
+                xlsx_text(result.contestant),
+                xlsx_text(result.problem),
+                xlsx_text(result.test),
+                xlsx_text(neothemis::to_string(result.verdict)),
+                xlsx_number(static_cast<double>(result.time_ms)),
+                xlsx_number(static_cast<double>(result.exit_code)),
+                xlsx_number(result.max_points),
+                xlsx_number(result.earned_points),
+                xlsx_text(result.message)
+            });
+        }
+
+        std::vector<double> widths{28.0, 14.0, 12.0, 10.0, 12.0, 12.0, 12.0, 14.0, 48.0};
+        try {
+            write_xlsx_file(path, "Data", rows, widths);
+            log_->appendPlainText("Exported " + QString::fromStdString(path.string()));
+            QMessageBox::information(this, "Export complete",
+                                     "Exported " + QString::fromStdString(path.string()));
+        } catch (const std::exception& ex) {
+            QMessageBox::critical(this, "Export failed", ex.what());
         }
     }
 
@@ -662,10 +1219,6 @@ private:
     }
 
     void reset_run_cells(const std::vector<std::string>& selected, const std::string& selected_problem) {
-        if (selected_problem.empty()) {
-            score_cells_.clear();
-            result_details_.clear();
-        }
         std::set<std::string> selected_set(selected.begin(), selected.end());
         for (const auto& contestant : contestants_) {
             if (!selected_set.empty() && selected_set.count(contestant) == 0) {
@@ -794,12 +1347,8 @@ private:
     }
 
     void handle_result(const neothemis::TestResult& result) {
-        std::string key = cell_key(result.contestant, result.problem);
-        result_details_[key].push_back(result);
-        CellScore& score = score_cells_[key];
-        score.earned += result.earned_points;
-        score.max += result.max_points;
-        ++score.completed;
+        record_result(result);
+        const CellScore& score = score_cells_[cell_key(result.contestant, result.problem)];
 
         int expected = problem_test_counts_[result.problem];
         QString status = score.completed >= expected ? "Done" : "Running";
@@ -1009,17 +1558,24 @@ private:
                 };
 
                 auto core = neothemis::make_judge_core(options.core_name);
-                std::vector<neothemis::TestResult> results = core->judge(options);
-                std::ofstream details(options.contest_root / options.output_csv);
-                neothemis::write_csv(details, results);
-                std::ofstream scoreboard(options.contest_root / options.scoreboard_csv);
-                neothemis::write_scoreboard_csv(scoreboard, results);
+                core->judge(options);
                 QMetaObject::invokeMethod(this, [this]() {
-                    progress_->setRange(0, 100);
-                    progress_->setValue(100);
-                    progress_label_->setText("Done");
-                    run_status_->setText("Judge run complete");
-                    log_->appendPlainText("Done.");
+                    try {
+                        write_current_csv_outputs();
+                        progress_->setRange(0, 100);
+                        progress_->setValue(100);
+                        progress_label_->setText("Done");
+                        run_status_->setText("Judge run complete");
+                        log_->appendPlainText("Done.");
+                    } catch (const std::exception& ex) {
+                        progress_->setRange(0, 100);
+                        progress_->setValue(0);
+                        progress_label_->setText("Failed");
+                        run_status_->setText("Judge run finished but CSV write failed");
+                        log_->appendPlainText(QString("CSV write failed: ") +
+                                              QString::fromUtf8(ex.what()));
+                        QMessageBox::critical(this, "CSV write failed", ex.what());
+                    }
                     judging_.store(false);
                     set_judge_controls_enabled(true);
                 }, Qt::QueuedConnection);
@@ -1117,7 +1673,7 @@ private:
         form->addRow("Contestants dir", contestants);
         form->addRow("Tests dir", tests);
         form->addRow("Stack MB", stack);
-        form->addRow("Parallel jobs", parallel);
+        form->addRow("Parallel jobs (0 = auto)", parallel);
         form->addRow("Keep workdir", keep);
         form->addRow(save);
 

@@ -182,7 +182,8 @@ Checker binaries are cached in the problem folder as `checker` on Linux/macOS or
 `checker.exe` on Windows. If that binary already exists, NeoThemis uses it
 directly instead of rebuilding the checker source.
 
-`parallel_jobs=0` auto-detects the available CPU cores. Set it to `1` for
+`parallel_jobs=0` uses the number of physical CPU cores, or half the logical
+thread count if physical-core detection is unavailable. Set it to `1` for
 serial judging or to another positive number to cap the test worker queue.
 NeoThemis compiles each contestant/problem once, then runs that submission's
 tests in parallel workers. Each worker runs one test process at a time. On an

@@ -20,6 +20,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <vector>
 
 #ifndef _WIN32
 #include <csignal>
@@ -28,7 +29,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #else
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -197,8 +200,8 @@ std::string quote_path(const fs::path& path) {
 #endif
 }
 
-void apply_child_limits(std::uint64_t memory_limit_mb, std::uint64_t stack_limit_mb) {
 #ifndef _WIN32
+void apply_child_limits(std::uint64_t memory_limit_mb, std::uint64_t stack_limit_mb) {
     constexpr std::uint64_t bytes_per_mb = 1024ULL * 1024ULL;
     if (memory_limit_mb > 0) {
         rlimit limit{};
@@ -216,20 +219,191 @@ void apply_child_limits(std::uint64_t memory_limit_mb, std::uint64_t stack_limit
             _exit(124);
         }
     }
-#else
-    (void)memory_limit_mb;
-    (void)stack_limit_mb;
-#endif
 }
 
 bool signal_can_indicate_memory_limit(int signal_number) {
-#ifndef _WIN32
     return signal_number == SIGKILL;
-#else
-    (void)signal_number;
-    return false;
-#endif
 }
+
+#if defined(__linux__)
+unsigned int linux_physical_core_count() {
+    std::ifstream cpuinfo("/proc/cpuinfo");
+    if (!cpuinfo) {
+        return 0;
+    }
+
+    std::set<std::pair<std::string, std::string>> cores;
+    std::string physical_id;
+    std::string core_id;
+
+    auto flush_cpu = [&]() {
+        if (!physical_id.empty() && !core_id.empty()) {
+            cores.emplace(physical_id, core_id);
+        }
+        physical_id.clear();
+        core_id.clear();
+    };
+
+    std::string line;
+    while (std::getline(cpuinfo, line)) {
+        if (trim(line).empty()) {
+            flush_cpu();
+            continue;
+        }
+
+        std::size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            continue;
+        }
+
+        std::string key = trim(line.substr(0, colon));
+        std::string value = trim(line.substr(colon + 1));
+        if (key == "physical id") {
+            physical_id = value;
+        } else if (key == "core id") {
+            core_id = value;
+        }
+    }
+    flush_cpu();
+
+    return static_cast<unsigned int>(cores.size());
+}
+#endif
+#endif
+
+#ifdef _WIN32
+unsigned int windows_physical_core_count() {
+    DWORD length = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        return 0;
+    }
+
+    std::vector<unsigned char> buffer(length);
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+            &length)) {
+        return 0;
+    }
+
+    unsigned int cores = 0;
+    DWORD offset = 0;
+    while (offset < length) {
+        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+            buffer.data() + offset);
+        if (info->Relationship == RelationProcessorCore) {
+            ++cores;
+        }
+        if (info->Size == 0) {
+            break;
+        }
+        offset += info->Size;
+    }
+    return cores;
+}
+
+std::string windows_error_message(DWORD error) {
+    LPSTR buffer = nullptr;
+    DWORD size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                                    FORMAT_MESSAGE_FROM_SYSTEM |
+                                    FORMAT_MESSAGE_IGNORE_INSERTS,
+                                nullptr, error, 0, reinterpret_cast<LPSTR>(&buffer),
+                                0, nullptr);
+    std::string message = size > 0 && buffer ? std::string(buffer, size)
+                                             : "Windows error " + std::to_string(error);
+    if (buffer) {
+        LocalFree(buffer);
+    }
+    return trim(message);
+}
+
+std::string windows_quote_argument(const std::string& argument) {
+    if (argument.empty()) {
+        return "\"\"";
+    }
+
+    bool needs_quotes = argument.find_first_of(" \t\n\v\"") != std::string::npos;
+    if (!needs_quotes) {
+        return argument;
+    }
+
+    std::string quoted = "\"";
+    std::size_t backslashes = 0;
+    for (char ch : argument) {
+        if (ch == '\\') {
+            ++backslashes;
+        } else if (ch == '"') {
+            quoted.append(backslashes * 2 + 1, '\\');
+            quoted.push_back(ch);
+            backslashes = 0;
+        } else {
+            quoted.append(backslashes, '\\');
+            backslashes = 0;
+            quoted.push_back(ch);
+        }
+    }
+    quoted.append(backslashes * 2, '\\');
+    quoted.push_back('"');
+    return quoted;
+}
+
+std::string windows_command_line(const std::vector<std::string>& args) {
+    std::string command_line;
+    for (const auto& arg : args) {
+        if (!command_line.empty()) {
+            command_line.push_back(' ');
+        }
+        command_line += windows_quote_argument(arg);
+    }
+    return command_line;
+}
+
+bool is_windows_null_device(const fs::path& path) {
+    std::string value = path.string();
+    std::replace(value.begin(), value.end(), '/', '\\');
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value == "nul" || value == "\\\\.\\nul";
+}
+
+std::string windows_open_path(const fs::path& path) {
+    return is_windows_null_device(path) ? std::string("NUL") : fs::absolute(path).string();
+}
+
+std::uint64_t filetime_to_ms(const FILETIME& time) {
+    ULARGE_INTEGER value{};
+    value.LowPart = time.dwLowDateTime;
+    value.HighPart = time.dwHighDateTime;
+    return value.QuadPart / 10000ULL;
+}
+
+std::uint64_t process_cpu_time_ms(HANDLE process) {
+    FILETIME creation_time{};
+    FILETIME exit_time{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    if (!GetProcessTimes(process, &creation_time, &exit_time, &kernel_time, &user_time)) {
+        return 0;
+    }
+    return filetime_to_ms(kernel_time) + filetime_to_ms(user_time);
+}
+
+std::uint64_t wall_timeout_guard_ms(std::uint64_t timeout_ms) {
+    if (timeout_ms == 0) {
+        return 0;
+    }
+    return std::max(timeout_ms * 4, timeout_ms + 5000);
+}
+
+std::uint64_t windows_cpu_timeout_ms(std::uint64_t timeout_ms) {
+    if (timeout_ms == 0) {
+        return 0;
+    }
+    return timeout_ms + std::max<std::uint64_t>(100, timeout_ms / 10);
+}
+#endif
 
 ProcessResult run_command(const std::string& command,
                           const fs::path* working_dir,
@@ -249,15 +423,27 @@ ProcessResult run_command(const std::string& command,
         working_dir = &absolute_working_dir;
     }
     if (stdin_path) {
+#ifdef _WIN32
+        absolute_stdin = windows_open_path(*stdin_path);
+#else
         absolute_stdin = fs::absolute(*stdin_path);
+#endif
         stdin_path = &absolute_stdin;
     }
     if (stdout_path) {
+#ifdef _WIN32
+        absolute_stdout = windows_open_path(*stdout_path);
+#else
         absolute_stdout = fs::absolute(*stdout_path);
+#endif
         stdout_path = &absolute_stdout;
     }
     if (stderr_path) {
+#ifdef _WIN32
+        absolute_stderr = windows_open_path(*stderr_path);
+#else
         absolute_stderr = fs::absolute(*stderr_path);
+#endif
         stderr_path = &absolute_stderr;
     }
 
@@ -340,6 +526,9 @@ ProcessResult run_command(const std::string& command,
     }
     return result;
 #else
+    (void)memory_limit_mb;
+    (void)stack_limit_mb;
+
     HANDLE child_stdin = GetStdHandle(STD_INPUT_HANDLE);
     HANDLE child_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
     HANDLE child_stderr = GetStdHandle(STD_ERROR_HANDLE);
@@ -565,16 +754,148 @@ ProcessResult run_program(const std::vector<std::string>& args,
     }
     return result;
 #else
-    std::string command;
-    for (const auto& arg : args) {
-        if (!command.empty()) {
-            command += ' ';
-        }
-        command += quote_path(arg);
+    (void)memory_limit_mb;
+    (void)stack_limit_mb;
+
+    fs::path absolute_working_dir;
+    if (working_dir) {
+        absolute_working_dir = fs::absolute(*working_dir);
+        working_dir = &absolute_working_dir;
     }
-    fs::path stdin_sink = "\\\\.\\NUL";
-    return run_command(command, working_dir, &stdin_sink, stdout_path, stderr_path, timeout_ms,
-                       memory_limit_mb, stack_limit_mb, should_cancel);
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = nullptr;
+    sa.bInheritHandle = TRUE;
+
+    auto open_file = [&](const std::string& path, DWORD access, DWORD creation) {
+        return CreateFileA(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           &sa, creation, FILE_ATTRIBUTE_NORMAL, nullptr);
+    };
+
+    HANDLE child_stdin = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE child_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE child_stderr = GetStdHandle(STD_ERROR_HANDLE);
+    HANDLE opened_stdin = INVALID_HANDLE_VALUE;
+    HANDLE opened_stdout = INVALID_HANDLE_VALUE;
+    HANDLE opened_stderr = INVALID_HANDLE_VALUE;
+
+    auto close_opened_files = [&]() {
+        if (opened_stdin != INVALID_HANDLE_VALUE) CloseHandle(opened_stdin);
+        if (opened_stdout != INVALID_HANDLE_VALUE) CloseHandle(opened_stdout);
+        if (opened_stderr != INVALID_HANDLE_VALUE) CloseHandle(opened_stderr);
+    };
+
+    opened_stdin = open_file("NUL", GENERIC_READ, OPEN_EXISTING);
+    if (opened_stdin == INVALID_HANDLE_VALUE) {
+        throw std::runtime_error("failed to open NUL: " + windows_error_message(GetLastError()));
+    }
+    child_stdin = opened_stdin;
+
+    if (stdout_path) {
+        opened_stdout = open_file(windows_open_path(*stdout_path), GENERIC_WRITE, CREATE_ALWAYS);
+        if (opened_stdout == INVALID_HANDLE_VALUE) {
+            DWORD error = GetLastError();
+            close_opened_files();
+            throw std::runtime_error("failed to open stdout file: " + windows_error_message(error));
+        }
+        child_stdout = opened_stdout;
+    }
+    if (stderr_path) {
+        opened_stderr = open_file(windows_open_path(*stderr_path), GENERIC_WRITE, CREATE_ALWAYS);
+        if (opened_stderr == INVALID_HANDLE_VALUE) {
+            DWORD error = GetLastError();
+            close_opened_files();
+            throw std::runtime_error("failed to open stderr file: " + windows_error_message(error));
+        }
+        child_stderr = opened_stderr;
+    }
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = child_stdin;
+    si.hStdOutput = child_stdout;
+    si.hStdError = child_stderr;
+
+    PROCESS_INFORMATION pi{};
+    std::string command_line = windows_command_line(args);
+    std::string application_name = args.front();
+    auto begin = std::chrono::steady_clock::now();
+    BOOL ok = CreateProcessA(application_name.c_str(), command_line.data(),
+                             nullptr, nullptr, TRUE,
+                             CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                             nullptr,
+                             working_dir ? working_dir->string().c_str() : nullptr,
+                             &si, &pi);
+    if (!ok) {
+        DWORD error = GetLastError();
+        close_opened_files();
+        throw std::runtime_error("CreateProcess failed for " + application_name + ": " +
+                                 windows_error_message(error));
+    }
+
+    HANDLE job = CreateJobObjectA(nullptr, nullptr);
+    bool has_job = job != nullptr && AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+
+    bool timed_out = false;
+    std::uint64_t cpu_elapsed_ms = 0;
+    std::uint64_t wall_guard_ms = wall_timeout_guard_ms(timeout_ms);
+    std::uint64_t cpu_timeout_ms = windows_cpu_timeout_ms(timeout_ms);
+    while (true) {
+        DWORD wait_result = WaitForSingleObject(pi.hProcess, 10);
+        if (wait_result == WAIT_OBJECT_0) {
+            cpu_elapsed_ms = process_cpu_time_ms(pi.hProcess);
+            break;
+        }
+        if (wait_result != WAIT_TIMEOUT) {
+            break;
+        }
+        auto now = std::chrono::steady_clock::now();
+        auto wall_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
+        cpu_elapsed_ms = process_cpu_time_ms(pi.hProcess);
+        if (should_cancel && should_cancel()) {
+            if (has_job) {
+                TerminateJobObject(job, 125);
+            } else {
+                TerminateProcess(pi.hProcess, 125);
+            }
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            if (job) CloseHandle(job);
+            close_opened_files();
+            throw std::runtime_error("judging cancelled");
+        }
+        if (cpu_timeout_ms > 0 && cpu_elapsed_ms > cpu_timeout_ms) {
+            timed_out = true;
+            break;
+        }
+        if (wall_guard_ms > 0 && static_cast<std::uint64_t>(wall_elapsed) > wall_guard_ms) {
+            timed_out = true;
+            break;
+        }
+    }
+    if (timed_out) {
+        if (has_job) {
+            TerminateJobObject(job, 124);
+        } else {
+            TerminateProcess(pi.hProcess, 124);
+        }
+        WaitForSingleObject(pi.hProcess, INFINITE);
+    }
+
+    DWORD exit_code = 0;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    cpu_elapsed_ms = process_cpu_time_ms(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    if (job) CloseHandle(job);
+    close_opened_files();
+
+    return ProcessResult{static_cast<int>(exit_code), timed_out, false,
+                         cpu_elapsed_ms};
 #endif
 }
 
@@ -858,7 +1179,7 @@ fs::path find_actual_output(const fs::path& run_dir,
 
 fs::path null_output_path() {
 #ifdef _WIN32
-    return "\\\\.\\NUL";
+    return "NUL";
 #else
     return "/dev/null";
 #endif
@@ -1421,7 +1742,17 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
 unsigned int configured_worker_count(const JudgeOptions& options) {
     unsigned int worker_count = options.parallel_jobs;
     if (worker_count == 0) {
-        worker_count = std::thread::hardware_concurrency();
+#ifdef _WIN32
+        worker_count = windows_physical_core_count();
+#elif defined(__linux__)
+        worker_count = linux_physical_core_count();
+#endif
+        if (worker_count == 0) {
+            worker_count = std::thread::hardware_concurrency();
+            if (worker_count > 1) {
+                worker_count = (worker_count + 1) / 2;
+            }
+        }
         if (worker_count == 0) {
             worker_count = 1;
         }
@@ -1726,7 +2057,23 @@ public:
             }
         }
 
-        run_contestant_jobs(std::move(all_jobs));
+        std::sort(all_jobs.begin(), all_jobs.end(), [](const TestJob& a, const TestJob& b) {
+            return std::make_tuple(a.contestant, a.problem->name,
+                                   a.test.path().filename().string()) <
+                   std::make_tuple(b.contestant, b.problem->name,
+                                   b.test.path().filename().string());
+        });
+        std::vector<TestJob> job_group;
+        for (const auto& job : all_jobs) {
+            if (!job_group.empty() &&
+                (job_group.back().contestant != job.contestant ||
+                 job_group.back().problem != job.problem)) {
+                run_contestant_jobs(std::move(job_group));
+                job_group.clear();
+            }
+            job_group.push_back(job);
+        }
+        run_contestant_jobs(std::move(job_group));
 
         std::sort(results.begin(), results.end(), [](const TestResult& a, const TestResult& b) {
             return std::tie(a.contestant, a.problem, a.test) < std::tie(b.contestant, b.problem, b.test);
