@@ -59,7 +59,7 @@ jobs:
       - name: Install Qt and MinGW
         uses: jurplel/install-qt-action@v4
         with:
-          version: 6.11.1
+          version: 6.8.*
           arch: win64_mingw
           tools: tools_mingw1310,qt.tools.win64_mingw1310
           cache: true
