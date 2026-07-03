@@ -256,6 +256,11 @@ temporary folder, changed there, and saved back only for mutating commands.
 ./build/neothemis-cli convert /path/to/old-themis-folder converted.ncontest
 ```
 
+ZIP compression and extraction use available CPU cores across archive entries.
+Compression keeps a bounded number of prepared entries in memory while writing
+the archive in stable path order. The GUI uses the same archive implementation
+for opening and saving `.ncontest` files.
+
 `convert` reads old Themis contests whose `*.cfg` and `*.config` files are
 zlib-compressed XML. It uses `ContestantDirectories.txt` and
 `TaskDirectories.txt` to build the new `contestants/` and `tests/` folders, and

@@ -344,36 +344,6 @@ void write_le32(std::ostream& out, std::uint32_t value) {
     out.put(static_cast<char>((value >> 24U) & 0xffU));
 }
 
-std::uint16_t read_le16(const std::string& data, std::size_t offset) {
-    if (offset + 2 > data.size()) {
-        throw std::runtime_error("invalid zip file");
-    }
-    return static_cast<std::uint16_t>(
-        static_cast<unsigned char>(data[offset]) |
-        (static_cast<unsigned char>(data[offset + 1]) << 8));
-}
-
-std::uint32_t read_le32(const std::string& data, std::size_t offset) {
-    if (offset + 4 > data.size()) {
-        throw std::runtime_error("invalid zip file");
-    }
-    return static_cast<std::uint32_t>(
-        static_cast<unsigned char>(data[offset]) |
-        (static_cast<unsigned char>(data[offset + 1]) << 8) |
-        (static_cast<unsigned char>(data[offset + 2]) << 16) |
-        (static_cast<unsigned char>(data[offset + 3]) << 24));
-}
-
-std::string read_binary_file(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("failed to read " + path.string());
-    }
-    std::ostringstream out;
-    out << in.rdbuf();
-    return out.str();
-}
-
 struct ZipEntry {
     std::string name;
     std::string data;
@@ -392,6 +362,17 @@ void report_archive_progress(const ArchiveProgress& progress,
     if (progress) {
         progress(done, total, label_key);
     }
+}
+
+neothemis::ArchiveProgress core_archive_progress(const ArchiveProgress& progress) {
+    if (!progress) {
+        return {};
+    }
+    return [progress](std::uint64_t done,
+                      std::uint64_t total,
+                      const std::string& label) {
+        progress(done, total, label.c_str());
+    };
 }
 
 #ifdef NEOTHEMIS_HAS_ZLIB
@@ -423,31 +404,6 @@ std::string zip_deflate_raw(const std::string& input) {
     return output;
 }
 
-std::string zip_inflate_raw(const std::string& input, std::uint32_t output_size) {
-    std::string output;
-    output.resize(output_size);
-    if (output_size == 0) {
-        return output;
-    }
-
-    z_stream stream{};
-    if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
-        throw std::runtime_error("failed to initialize zip extraction");
-    }
-
-    stream.next_in = reinterpret_cast<Bytef*>(const_cast<char*>(input.data()));
-    stream.avail_in = static_cast<uInt>(input.size());
-    stream.next_out = reinterpret_cast<Bytef*>(output.data());
-    stream.avail_out = static_cast<uInt>(output.size());
-
-    int result = inflate(&stream, Z_FINISH);
-    if (result != Z_STREAM_END || stream.total_out != output_size) {
-        inflateEnd(&stream);
-        throw std::runtime_error("failed to extract compressed zip entry");
-    }
-    inflateEnd(&stream);
-    return output;
-}
 #endif
 
 bool archive_name_is_directory(const std::string& name) {
@@ -490,19 +446,6 @@ std::string normalized_archive_name(std::string name) {
         normalized.push_back('/');
     }
     return normalized;
-}
-
-fs::path archive_output_path(const fs::path& root, const std::string& name) {
-    std::string normalized = normalized_archive_name(name);
-    fs::path result = root;
-    std::stringstream stream(normalized);
-    std::string segment;
-    while (std::getline(stream, segment, '/')) {
-        if (!segment.empty()) {
-            result /= segment;
-        }
-    }
-    return result;
 }
 
 void prepare_zip_entry(ZipEntry& entry, bool compress) {
@@ -601,162 +544,15 @@ void write_zip_store(const fs::path& path,
 void extract_zip_file(const fs::path& archive_path,
                       const fs::path& destination,
                       const ArchiveProgress& progress = {}) {
-    report_archive_progress(progress, 0, 0, "reading_archive");
-    std::string zip = read_binary_file(archive_path);
-    if (zip.size() < 22) {
-        throw std::runtime_error("invalid zip file");
-    }
-
-    std::size_t eocd = std::string::npos;
-    std::size_t min_offset = zip.size() > 65557 ? zip.size() - 65557 : 0;
-    for (std::size_t pos = zip.size() - 22;; --pos) {
-        if (read_le32(zip, pos) == 0x06054b50U) {
-            eocd = pos;
-            break;
-        }
-        if (pos == min_offset) {
-            break;
-        }
-    }
-    if (eocd == std::string::npos) {
-        throw std::runtime_error("invalid zip file");
-    }
-
-    std::uint16_t entry_count = read_le16(zip, eocd + 10);
-    std::uint32_t central_offset = read_le32(zip, eocd + 16);
-    std::size_t cursor = central_offset;
-    fs::create_directories(destination);
-    report_archive_progress(progress, 0, entry_count, "extracting_archive");
-
-    for (std::uint16_t index = 0; index < entry_count; ++index) {
-        if (read_le32(zip, cursor) != 0x02014b50U) {
-            throw std::runtime_error("invalid zip central directory");
-        }
-        std::uint16_t flags = read_le16(zip, cursor + 8);
-        std::uint16_t method = read_le16(zip, cursor + 10);
-        std::uint32_t crc = read_le32(zip, cursor + 16);
-        std::uint32_t compressed_size = read_le32(zip, cursor + 20);
-        std::uint32_t uncompressed_size = read_le32(zip, cursor + 24);
-        std::uint16_t name_length = read_le16(zip, cursor + 28);
-        std::uint16_t extra_length = read_le16(zip, cursor + 30);
-        std::uint16_t comment_length = read_le16(zip, cursor + 32);
-        std::uint32_t local_offset = read_le32(zip, cursor + 42);
-        if ((flags & 1U) != 0) {
-            throw std::runtime_error("encrypted zip entries are not supported");
-        }
-        if (cursor + 46 + name_length + extra_length + comment_length > zip.size()) {
-            throw std::runtime_error("invalid zip central directory");
-        }
-        std::string name = zip.substr(cursor + 46, name_length);
-        cursor += 46 + name_length + extra_length + comment_length;
-
-        if (read_le32(zip, local_offset) != 0x04034b50U) {
-            throw std::runtime_error("invalid zip local header");
-        }
-        std::uint16_t local_name_length = read_le16(zip, local_offset + 26);
-        std::uint16_t local_extra_length = read_le16(zip, local_offset + 28);
-        std::size_t data_offset = local_offset + 30 + local_name_length + local_extra_length;
-        if (data_offset + compressed_size > zip.size()) {
-            throw std::runtime_error("invalid zip entry data");
-        }
-
-        fs::path output_path = archive_output_path(destination, name);
-        if (archive_name_is_directory(normalized_archive_name(name))) {
-            fs::create_directories(output_path);
-            report_archive_progress(progress, index + 1, entry_count, "extracting_archive");
-            continue;
-        }
-
-        std::string compressed = zip.substr(data_offset, compressed_size);
-        std::string content;
-        if (method == 0) {
-            content = std::move(compressed);
-            if (content.size() != uncompressed_size) {
-                throw std::runtime_error("invalid stored zip entry");
-            }
-        } else if (method == 8) {
-#ifdef NEOTHEMIS_HAS_ZLIB
-            content = zip_inflate_raw(compressed, uncompressed_size);
-#else
-            throw std::runtime_error("compressed zip entries require zlib support");
-#endif
-        } else {
-            throw std::runtime_error("unsupported zip compression method");
-        }
-        if (crc32_bytes(content) != crc) {
-            throw std::runtime_error("zip entry checksum failed");
-        }
-
-        fs::create_directories(output_path.parent_path());
-        std::ofstream out(output_path, std::ios::binary);
-        if (!out) {
-            throw std::runtime_error("failed to write " + output_path.string());
-        }
-        out.write(content.data(), static_cast<std::streamsize>(content.size()));
-        report_archive_progress(progress, index + 1, entry_count, "extracting_archive");
-    }
-}
-
-bool should_skip_contest_archive_path(const fs::path& path) {
-    for (const auto& part : path) {
-        if (part == ".neothemis-work") {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::string archive_name_for_path(const fs::path& relative) {
-    std::string name = relative.generic_string();
-    return normalized_archive_name(name);
-}
-
-std::vector<ZipEntry> collect_contest_archive_entries(const fs::path& root,
-                                                      const ArchiveProgress& progress = {}) {
-    std::vector<ZipEntry> entries;
-    if (!fs::exists(root)) {
-        throw std::runtime_error("contest folder not found: " + root.string());
-    }
-
-    report_archive_progress(progress, 0, 0, "scanning_contest");
-    std::vector<fs::path> paths;
-    for (fs::recursive_directory_iterator it(root), end; it != end; ++it) {
-        fs::path relative = fs::relative(it->path(), root);
-        if (should_skip_contest_archive_path(relative)) {
-            if (it->is_directory()) {
-                it.disable_recursion_pending();
-            }
-            continue;
-        }
-        paths.push_back(it->path());
-    }
-    std::sort(paths.begin(), paths.end());
-
-    std::uint64_t total_paths = static_cast<std::uint64_t>(paths.size());
-    std::uint64_t done_paths = 0;
-    report_archive_progress(progress, done_paths, total_paths, "reading_contest_files");
-    for (const auto& path : paths) {
-        fs::path relative = fs::relative(path, root);
-        std::string name = archive_name_for_path(relative);
-        if (fs::is_directory(path)) {
-            if (!archive_name_is_directory(name)) {
-                name.push_back('/');
-            }
-            entries.push_back({name, {}});
-        } else if (fs::is_regular_file(path)) {
-            entries.push_back({name, read_binary_file(path)});
-        }
-        ++done_paths;
-        report_archive_progress(progress, done_paths, total_paths, "reading_contest_files");
-    }
-    return entries;
+    neothemis::extract_zip_archive(archive_path, destination,
+                                   core_archive_progress(progress));
 }
 
 void write_contest_archive(const fs::path& archive_path,
                            const fs::path& contest_root,
                            const ArchiveProgress& progress = {}) {
-    write_zip_store(archive_path, collect_contest_archive_entries(contest_root, progress),
-                    true, progress);
+    neothemis::write_zip_archive_from_directory(
+        archive_path, contest_root, core_archive_progress(progress));
 }
 
 void write_xlsx_file(const fs::path& path,

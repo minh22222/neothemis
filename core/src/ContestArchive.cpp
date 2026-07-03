@@ -1,22 +1,30 @@
 #include "neothemis/ContestArchive.hpp"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef NEOTHEMIS_HAS_ZLIB
@@ -41,6 +49,20 @@ struct PendingZipEntry {
     fs::path path;
     std::string name;
     bool directory = false;
+};
+
+struct PreparedZipEntry {
+    ZipEntry entry;
+    std::string content;
+};
+
+struct ZipExtractionEntry {
+    fs::path output_path;
+    std::size_t data_offset = 0;
+    std::uint16_t method = 0;
+    std::uint32_t crc = 0;
+    std::uint32_t compressed_size = 0;
+    std::uint32_t uncompressed_size = 0;
 };
 
 struct ScopedDirectory {
@@ -125,19 +147,85 @@ void report_progress(const ArchiveProgress& progress,
     }
 }
 
+unsigned int archive_worker_count(std::size_t task_count) {
+    if (task_count == 0) {
+        return 0;
+    }
+    unsigned int detected = std::thread::hardware_concurrency();
+    if (detected == 0) {
+        detected = 1;
+    }
+    return static_cast<unsigned int>(
+        std::min<std::size_t>(detected, task_count));
+}
+
+void run_parallel_archive_tasks(
+    std::size_t task_count,
+    const std::function<void(std::size_t)>& task) {
+    unsigned int worker_count = archive_worker_count(task_count);
+    if (worker_count <= 1) {
+        for (std::size_t index = 0; index < task_count; ++index) {
+            task(index);
+        }
+        return;
+    }
+
+    std::atomic<std::size_t> next_task{0};
+    std::atomic<bool> stop{false};
+    std::mutex error_mutex;
+    std::exception_ptr error;
+
+    auto worker = [&]() {
+        try {
+            while (!stop.load()) {
+                std::size_t index = next_task.fetch_add(1);
+                if (index >= task_count) {
+                    return;
+                }
+                task(index);
+            }
+        } catch (...) {
+            stop.store(true);
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (!error) {
+                error = std::current_exception();
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (unsigned int index = 0; index < worker_count; ++index) {
+            workers.emplace_back(worker);
+        }
+    } catch (...) {
+        stop.store(true);
+        for (auto& thread : workers) {
+            thread.join();
+        }
+        throw;
+    }
+    for (auto& thread : workers) {
+        thread.join();
+    }
+    if (error) {
+        std::rethrow_exception(error);
+    }
+}
+
 std::uint32_t crc32_bytes(const std::string& data) {
-    static std::uint32_t table[256]{};
-    static bool initialized = false;
-    if (!initialized) {
+    static const std::array<std::uint32_t, 256> table = []() {
+        std::array<std::uint32_t, 256> values{};
         for (std::uint32_t i = 0; i < 256; ++i) {
             std::uint32_t value = i;
             for (int bit = 0; bit < 8; ++bit) {
                 value = (value & 1U) ? (0xedb88320U ^ (value >> 1U)) : (value >> 1U);
             }
-            table[i] = value;
+            values[i] = value;
         }
-        initialized = true;
-    }
+        return values;
+    }();
 
     std::uint32_t crc = 0xffffffffU;
     for (unsigned char ch : data) {
@@ -385,7 +473,7 @@ fs::path archive_output_path(const fs::path& root, const std::string& name) {
 }
 
 void prepare_zip_content(const std::string& name,
-                         const std::string& original,
+                         std::string original,
                          bool compress,
                          ZipEntry& entry,
                          std::string& content) {
@@ -406,7 +494,7 @@ void prepare_zip_content(const std::string& name,
 #else
     (void)compress;
 #endif
-    content = original;
+    content = std::move(original);
     entry.compressed_size = static_cast<std::uint32_t>(content.size());
 }
 
@@ -433,6 +521,9 @@ void write_zip_archive(const fs::path& path,
                        const std::vector<PendingZipEntry>& pending,
                        bool compress,
                        const ArchiveProgress& progress) {
+    std::uint64_t total_entries = static_cast<std::uint64_t>(pending.size());
+    report_progress(progress, 0, total_entries, "compressing_archive");
+
     if (!path.parent_path().empty()) {
         fs::create_directories(path.parent_path());
     }
@@ -441,24 +532,133 @@ void write_zip_archive(const fs::path& path,
         throw std::runtime_error("failed to write " + path.string());
     }
 
+    unsigned int worker_count = archive_worker_count(pending.size());
+    std::size_t max_pending = std::max<std::size_t>(1, worker_count);
+    std::vector<std::unique_ptr<PreparedZipEntry>> ready(pending.size());
+    std::mutex state_mutex;
+    std::condition_variable state_changed;
+    std::size_t next_task = 0;
+    std::size_t next_write = 0;
+    bool stop = false;
+    std::exception_ptr worker_error;
+    std::mutex progress_mutex;
+    std::uint64_t completed_entries = 0;
+
+    auto worker = [&]() {
+        try {
+            for (;;) {
+                std::size_t index = 0;
+                {
+                    std::unique_lock<std::mutex> lock(state_mutex);
+                    state_changed.wait(lock, [&]() {
+                        return stop || next_task >= pending.size() ||
+                               next_task < next_write + max_pending;
+                    });
+                    if (stop || next_task >= pending.size()) {
+                        return;
+                    }
+                    index = next_task++;
+                }
+
+                auto result = std::make_unique<PreparedZipEntry>();
+                result->entry.name = normalized_archive_name(pending[index].name);
+                std::string original;
+                if (!pending[index].directory) {
+                    original = read_binary_file(pending[index].path);
+                }
+                prepare_zip_content(result->entry.name, std::move(original), compress,
+                                    result->entry, result->content);
+
+                {
+                    std::lock_guard<std::mutex> lock(state_mutex);
+                    ready[index] = std::move(result);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(progress_mutex);
+                    ++completed_entries;
+                    report_progress(progress, completed_entries, total_entries,
+                                    "compressing_archive");
+                }
+                state_changed.notify_all();
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(state_mutex);
+                if (!worker_error) {
+                    worker_error = std::current_exception();
+                }
+                stop = true;
+            }
+            state_changed.notify_all();
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (unsigned int index = 0; index < worker_count; ++index) {
+            workers.emplace_back(worker);
+        }
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            stop = true;
+        }
+        state_changed.notify_all();
+        for (auto& thread : workers) {
+            thread.join();
+        }
+        throw;
+    }
+
     std::vector<ZipEntry> entries;
     entries.reserve(pending.size());
-    std::uint64_t total_entries = static_cast<std::uint64_t>(pending.size());
-    report_progress(progress, 0, total_entries, "compressing_archive");
+    std::exception_ptr write_error;
     for (std::size_t index = 0; index < pending.size(); ++index) {
-        ZipEntry entry;
-        entry.name = normalized_archive_name(pending[index].name);
-        std::string original;
-        if (!pending[index].directory) {
-            original = read_binary_file(pending[index].path);
+        std::unique_ptr<PreparedZipEntry> result;
+        {
+            std::unique_lock<std::mutex> lock(state_mutex);
+            state_changed.wait(lock, [&]() {
+                return stop || worker_error || ready[index] != nullptr;
+            });
+            if (worker_error) {
+                break;
+            }
+            result = std::move(ready[index]);
+            next_write = index + 1;
         }
+        state_changed.notify_all();
 
-        std::string content;
-        prepare_zip_content(entry.name, original, compress, entry, content);
-        write_zip_local_entry(out, entry, content);
-        entries.push_back(entry);
-        report_progress(progress, static_cast<std::uint64_t>(index + 1), total_entries,
-                        "compressing_archive");
+        try {
+            write_zip_local_entry(out, result->entry, result->content);
+            if (!out) {
+                throw std::runtime_error("failed to write " + path.string());
+            }
+            entries.push_back(std::move(result->entry));
+        } catch (...) {
+            write_error = std::current_exception();
+            {
+                std::lock_guard<std::mutex> lock(state_mutex);
+                stop = true;
+            }
+            state_changed.notify_all();
+            break;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        stop = true;
+    }
+    state_changed.notify_all();
+    for (auto& thread : workers) {
+        thread.join();
+    }
+    if (worker_error) {
+        std::rethrow_exception(worker_error);
+    }
+    if (write_error) {
+        std::rethrow_exception(write_error);
     }
 
     std::uint32_t central_offset = static_cast<std::uint32_t>(out.tellp());
@@ -492,6 +692,9 @@ void write_zip_archive(const fs::path& path,
     write_le32(out, central_size);
     write_le32(out, central_offset);
     write_le16(out, 0);
+    if (!out) {
+        throw std::runtime_error("failed to write " + path.string());
+    }
 }
 
 bool should_skip_contest_archive_path(const fs::path& path) {
@@ -1230,6 +1433,9 @@ void extract_zip_archive(const fs::path& archive_path,
     fs::create_directories(destination);
     report_progress(progress, 0, entry_count, "extracting_archive");
 
+    std::vector<ZipExtractionEntry> files;
+    files.reserve(entry_count);
+    std::uint64_t completed_entries = 0;
     for (std::uint16_t index = 0; index < entry_count; ++index) {
         if (read_le32(zip, cursor) != 0x02014b50U) {
             throw std::runtime_error("invalid zip central directory");
@@ -1251,6 +1457,7 @@ void extract_zip_archive(const fs::path& archive_path,
         }
         std::string name = zip.substr(cursor + 46, name_length);
         cursor += 46 + name_length + extra_length + comment_length;
+        std::string normalized_name = normalized_archive_name(name);
 
         if (read_le32(zip, local_offset) != 0x04034b50U) {
             throw std::runtime_error("invalid zip local header");
@@ -1262,36 +1469,50 @@ void extract_zip_archive(const fs::path& archive_path,
             throw std::runtime_error("invalid zip entry data");
         }
 
-        fs::path output_path = archive_output_path(destination, name);
-        if (archive_name_is_directory(normalized_archive_name(name))) {
+        fs::path output_path = archive_output_path(destination, normalized_name);
+        if (archive_name_is_directory(normalized_name)) {
             fs::create_directories(output_path);
-            report_progress(progress, index + 1, entry_count, "extracting_archive");
+            ++completed_entries;
+            report_progress(progress, completed_entries, entry_count, "extracting_archive");
             continue;
         }
 
-        std::string compressed = zip.substr(data_offset, compressed_size);
-        std::string content;
-        if (method == 0) {
-            content = std::move(compressed);
-            if (content.size() != uncompressed_size) {
-                throw std::runtime_error("invalid stored zip entry");
-            }
-        } else if (method == 8) {
-#ifdef NEOTHEMIS_HAS_ZLIB
-            content = zip_inflate_raw(compressed, uncompressed_size);
-#else
-            throw std::runtime_error("compressed zip entries require zlib support");
-#endif
-        } else {
+        if (method != 0 && method != 8) {
             throw std::runtime_error("unsupported zip compression method");
         }
-        if (crc32_bytes(content) != crc) {
+#ifndef NEOTHEMIS_HAS_ZLIB
+        if (method == 8) {
+            throw std::runtime_error("compressed zip entries require zlib support");
+        }
+#endif
+        files.push_back(ZipExtractionEntry{output_path, data_offset, method, crc,
+                                           compressed_size, uncompressed_size});
+    }
+
+    std::mutex progress_mutex;
+    run_parallel_archive_tasks(files.size(), [&](std::size_t index) {
+        const ZipExtractionEntry& entry = files[index];
+        std::string compressed = zip.substr(entry.data_offset, entry.compressed_size);
+        std::string content;
+        if (entry.method == 0) {
+            content = std::move(compressed);
+            if (content.size() != entry.uncompressed_size) {
+                throw std::runtime_error("invalid stored zip entry");
+            }
+        } else {
+#ifdef NEOTHEMIS_HAS_ZLIB
+            content = zip_inflate_raw(compressed, entry.uncompressed_size);
+#endif
+        }
+        if (crc32_bytes(content) != entry.crc) {
             throw std::runtime_error("zip entry checksum failed");
         }
 
-        write_binary_file(output_path, content);
-        report_progress(progress, index + 1, entry_count, "extracting_archive");
-    }
+        write_binary_file(entry.output_path, content);
+        std::lock_guard<std::mutex> lock(progress_mutex);
+        ++completed_entries;
+        report_progress(progress, completed_entries, entry_count, "extracting_archive");
+    });
 }
 
 void write_zip_archive_from_directory(const fs::path& archive_path,
