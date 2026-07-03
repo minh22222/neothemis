@@ -1,7 +1,9 @@
 # NeoThemis
 
-NeoThemis is a small C++17 competitive-programming contest judge. A contest is
+NeoThemis is a small competitive-programming contest judge. A contest is
 represented by a directory wrapper with contestant submissions and test cases.
+
+This is all made by Codex, so expect bugs.
 
 ## Layout
 
@@ -33,6 +35,19 @@ Problem names are matched by source-file stem. For example, tests in
 `tests/A` are judged against each contestant's `A.cpp`, `A.cc`, or `A.cxx`.
 
 ## Build
+
+Windows (Don't use Visual Studio build tools):
+
+```sh
+cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=C:/Qt/Tools/mingw1310_64/bin/gcc.exe -DCMAKE_CXX_COMPILER=C:/Qt/Tools/mingw1310_64/bin/g++.exe -DCMAKE_PREFIX_PATH=C:/Qt/6.11.1/mingw_64
+cmake --build build
+C:\Qt\6.11.1\mingw_64\bin\windeployqt.exe build\neothemis-gui.exe
+```
+
+You can change the -DCMAKE_C_COMPILER, -DCMAKE_CXX_COMPILER, -DCMAKE_PREFIX_PATH to your own MinGW directory but it needs to be on the same version as the MinGW of Qt.
+
+Linux:
+
 
 ```sh
 cmake -S . -B build
@@ -221,18 +236,41 @@ Contest settings can be edited from the CLI:
 ./build/neothemis-cli config /path/to/contest problem A set checker custom
 ./build/neothemis-cli config /path/to/contest problem A points 2 1-10
 ./build/neothemis-cli config /path/to/contest problem A points 5 1 5 3 12
+./build/neothemis-cli config contest.ncontest problem A points default 1-10
 ```
 
 The `points` command uses `points <value> <tests...>`, where tests can be
-individual names or numeric ranges.
+individual names or numeric ranges. Use `points default <tests...>` to leave
+those test points blank so `default_points` is used.
+
+The CLI accepts either a contest folder or a `.ncontest` archive for `judge`,
+`rejudge`, `config`, and the export commands. Archive inputs are extracted to a
+temporary folder, changed there, and saved back only for mutating commands.
+
+## Archive CLI
+
+```sh
+./build/neothemis-cli pack /path/to/contest contest.ncontest
+./build/neothemis-cli unpack contest.ncontest /path/to/output-folder
+./build/neothemis-cli convert old.contest converted.ncontest
+./build/neothemis-cli convert /path/to/old-themis-folder converted.ncontest
+```
+
+`convert` reads old Themis contests whose `*.cfg` and `*.config` files are
+zlib-compressed XML. It uses `ContestantDirectories.txt` and
+`TaskDirectories.txt` to build the new `contestants/` and `tests/` folders, and
+drops old Themis-only config files from the generated `.ncontest`.
 
 ## Run
 
 ```sh
 ./build/neothemis-cli judge /path/to/contest
+./build/neothemis-cli judge contest.ncontest
 ./build/neothemis-cli judge /path/to/contest --problem VENUE
 ./build/neothemis-cli judge /path/to/contest --contestant "Tran Minh Duy"
 ./build/neothemis-cli rejudge /path/to/contest --problem VENUE --contestant "Tran Minh Duy"
+./build/neothemis-cli export-scoreboard contest.ncontest scoreboard.xlsx
+./build/neothemis-cli export-data contest.ncontest data.xlsx
 ```
 
 `judge` and `rejudge` use the same execution path. The filters are

@@ -20,6 +20,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -1507,6 +1508,9 @@ void apply_problem_setting(ProblemSettings& settings,
             if (test_name.empty()) {
                 throw std::runtime_error("empty test name in " + settings_path.string());
             }
+            if (trim(value).empty()) {
+                return;
+            }
             settings.test_points[test_name] = std::stod(value);
         } else {
             throw std::runtime_error("unknown problem setting in " +
@@ -1774,6 +1778,29 @@ fs::path work_root_for_contest(const JudgeOptions& options) {
                    std::to_string(process_id) + "-" + std::to_string(now));
 }
 
+class ScopedWorkdirCleanup {
+public:
+    ScopedWorkdirCleanup(fs::path path, bool enabled)
+        : path_(std::move(path)), enabled_(enabled) {}
+
+    ~ScopedWorkdirCleanup() {
+        cleanup();
+    }
+
+    void cleanup() {
+        if (!enabled_) {
+            return;
+        }
+        std::error_code ignored;
+        fs::remove_all(path_, ignored);
+        enabled_ = false;
+    }
+
+private:
+    fs::path path_;
+    bool enabled_ = false;
+};
+
 class BuiltinJudgeCore final : public JudgeCore {
 public:
     std::vector<TestResult> judge(const JudgeOptions& options) override {
@@ -1788,6 +1815,7 @@ public:
             throw std::runtime_error("tests directory not found: " + tests_root.string());
         }
 
+        ScopedWorkdirCleanup workdir_cleanup(work_root.parent_path(), !options.keep_workdir);
         if (!options.keep_workdir) {
             std::error_code ignored;
             fs::remove_all(work_root, ignored);
@@ -2080,8 +2108,7 @@ public:
         });
 
         if (!options.keep_workdir) {
-            std::error_code ignored;
-            fs::remove_all(work_root, ignored);
+            workdir_cleanup.cleanup();
         }
         return results;
     }

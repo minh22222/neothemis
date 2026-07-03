@@ -3,3 +3,5 @@ build/
 **/.neothemis-work/
 examples/
 marathonr1/
+marathonr1_old/
+.agents/
