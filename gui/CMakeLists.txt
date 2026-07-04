@@ -12,10 +12,27 @@ find_package(Qt6ZlibPrivate QUIET)
 
 add_executable(neothemis-gui
     main.cpp
+    MainWindow.cpp
+    MainWindow.hpp
+    FileFormats.cpp
+    FileFormats.hpp
+    FileAssociation.cpp
+    FileAssociation.hpp
+    GuiSupport.cpp
+    GuiSupport.hpp
+    Theme.cpp
+    Theme.hpp
+    ThemeBackground.cpp
+    ThemeBackground.hpp
+    Translations.cpp
+    Translations.hpp
+    WindowResizeHandles.cpp
+    WindowResizeHandles.hpp
 )
 
 if (WIN32)
     target_sources(neothemis-gui PRIVATE ${CMAKE_SOURCE_DIR}/materials/neothemis.rc)
+    target_link_libraries(neothemis-gui PRIVATE shell32)
 endif()
 
 qt_add_resources(neothemis-gui neothemis_gui_resources
