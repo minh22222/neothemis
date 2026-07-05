@@ -2,9 +2,9 @@ if (NOT NEOTHEMIS_BUILD_GUI)
     return()
 endif()
 
-find_package(Qt6 COMPONENTS Widgets QUIET)
+find_package(Qt6 COMPONENTS Widgets Sql QUIET)
 if (NOT Qt6_FOUND)
-    message(STATUS "Qt6 Widgets not found; neothemis-gui target disabled")
+    message(STATUS "Qt6 Widgets/Sql not found; neothemis-gui target disabled")
     return()
 endif()
 find_package(ZLIB QUIET)
@@ -41,7 +41,7 @@ qt_add_resources(neothemis-gui neothemis_gui_resources
     FILES ${CMAKE_SOURCE_DIR}/materials/logo.png
 )
 
-target_link_libraries(neothemis-gui PRIVATE neothemis_core Qt6::Widgets)
+target_link_libraries(neothemis-gui PRIVATE neothemis_core Qt6::Widgets Qt6::Sql)
 if (TARGET Qt6::ZlibPrivate)
     target_link_libraries(neothemis-gui PRIVATE Qt6::ZlibPrivate)
     target_compile_definitions(neothemis-gui PRIVATE NEOTHEMIS_HAS_ZLIB=1)

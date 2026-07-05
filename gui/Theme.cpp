@@ -5,6 +5,7 @@
 namespace neothemis::gui {
 
 void apply_application_theme(const std::string& theme) {
+    const bool cyber = theme == "cyber" || theme == "glassy-dark";
     QString style_sheet = QString::fromUtf8(R"(
         QWidget {
             background: #090d12;
@@ -73,6 +74,9 @@ void apply_application_theme(const std::string& theme) {
         QToolButton#WindowButton:hover {
             background: rgba(84, 211, 194, 44);
             color: #ffffff;
+        }
+        QToolButton#WindowCloseButton {
+            font-size: 13px;
         }
         QToolButton#WindowCloseButton:hover {
             background: rgba(204, 38, 57, 230);
@@ -299,7 +303,7 @@ void apply_application_theme(const std::string& theme) {
         QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
     )");
 
-    if (theme == "glassy-dark") {
+    if (cyber) {
         style_sheet += QString::fromUtf8(R"(
             QMainWindow {
                 background: transparent;

@@ -2,7 +2,8 @@
 
 NeoThemis is a local competitive-programming contest judge for C++
 submissions. It has a Qt GUI, a CLI, `.ncontest` archive support, parallel test
-execution, built-in token comparison, and per-problem custom checkers.
+execution, built-in token comparison, per-problem custom checkers, and an
+optional local web server for contestant submissions.
 
 ## Build
 
@@ -23,7 +24,8 @@ C:\Qt\6.11.1\mingw_64\bin\windeployqt.exe build\neothemis-gui.exe
 
 Use the MinGW version that matches your Qt package. The built-in judge expects
 `g++` to be available on `PATH`, unless `compiler` is changed in
-`neothemis.conf`.
+`neothemis.conf`. The GUI uses Qt Widgets; the local server uses Qt Core,
+Network, and Sql.
 
 GitHub Actions builds Linux and Windows packages on pushes and pull requests to
 `main`. The workflow also runs a CLI smoke test and uploads build artifacts.
@@ -34,6 +36,7 @@ GitHub Actions builds Linux and Windows packages on pushes and pull requests to
 ./build/neothemis-gui
 ./build/neothemis-gui contest.ncontest
 ./build/neothemis-gui --register-file-association
+./build/neothemis-server --contest /path/to/contest
 ./build/neothemis-cli judge /path/to/contest
 ./build/neothemis-cli judge contest.ncontest
 ./build/neothemis-cli judge /path/to/contest --problem VENUE
@@ -51,6 +54,142 @@ application settings screen can register NeoThemis as the user-level opener for
 `judge` and `rejudge` use the same execution path. Problem and contestant
 filters are case-insensitive and repeatable. Archive inputs are extracted to a
 temporary folder; mutating commands save changes back to the archive.
+
+## Local Judging Server
+
+`neothemis-server` runs a small local HTTP server where contestants can
+register, log in, paste C++ source, submit to a problem, and view verdicts. It
+reuses the same `core/` judge as the CLI and GUI.
+
+Local-only mode:
+
+```sh
+./build/neothemis-server --contest /path/to/contest
+```
+
+The GUI can start the same server from `Server` -> `Start Local Server`. The
+server defaults are configured from `Settings` -> `Server Settings`, and
+contest-local users can be created from `Settings` -> `Server Users`. The
+`neothemis-server` executable must be in the same folder as `neothemis-gui` or
+available on `PATH`; CI packages include it beside the GUI.
+
+The Server Users tab shows each account password and supports changing or
+removing an account later. Removing an account also removes its server sessions
+and submission records, but does not remove its contestant folder. NeoThemis
+prevents removal of the final admin account.
+
+`Contestant` -> `Sync Contestants to Server` creates an account for every
+contestant folder that does not already have one. Existing accounts are left
+unchanged, and contestant accounts whose folders no longer exist are removed.
+Admin accounts are never removed by synchronization. New synchronized accounts
+use the default password `123456`; change these passwords in Server Users before
+exposing the server to contestants. Removing only a server account while keeping
+its contestant folder causes the next synchronization to recreate that account.
+
+While a GUI-started server is running, the GUI auto-refreshes the contest table
+when server users, submitted sources, or judged results change. Registered
+contestants are created under the contest `contestants_dir`, submitted source is
+copied to that contestant folder, and judged server submissions are merged into
+the configured `output_csv` file, defaulting to `results.csv`.
+
+By default the server binds to `127.0.0.1:8080`. On first run it creates an
+admin account and a contestant join code, prints generated credentials to the
+terminal, and stores data in `<contest>/.neothemis-server/`.
+
+All server state is contest-local by default:
+
+```text
+<contest>/.neothemis-server/server.db
+<contest>/.neothemis-server/submissions/
+<contest>/.neothemis-server/jobs/
+```
+
+The GUI always starts the bundled server with that contest-local data folder.
+When working from a `.ncontest` archive, the database lives in the extracted
+contest folder and is included when the contest archive is saved again.
+
+Contestant usernames may contain letters, digits, spaces, underscores, and
+dashes. Slashes, path separators, and control characters are rejected.
+
+The web submit page includes lightweight C++ syntax highlighting. It is served
+by the local NeoThemis server itself, so no internet CDN is required.
+
+`Settings` -> `Server Settings` has two contest-local web visibility options:
+
+- `Enable web ranking` lets contestants open the live `/ranking` page. The table
+  auto-refreshes and shows rank, contestant name, the score for each problem,
+  and total points. It reads the contest `output_csv`, so local GUI/CLI judging
+  and server judging update the same ranking. Verdicts, messages, and per-test
+  data are not shown there.
+- `Contestants can see own judge details` lets contestants open the detail page
+  for their own submissions. They still cannot open another contestant's details.
+
+Admins can always open the ranking and all submission detail pages. On the admin
+submission table, `Ignore` marks a submission as skipped for ranking and
+`results.csv` output while keeping the submission row and stored test details
+available for audit.
+
+### Import Server Users From CSV
+
+Use `Settings` -> `Server Users` -> `Import CSV Users` to create accounts in
+the contest-local server database. The CSV format is:
+
+```text
+username,password,role
+Nguyen Van A,secret123,contestant
+Admin User,admin-secret,admin
+```
+
+The header row is optional. `role` is optional and defaults to `contestant`.
+Invalid rows and duplicate usernames are skipped and reported after import.
+
+LAN mode must be explicit:
+
+```sh
+./build/neothemis-server --contest /path/to/contest \
+  --host 0.0.0.0 --port 8080 --allow-lan \
+  --admin-password change-this --join-code contest-join-code
+```
+
+Useful options:
+
+```text
+--data <folder>           Server database, submissions, and job folders
+--admin-user <name>       Admin username, default: admin
+--admin-password <pass>   Admin password
+--join-code <code>        Required for contestant self-registration
+--allow-lan               Required for non-loopback bind addresses
+```
+
+Security model:
+
+- The default bind address is loopback only. LAN exposure requires
+  `--allow-lan`.
+- Contestant registration requires the join code.
+- Passwords are stored as plain text in the contest-local database so they can
+  be shown and managed in the desktop GUI. Anyone who can read the contest
+  folder or a saved `.ncontest` archive can read these passwords. Use unique
+  contest-only passwords and protect the contest files. Databases created by an
+  older version keep accepting their legacy password hashes until each password
+  is reset in the GUI.
+- Sessions use random HttpOnly SameSite cookies and POST submissions require a
+  CSRF token.
+- Admin submission-ignore actions also require the admin session CSRF token.
+- Request bodies and source code are size-limited.
+- Usernames and problem names are restricted to safe identifier characters.
+- Submissions are stored under the server data folder, never by user-supplied
+  paths.
+- Each submission is judged in a generated mini contest containing only that
+  contestant source and the selected problem tests.
+- Problem copies skip symlinks.
+- The judge still applies the configured `forbidden_pattern` source filters.
+- The server runs one judge worker and uses `parallel_jobs=1` per submitted
+  source to avoid one contestant consuming all CPU cores.
+
+Important limitation: this is not a complete sandbox. Submitted C++ still runs
+as the OS user that started `neothemis-server`. For untrusted contestants, run
+the server inside a VM, container, or dedicated contest machine with restricted
+permissions and no sensitive files.
 
 ## Contest Layout
 
@@ -83,6 +222,12 @@ contest/
 
 Problem names are matched by source-file stem. For example, tests in `tests/A`
 are judged against each contestant's `A.cpp`, `A.cc`, or `A.cxx`.
+
+In the GUI, `Contestant` -> `Add Contestants From Folder` imports contestant
+folders into the configured `contestants_dir`. If the selected folder contains
+subfolders, each subfolder is imported as one contestant. If it has no
+subfolders, the selected folder itself is imported as one contestant. Existing
+contestant folders are merged and matching files are overwritten.
 
 Each test folder stores the official input and answer using the problem name,
 such as `tests/A/1/A.inp` and `tests/A/1/A.out`.
@@ -229,6 +374,8 @@ tests_dir=tests
 output_csv=results.csv
 scoreboard_csv=scoreboard.csv
 keep_workdir=false
+server_ranking_enabled=false
+server_contestant_details_enabled=false
 compiler=g++
 compile_flags=-std=c++17 -O2 -pipe
 stack_limit_mb=64
@@ -266,6 +413,14 @@ written inside the contest folder.
 `keep_workdir`
 : Whether to keep `.neothemis-work` after judging. Default: `false`. Accepted
 values are `true`, `false`, `1`, `0`, `yes`, `no`, `on`, and `off`.
+
+`server_ranking_enabled`
+: Whether contestants can view the live web ranking page. Default: `false`.
+Admins can always view the ranking.
+
+`server_contestant_details_enabled`
+: Whether contestants can view per-test details for their own web submissions.
+Default: `false`. Admins can always view all submission details.
 
 `compiler`
 : C++ compiler command. Default: `g++`. This command is used for submissions and
@@ -383,3 +538,5 @@ drops old Themis-only config files from the generated `.ncontest`.
   GUI helpers, styling and background effects, localized text, and Windows
   frame behavior.
 - `gui/main.cpp` initializes Qt and launches the main window.
+- `server/main.cpp` contains the local HTTP judging server, SQLite-backed
+  accounts/sessions/submissions, and the single-worker submission queue.

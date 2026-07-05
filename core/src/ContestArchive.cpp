@@ -1111,6 +1111,8 @@ void write_default_neothemis_config(const fs::path& new_root) {
         << "output_csv=results.csv\n"
         << "scoreboard_csv=scoreboard.csv\n"
         << "keep_workdir=false\n"
+        << "server_ranking_enabled=false\n"
+        << "server_contestant_details_enabled=false\n"
         << "compiler=g++\n"
         << "compile_flags=-std=c++17 -O2 -pipe\n"
         << "stack_limit_mb=64\n"

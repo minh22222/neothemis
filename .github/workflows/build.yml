@@ -36,10 +36,13 @@ jobs:
       - name: Smoke test CLI
         run: ./build/neothemis-cli --help
 
+      - name: Smoke test server
+        run: ./build/neothemis-server --help
+
       - name: Package
         run: |
           mkdir -p dist
-          cp build/neothemis-cli build/neothemis-gui dist/
+          cp build/neothemis-cli build/neothemis-gui build/neothemis-server dist/
           tar -czf neothemis-linux-x64.tar.gz -C dist .
 
       - name: Upload Linux build
@@ -73,12 +76,16 @@ jobs:
       - name: Smoke test CLI
         run: .\build\neothemis-cli.exe --help
 
+      - name: Smoke test server
+        run: .\build\neothemis-server.exe --help
+
       - name: Deploy and package
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item build\neothemis-cli.exe, build\neothemis-gui.exe dist\
+          Copy-Item build\neothemis-cli.exe, build\neothemis-gui.exe, build\neothemis-server.exe dist\
           windeployqt --release --dir dist build\neothemis-gui.exe
+          windeployqt --release --dir dist build\neothemis-server.exe
           Compress-Archive -Path dist\* -DestinationPath neothemis-windows-x64.zip
 
       - name: Upload Windows build

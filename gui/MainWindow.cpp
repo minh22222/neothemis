@@ -13,15 +13,16 @@
 #include <QAction>
 #include <QAbstractItemView>
 #include <QAbstractButton>
+#include <QCoreApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QColor>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDateTime>
 #include <QFileDialog>
 #include <QFormLayout>
-#include <QGraphicsBlurEffect>
 #include <QGraphicsDropShadowEffect>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -38,15 +39,23 @@
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QProgressBar>
+#include <QProcess>
+#include <QProcessEnvironment>
 #include <QPushButton>
+#include <QRandomGenerator>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QSpinBox>
 #include <QSlider>
+#include <QSqlDatabase>
+#include <QSqlError>
+#include <QSqlQuery>
 #include <QStackedLayout>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTimer>
 #include <QToolButton>
+#include <QVariant>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -72,6 +81,13 @@ struct CellScore {
     double earned = 0.0;
     double max = 0.0;
     int completed = 0;
+};
+
+struct ServerUserSyncResult {
+    int created = 0;
+    int existing = 0;
+    int removed = 0;
+    int skipped = 0;
 };
 
 using neothemis::gui::default_temporary_dir;
@@ -152,7 +168,10 @@ public:
         maximize->setText("[]");
         auto* close = new QToolButton(title_bar_);
         close->setObjectName("WindowCloseButton");
-        close->setText(QString());
+        close->setText("X");
+        close->setIcon(QIcon());
+        close->setToolButtonStyle(Qt::ToolButtonTextOnly);
+        close->setFocusPolicy(Qt::NoFocus);
         close->setToolTip(text("close"));
         close->setAccessibleName(text("close"));
         title_layout->addWidget(minimize);
@@ -256,6 +275,7 @@ public:
     }
 
     ~MainWindow() override {
+        stop_local_server(false);
         stop_active_judge();
         join_archive_thread();
         cleanup_temporary_contests();
@@ -310,6 +330,7 @@ protected:
         }
         stop_active_judge();
         join_archive_thread();
+        stop_local_server(false);
         cleanup_temporary_contests();
         event->accept();
     }
@@ -334,7 +355,10 @@ private:
             language_ = "en";
         }
         theme_ = settings.value("theme", "dark").toString().toStdString();
-        if (theme_ != "glassy-dark") {
+        if (theme_ == "glassy-dark") {
+            theme_ = "cyber";
+        }
+        if (theme_ != "cyber") {
             theme_ = "dark";
         }
         transparent_background_ = settings.value("transparent_background", false).toBool();
@@ -342,12 +366,22 @@ private:
             std::clamp(settings.value("background_transparency", 20).toInt(), 0, 80);
         blur_background_ = settings.value("blur_background", false).toBool();
         background_blur_radius_ =
-            std::clamp(settings.value("background_blur_radius", 18).toInt(), 0, 36);
+            std::clamp(settings.value("background_blur_radius", 24).toInt(), 0, 120);
         temporary_dir_ = settings.value(
             "temporary_dir",
             QString::fromStdString(default_temporary_dir().string())).toString().toStdString();
         if (temporary_dir_.empty()) {
             temporary_dir_ = default_temporary_dir();
+        }
+        server_port_ = std::clamp(settings.value("server_port", 8080).toInt(), 1024, 65535);
+        server_allow_lan_ = settings.value("server_allow_lan", false).toBool();
+        server_join_code_ = settings.value("server_join_code").toString().trimmed();
+        if (server_join_code_.isEmpty()) {
+            server_join_code_ = generated_server_secret(10);
+        }
+        server_admin_password_ = settings.value("server_admin_password").toString();
+        if (server_admin_password_.isEmpty()) {
+            server_admin_password_ = generated_server_secret(14);
         }
     }
 
@@ -360,6 +394,10 @@ private:
         settings.setValue("blur_background", blur_background_);
         settings.setValue("background_blur_radius", background_blur_radius_);
         settings.setValue("temporary_dir", QString::fromStdString(temporary_dir_.string()));
+        settings.setValue("server_port", server_port_);
+        settings.setValue("server_allow_lan", server_allow_lan_);
+        settings.setValue("server_join_code", server_join_code_);
+        settings.setValue("server_admin_password", server_admin_password_);
     }
 
     void apply_language_to_main_window() {
@@ -381,6 +419,12 @@ private:
         }
         if (detail_view_button_) {
             detail_view_button_->setText(text("detail_view"));
+        }
+        if (server_start_action_) {
+            server_start_action_->setText(text("start_local_server"));
+        }
+        if (server_stop_action_) {
+            server_stop_action_->setText(text("stop_local_server"));
         }
         if (detail_dialog_) {
             detail_dialog_->setWindowTitle(text("judge_details"));
@@ -407,11 +451,39 @@ private:
         contest_menu->addSeparator();
         contest_menu->addAction(text("refresh"), [this]() { refresh_table(); });
 
+        auto* contestant_menu = bar->addMenu(text("contestant_menu"));
+        contestant_menu->addAction(text("add_contestants_from_folder"),
+                                   [this]() { add_contestants_from_folder(); });
+        contestant_menu->addAction(text("sync_server_users"), [this]() {
+            try {
+                const ServerUserSyncResult result = sync_server_users_from_contest();
+                if (server_users_table_) {
+                    refresh_server_users_table(server_users_table_);
+                }
+                const QString message = text("server_users_synced")
+                                            .arg(result.created)
+                                            .arg(result.existing)
+                                            .arg(result.removed)
+                                            .arg(result.skipped);
+                log_->appendPlainText(message);
+                QMessageBox::information(this, text("sync_server_users"), message);
+            } catch (const std::exception& ex) {
+                QMessageBox::critical(this, text("server_user_failed"), ex.what());
+            }
+        });
+
         auto* judge_menu = bar->addMenu(text("judge"));
         judge_selected_action_ = judge_menu->addAction(text("judge_selected"), [this]() { start_judge(true); });
         judge_all_action_ = judge_menu->addAction(text("judge_all"), [this]() { start_judge(false); });
         stop_action_ = judge_menu->addAction(text("stop"), [this]() { request_stop_judge(); });
         stop_action_->setEnabled(false);
+
+        auto* server_menu = bar->addMenu(text("server"));
+        server_start_action_ =
+            server_menu->addAction(text("start_local_server"), [this]() { open_start_server_dialog(); });
+        server_stop_action_ =
+            server_menu->addAction(text("stop_local_server"), [this]() { stop_local_server(true); });
+        update_server_actions();
 
         auto* export_menu = bar->addMenu(text("export"));
         export_menu->addAction(text("export_scoreboard"), [this]() { export_scoreboard_xlsx(); });
@@ -429,9 +501,17 @@ private:
         settings_menu->addAction(text("application_settings"), [this]() { open_settings_dialog(0); });
         settings_menu->addAction(text("contest_config"), [this]() { open_settings_dialog(1); });
         settings_menu->addAction(text("problem_config"), [this]() { open_settings_dialog(2); });
+        settings_menu->addAction(text("server_settings"), [this]() { open_settings_dialog(3); });
+        settings_menu->addAction(text("server_users"), [this]() { open_settings_dialog(4); });
 
         auto* help_menu = bar->addMenu(text("help"));
         help_menu->addAction(text("about"), [this]() { show_about_dialog(); });
+
+        for (QMenu* menu : {contest_menu, contestant_menu, judge_menu, server_menu,
+                            export_menu, converter_menu, settings_menu, help_menu}) {
+            menu->setAttribute(Qt::WA_TranslucentBackground);
+            menu->setWindowFlag(Qt::NoDropShadowWindowHint, true);
+        }
     }
 
     void add_soft_shadow(QWidget* widget, qreal blur_radius, const QColor& color) {
@@ -446,7 +526,7 @@ private:
     }
 
     void apply_selected_theme() {
-        const bool glassy = theme_ == "glassy-dark";
+        const bool cyber = theme_ == "cyber";
         const bool transparent = background_transparency_active();
         const bool blurred = background_blur_active();
         neothemis::gui::apply_application_theme(theme_);
@@ -455,25 +535,645 @@ private:
                                 ? 255 * (100 - background_transparency_) / 100
                                 : 255;
         if (background_layer_) {
-            background_layer_->set_appearance(theme_, opacity);
-            if (blurred) {
-                auto* blur = qobject_cast<QGraphicsBlurEffect*>(background_layer_->graphicsEffect());
-                if (!blur) {
-                    blur = new QGraphicsBlurEffect(background_layer_);
-                    blur->setBlurHints(QGraphicsBlurEffect::PerformanceHint);
-                    background_layer_->setGraphicsEffect(blur);
-                }
-                if (blur->blurRadius() != background_blur_radius_) {
-                    blur->setBlurRadius(background_blur_radius_);
-                }
-            } else {
-                background_layer_->setGraphicsEffect(nullptr);
+            background_layer_->set_appearance(theme_, opacity,
+                                              blurred ? background_blur_radius_ : 0);
+        }
+        add_soft_shadow(table_, cyber ? 56 : 34,
+                        cyber ? QColor(55, 8, 32, 178) : QColor(0, 0, 0, 120));
+        add_soft_shadow(side_panel_, cyber ? 60 : 36,
+                        cyber ? QColor(72, 10, 39, 188) : QColor(0, 0, 0, 135));
+    }
+
+    QString generated_server_secret(int chars) const {
+        QByteArray data;
+        data.resize((chars + 1) / 2);
+        for (qsizetype i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<char>(QRandomGenerator::system()->bounded(256));
+        }
+        return QString::fromLatin1(data.toHex()).left(chars);
+    }
+
+    QString local_server_executable() const {
+        QString name =
+#ifdef _WIN32
+            "neothemis-server.exe";
+#else
+            "neothemis-server";
+#endif
+        fs::path alongside = fs::path(QCoreApplication::applicationDirPath().toStdString()) /
+                             name.toStdString();
+        if (fs::exists(alongside)) {
+            return QString::fromStdString(alongside.string());
+        }
+        return name;
+    }
+
+    fs::path server_data_dir() const {
+        if (contest_root_.empty()) {
+            return {};
+        }
+        return contest_root_ / ".neothemis-server";
+    }
+
+    fs::path server_database_path() const {
+        fs::path dir = server_data_dir();
+        if (dir.empty()) {
+            return {};
+        }
+        return dir / "server.db";
+    }
+
+    QString server_database_display_path() const {
+        fs::path path = server_database_path();
+        if (path.empty()) {
+            return text("open_contest_first");
+        }
+        return QString::fromStdString(path.string());
+    }
+
+    bool valid_server_username(const QString& username) const {
+        static const QRegularExpression pattern("^[A-Za-z0-9 _-]{1,64}$");
+        static const QRegularExpression has_visible(".*[A-Za-z0-9].*");
+        return pattern.match(username).hasMatch() &&
+               has_visible.match(username).hasMatch();
+    }
+
+    void exec_server_sql(QSqlDatabase& database, const QString& sql) const {
+        QSqlQuery query(database);
+        if (!query.exec(sql)) {
+            throw std::runtime_error(query.lastError().text().toStdString());
+        }
+    }
+
+    void initialize_server_database(QSqlDatabase& database) const {
+        exec_server_sql(database, "PRAGMA journal_mode=WAL");
+        exec_server_sql(database, "PRAGMA foreign_keys=ON");
+        exec_server_sql(database, "PRAGMA busy_timeout=5000");
+        exec_server_sql(database,
+                        "CREATE TABLE IF NOT EXISTS users ("
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        "username TEXT UNIQUE NOT NULL,"
+                        "salt TEXT NOT NULL,"
+                        "hash TEXT NOT NULL,"
+                        "password TEXT NOT NULL DEFAULT '',"
+                        "role TEXT NOT NULL,"
+                        "created_at INTEGER NOT NULL)");
+        exec_server_sql(database,
+                        "CREATE TABLE IF NOT EXISTS sessions ("
+                        "token TEXT PRIMARY KEY,"
+                        "user_id INTEGER NOT NULL,"
+                        "csrf TEXT NOT NULL,"
+                        "expires_at INTEGER NOT NULL,"
+                        "FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)");
+        exec_server_sql(database,
+                        "CREATE TABLE IF NOT EXISTS submissions ("
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                        "user_id INTEGER NOT NULL,"
+                        "username TEXT NOT NULL,"
+                        "problem TEXT NOT NULL,"
+                        "source_path TEXT NOT NULL,"
+                        "status TEXT NOT NULL,"
+                        "verdict TEXT NOT NULL,"
+                        "score REAL NOT NULL,"
+                        "message TEXT NOT NULL,"
+                        "submitted_at INTEGER NOT NULL,"
+                        "judged_at INTEGER NOT NULL,"
+                        "FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)");
+        exec_server_sql(database,
+                        "CREATE TABLE IF NOT EXISTS test_results ("
+                        "submission_id INTEGER NOT NULL,"
+                        "test TEXT NOT NULL,"
+                        "verdict TEXT NOT NULL,"
+                        "time_ms INTEGER NOT NULL,"
+                        "exit_code INTEGER NOT NULL DEFAULT 0,"
+                        "max_points REAL NOT NULL,"
+                        "earned_points REAL NOT NULL,"
+                        "message TEXT NOT NULL,"
+                        "FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE)");
+        exec_server_sql(database,
+                        "CREATE TABLE IF NOT EXISTS ignored_submissions ("
+                        "submission_id INTEGER PRIMARY KEY,"
+                        "ignored_at INTEGER NOT NULL,"
+                        "FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE)");
+        ensure_server_column(database, "test_results", "exit_code",
+                             "INTEGER NOT NULL DEFAULT 0");
+        ensure_server_column(database, "users", "password",
+                             "TEXT NOT NULL DEFAULT ''");
+        exec_server_sql(database, "UPDATE submissions SET status='queued' WHERE status='running'");
+    }
+
+    void ensure_server_column(QSqlDatabase& database,
+                              const QString& table,
+                              const QString& column,
+                              const QString& definition) const {
+        QSqlQuery info(database);
+        if (!info.exec("PRAGMA table_info(" + table + ")")) {
+            throw std::runtime_error(info.lastError().text().toStdString());
+        }
+        while (info.next()) {
+            if (info.value(1).toString() == column) {
+                return;
             }
         }
-        add_soft_shadow(table_, glassy ? 56 : 34,
-                        glassy ? QColor(55, 8, 32, 178) : QColor(0, 0, 0, 120));
-        add_soft_shadow(side_panel_, glassy ? 60 : 36,
-                        glassy ? QColor(72, 10, 39, 188) : QColor(0, 0, 0, 135));
+        exec_server_sql(database, "ALTER TABLE " + table + " ADD COLUMN " +
+                                  column + " " + definition);
+    }
+
+    QSqlDatabase open_server_database(bool create_if_missing) const {
+        if (contest_root_.empty()) {
+            throw std::runtime_error(text("open_contest_first").toStdString());
+        }
+        fs::path database_path = server_database_path();
+        if (create_if_missing) {
+            fs::create_directories(database_path.parent_path());
+        } else if (!fs::exists(database_path)) {
+            throw std::runtime_error(text("server_database_missing").toStdString());
+        }
+
+        const QString connection_name = "neothemis_gui_server_database";
+        QSqlDatabase database = QSqlDatabase::contains(connection_name)
+                                    ? QSqlDatabase::database(connection_name)
+                                    : QSqlDatabase::addDatabase("QSQLITE", connection_name);
+        if (database.isOpen()) {
+            database.close();
+        }
+        database.setDatabaseName(QString::fromStdString(database_path.string()));
+        if (!database.open()) {
+            throw std::runtime_error(database.lastError().text().toStdString());
+        }
+        initialize_server_database(database);
+        return database;
+    }
+
+    void create_server_user(const QString& username, const QString& password,
+                            const QString& role) {
+        const QString trimmed_username = username.trimmed();
+        if (!valid_server_username(trimmed_username)) {
+            throw std::runtime_error(text("server_username_invalid").toStdString());
+        }
+        if (password.size() < 6 || password.size() > 128) {
+            throw std::runtime_error(text("server_password_invalid").toStdString());
+        }
+        if (role != "admin" && role != "contestant") {
+            throw std::runtime_error(text("server_role_invalid").toStdString());
+        }
+
+        QSqlDatabase database = open_server_database(true);
+        QSqlQuery query(database);
+        query.prepare("INSERT INTO users(username, salt, hash, password, role, created_at) "
+                      "VALUES(?, '', '', ?, ?, ?)");
+        query.addBindValue(trimmed_username);
+        query.addBindValue(password);
+        query.addBindValue(role);
+        query.addBindValue(QDateTime::currentSecsSinceEpoch());
+        if (!query.exec()) {
+            const QString error = query.lastError().text();
+            if (error.contains("UNIQUE", Qt::CaseInsensitive) ||
+                error.contains("constraint", Qt::CaseInsensitive)) {
+                throw std::runtime_error(text("server_user_exists").toStdString());
+            }
+            throw std::runtime_error(error.toStdString());
+        }
+        if (role == "contestant") {
+            fs::create_directories(contest_root_ / contestants_dir_ /
+                                   trimmed_username.toStdString());
+        }
+        mark_contest_dirty();
+    }
+
+    void change_server_user_password(const QString& username, const QString& password) {
+        if (password.size() < 6 || password.size() > 128) {
+            throw std::runtime_error(text("server_password_invalid").toStdString());
+        }
+        QSqlDatabase database = open_server_database(false);
+        QSqlQuery update(database);
+        update.prepare("UPDATE users SET password=?, salt='', hash='' WHERE username=?");
+        update.addBindValue(password);
+        update.addBindValue(username);
+        if (!update.exec()) {
+            throw std::runtime_error(update.lastError().text().toStdString());
+        }
+        if (update.numRowsAffected() != 1) {
+            throw std::runtime_error(text("server_user_not_found").toStdString());
+        }
+        QSqlQuery sessions(database);
+        sessions.prepare("DELETE FROM sessions WHERE user_id=(SELECT id FROM users WHERE username=?)");
+        sessions.addBindValue(username);
+        if (!sessions.exec()) {
+            throw std::runtime_error(sessions.lastError().text().toStdString());
+        }
+        mark_contest_dirty();
+    }
+
+    void remove_server_user(const QString& username) {
+        QSqlDatabase database = open_server_database(false);
+        QSqlQuery user(database);
+        user.prepare("SELECT role FROM users WHERE username=?");
+        user.addBindValue(username);
+        if (!user.exec()) {
+            throw std::runtime_error(user.lastError().text().toStdString());
+        }
+        if (!user.next()) {
+            throw std::runtime_error(text("server_user_not_found").toStdString());
+        }
+        if (user.value(0).toString() == "admin") {
+            QSqlQuery admins(database);
+            if (!admins.exec("SELECT COUNT(*) FROM users WHERE role='admin'") ||
+                !admins.next()) {
+                throw std::runtime_error(admins.lastError().text().toStdString());
+            }
+            if (admins.value(0).toInt() <= 1) {
+                throw std::runtime_error(text("server_last_admin").toStdString());
+            }
+        }
+        user.finish();
+        QSqlQuery remove(database);
+        remove.prepare("DELETE FROM users WHERE username=?");
+        remove.addBindValue(username);
+        if (!remove.exec()) {
+            throw std::runtime_error(remove.lastError().text().toStdString());
+        }
+        mark_contest_dirty();
+    }
+
+    ServerUserSyncResult sync_server_users_from_contest() {
+        if (contest_root_.empty()) {
+            throw std::runtime_error(text("open_contest_first").toStdString());
+        }
+        QSqlDatabase database = open_server_database(true);
+        ServerUserSyncResult result;
+        const fs::path contestants_root = contest_root_ / contestants_dir_;
+        if (!fs::exists(contestants_root)) {
+            return result;
+        }
+        std::set<QString> contest_usernames;
+        for (const auto& entry : fs::directory_iterator(contestants_root)) {
+            if (!entry.is_directory()) {
+                continue;
+            }
+            const QString username =
+                QString::fromStdString(entry.path().filename().string()).trimmed();
+            if (!valid_server_username(username)) {
+                ++result.skipped;
+                continue;
+            }
+            contest_usernames.insert(username);
+            QSqlQuery exists(database);
+            exists.prepare("SELECT 1 FROM users WHERE username=?");
+            exists.addBindValue(username);
+            if (!exists.exec()) {
+                throw std::runtime_error(exists.lastError().text().toStdString());
+            }
+            if (exists.next()) {
+                ++result.existing;
+                continue;
+            }
+            QSqlQuery insert(database);
+            insert.prepare("INSERT INTO users(username, salt, hash, password, role, created_at) "
+                           "VALUES(?, '', '', '123456', 'contestant', ?)");
+            insert.addBindValue(username);
+            insert.addBindValue(QDateTime::currentSecsSinceEpoch());
+            if (!insert.exec()) {
+                throw std::runtime_error(insert.lastError().text().toStdString());
+            }
+            ++result.created;
+        }
+
+        std::vector<QString> stale_users;
+        QSqlQuery users(database);
+        if (!users.exec("SELECT username FROM users WHERE role='contestant'")) {
+            throw std::runtime_error(users.lastError().text().toStdString());
+        }
+        while (users.next()) {
+            const QString username = users.value(0).toString();
+            if (contest_usernames.count(username) == 0) {
+                stale_users.push_back(username);
+            }
+        }
+        users.finish();
+        for (const QString& username : stale_users) {
+            QSqlQuery remove(database);
+            remove.prepare("DELETE FROM users WHERE username=? AND role='contestant'");
+            remove.addBindValue(username);
+            if (!remove.exec()) {
+                throw std::runtime_error(remove.lastError().text().toStdString());
+            }
+            result.removed += remove.numRowsAffected();
+        }
+
+        if (result.created > 0 || result.removed > 0) {
+            mark_contest_dirty();
+        }
+        return result;
+    }
+
+    std::pair<int, int> import_server_users_csv(const fs::path& path) {
+        auto records = read_csv_records(path);
+        int created = 0;
+        int skipped = 0;
+        bool first = true;
+        for (const auto& row : records) {
+            if (row.empty()) {
+                continue;
+            }
+            QString first_cell = QString::fromStdString(row[0]).trimmed().toLower();
+            if (first && (first_cell == "username" || first_cell == "user" ||
+                          first_cell == "contestant")) {
+                first = false;
+                continue;
+            }
+            first = false;
+            if (row.size() < 2) {
+                ++skipped;
+                continue;
+            }
+            QString username = QString::fromStdString(row[0]).trimmed();
+            QString password = QString::fromStdString(row[1]);
+            QString role = row.size() >= 3
+                               ? QString::fromStdString(row[2]).trimmed().toLower()
+                               : QString();
+            if (role.isEmpty()) {
+                role = "contestant";
+            }
+            try {
+                create_server_user(username, password, role);
+                ++created;
+            } catch (const std::exception&) {
+                ++skipped;
+            }
+        }
+        return {created, skipped};
+    }
+
+    fs::file_time_type safe_last_write_time(const fs::path& path) const {
+        std::error_code error;
+        if (path.empty() || !fs::exists(path, error)) {
+            return fs::file_time_type::min();
+        }
+        fs::file_time_type time = fs::last_write_time(path, error);
+        if (error) {
+            return fs::file_time_type::min();
+        }
+        return time;
+    }
+
+    fs::path server_results_path() const {
+        return contest_output_path(options_from_ui().output_csv);
+    }
+
+    fs::file_time_type server_database_activity_time() const {
+        fs::path database_path = server_database_path();
+        fs::file_time_type database_time = safe_last_write_time(database_path);
+        fs::file_time_type wal_time =
+            safe_last_write_time(fs::path(database_path.string() + "-wal"));
+        return std::max(database_time, wal_time);
+    }
+
+    void initialize_server_auto_refresh_state() {
+        last_server_database_write_ = server_database_activity_time();
+        last_server_results_write_ = safe_last_write_time(server_results_path());
+        last_server_contestants_write_ =
+            safe_last_write_time(contest_root_ / contestants_dir_);
+    }
+
+    void start_server_auto_refresh() {
+        initialize_server_auto_refresh_state();
+        if (!server_refresh_timer_) {
+            server_refresh_timer_ = new QTimer(this);
+            server_refresh_timer_->setInterval(2000);
+            QObject::connect(server_refresh_timer_, &QTimer::timeout,
+                             [this]() { poll_server_auto_refresh(); });
+        }
+        server_refresh_timer_->start();
+    }
+
+    void stop_server_auto_refresh() {
+        if (server_refresh_timer_) {
+            server_refresh_timer_->stop();
+        }
+    }
+
+    void poll_server_auto_refresh() {
+        if (contest_root_.empty() || archive_running_.load() || judging_.load()) {
+            return;
+        }
+        fs::file_time_type database_write = server_database_activity_time();
+        fs::file_time_type results_write = safe_last_write_time(server_results_path());
+        fs::file_time_type contestants_write =
+            safe_last_write_time(contest_root_ / contestants_dir_);
+        const bool changed = database_write != last_server_database_write_ ||
+                             results_write != last_server_results_write_ ||
+                             contestants_write != last_server_contestants_write_;
+        if (!changed) {
+            return;
+        }
+        last_server_database_write_ = database_write;
+        last_server_results_write_ = results_write;
+        last_server_contestants_write_ = contestants_write;
+        refresh_table(false);
+        if (server_users_table_) {
+            try {
+                refresh_server_users_table(server_users_table_);
+            } catch (const std::exception& ex) {
+                log_->appendPlainText(text("server_user_failed") + ": " +
+                                      QString::fromUtf8(ex.what()));
+            }
+        }
+    }
+
+    void update_server_actions() {
+        const bool running =
+            server_process_ && server_process_->state() != QProcess::NotRunning;
+        if (server_start_action_) {
+            server_start_action_->setEnabled(!running);
+        }
+        if (server_stop_action_) {
+            server_stop_action_->setEnabled(running);
+        }
+    }
+
+    void append_server_output(const QByteArray& output) {
+        if (!log_ || output.isEmpty()) {
+            return;
+        }
+        QString text_output = QString::fromLocal8Bit(output).trimmed();
+        if (text_output.isEmpty()) {
+            return;
+        }
+        for (const QString& line : text_output.split('\n')) {
+            log_->appendPlainText("[server] " + line.trimmed());
+        }
+    }
+
+    void open_start_server_dialog() {
+        if (contest_root_.empty()) {
+            QMessageBox::information(this, text("no_contest"), text("open_contest_first"));
+            return;
+        }
+        if (server_process_ && server_process_->state() != QProcess::NotRunning) {
+            QMessageBox::information(this, text("server_running"), text("server_already_running"));
+            return;
+        }
+
+        auto* dialog = new QDialog(this);
+        dialog->setWindowTitle(text("start_local_server"));
+        dialog->resize(520, 320);
+        auto* layout = new QVBoxLayout(dialog);
+        auto* form = new QFormLayout;
+
+        auto* port = new QSpinBox(dialog);
+        port->setRange(1024, 65535);
+        port->setValue(server_port_);
+        auto* allow_lan = new QCheckBox(dialog);
+        allow_lan->setChecked(server_allow_lan_);
+        auto* join_code = new QLineEdit(server_join_code_, dialog);
+        auto* admin_password = new QLineEdit(server_admin_password_, dialog);
+        auto* data_path = new QLineEdit(server_database_display_path(), dialog);
+        data_path->setReadOnly(true);
+        auto* warning = new QLabel(text("server_security_warning"), dialog);
+        warning->setWordWrap(true);
+        warning->setObjectName("ServerWarning");
+
+        form->addRow(text("server_port"), port);
+        form->addRow(text("server_allow_lan"), allow_lan);
+        form->addRow(text("server_join_code"), join_code);
+        form->addRow(text("server_admin_password"), admin_password);
+        form->addRow(text("server_database"), data_path);
+        layout->addLayout(form);
+        layout->addWidget(warning);
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                             dialog);
+        auto* start_button = buttons->button(QDialogButtonBox::Ok);
+        start_button->setText(text("start_local_server"));
+        start_button->setIcon(QIcon());
+        auto* close_button = buttons->button(QDialogButtonBox::Cancel);
+        close_button->setText(text("close"));
+        close_button->setIcon(QIcon());
+        QObject::connect(buttons, &QDialogButtonBox::accepted, [this, dialog, port, allow_lan,
+                                                                join_code, admin_password]() {
+            server_port_ = port->value();
+            server_allow_lan_ = allow_lan->isChecked();
+            server_join_code_ = join_code->text().trimmed();
+            server_admin_password_ = admin_password->text();
+            save_app_settings();
+            start_local_server(server_port_, server_allow_lan_,
+                               server_join_code_, server_admin_password_);
+            dialog->accept();
+        });
+        QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+        layout->addWidget(buttons);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->show();
+    }
+
+    void start_local_server(int port, bool allow_lan,
+                            const QString& join_code,
+                            const QString& admin_password) {
+        if (join_code.isEmpty() || admin_password.isEmpty()) {
+            QMessageBox::warning(this, text("server_start_failed"),
+                                 text("server_credentials_required"));
+            return;
+        }
+
+        auto* process = new QProcess(this);
+        process->setProperty("stopRequested", false);
+        process->setProgram(local_server_executable());
+        fs::create_directories(server_data_dir());
+        QStringList args;
+        args << "--contest" << QString::fromStdString(contest_root_.string())
+             << "--data" << QString::fromStdString(server_data_dir().string())
+             << "--port" << QString::number(port);
+        if (allow_lan) {
+            args << "--host" << "0.0.0.0" << "--allow-lan";
+        }
+        process->setArguments(args);
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert("NEOTHEMIS_SERVER_JOIN_CODE", join_code);
+        environment.insert("NEOTHEMIS_SERVER_ADMIN_PASSWORD", admin_password);
+        process->setProcessEnvironment(environment);
+        process->setProcessChannelMode(QProcess::MergedChannels);
+
+        QObject::connect(process, &QProcess::readyReadStandardOutput, [this, process]() {
+            append_server_output(process->readAllStandardOutput());
+        });
+        QObject::connect(process, &QProcess::errorOccurred,
+                         [this, process](QProcess::ProcessError error) {
+            if (process->property("stopRequested").toBool() ||
+                error == QProcess::Crashed) {
+                return;
+            }
+            if (log_ && error == QProcess::FailedToStart) {
+                log_->appendPlainText(text("server_start_failed") + ": " +
+                                      process->errorString());
+            } else if (log_) {
+                log_->appendPlainText(text("server_process_error") + ": " +
+                                      process->errorString());
+            }
+            update_server_actions();
+        });
+        QObject::connect(process,
+                         qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
+                         [this, process](int exit_code, QProcess::ExitStatus status) {
+            append_server_output(process->readAllStandardOutput());
+            if (process->property("stopRequested").toBool()) {
+                log_->appendPlainText(text("server_stopped"));
+            } else if (status == QProcess::CrashExit) {
+                log_->appendPlainText(text("server_crashed"));
+            } else {
+                log_->appendPlainText(text("server_stopped") + " (" +
+                                      QString::number(exit_code) + ")");
+            }
+            if (server_process_ == process) {
+                server_process_ = nullptr;
+            }
+            stop_server_auto_refresh();
+            process->deleteLater();
+            update_server_actions();
+        });
+
+        server_process_ = process;
+        process->start();
+        if (!process->waitForStarted(3000)) {
+            QMessageBox::critical(this, text("server_start_failed"), process->errorString());
+            server_process_ = nullptr;
+            process->deleteLater();
+            update_server_actions();
+            return;
+        }
+
+        const QString host = allow_lan ? "0.0.0.0" : "127.0.0.1";
+        const QString url = "http://" + host + ":" + QString::number(port);
+        log_->appendPlainText(text("server_started") + ": " + url);
+        log_->appendPlainText(text("server_database") + ": " + server_database_display_path());
+        log_->appendPlainText(text("server_join_code") + ": " + join_code);
+        log_->appendPlainText(text("server_admin_password") + ": " + admin_password);
+        if (allow_lan) {
+            log_->appendPlainText(text("server_lan_warning"));
+        }
+        mark_contest_dirty();
+        start_server_auto_refresh();
+        update_server_actions();
+    }
+
+    void stop_local_server(bool log_message) {
+        if (!server_process_ || server_process_->state() == QProcess::NotRunning) {
+            stop_server_auto_refresh();
+            update_server_actions();
+            return;
+        }
+        if (log_message && log_) {
+            log_->appendPlainText(text("stopping_server"));
+        }
+        QProcess* process = server_process_;
+        process->setProperty("stopRequested", true);
+        process->terminate();
+        if (!process->waitForFinished(3000)) {
+            process->kill();
+            process->waitForFinished(2000);
+        }
+        stop_server_auto_refresh();
+        update_server_actions();
     }
 
 
@@ -628,6 +1328,8 @@ private:
         stack_limit_mb_ = 64;
         parallel_jobs_ = 0;
         keep_workdir_ = false;
+        server_ranking_enabled_ = false;
+        server_contestant_details_enabled_ = false;
     }
 
     fs::path ensure_ncontest_extension(fs::path path) const {
@@ -839,6 +1541,16 @@ private:
             std::string value = values["keep_workdir"];
             keep_workdir_ = value == "true" || value == "1" || value == "yes" || value == "on";
         }
+        if (values.count("server_ranking_enabled")) {
+            std::string value = values["server_ranking_enabled"];
+            server_ranking_enabled_ =
+                value == "true" || value == "1" || value == "yes" || value == "on";
+        }
+        if (values.count("server_contestant_details_enabled")) {
+            std::string value = values["server_contestant_details_enabled"];
+            server_contestant_details_enabled_ =
+                value == "true" || value == "1" || value == "yes" || value == "on";
+        }
     }
 
     void save_contest_config() const {
@@ -855,6 +1567,9 @@ private:
             << "output_csv=results.csv\n"
             << "scoreboard_csv=scoreboard.csv\n"
             << "keep_workdir=" << (keep_workdir_ ? "true" : "false") << '\n'
+            << "server_ranking_enabled=" << (server_ranking_enabled_ ? "true" : "false") << '\n'
+            << "server_contestant_details_enabled="
+            << (server_contestant_details_enabled_ ? "true" : "false") << '\n'
             << "compiler=" << compiler_ << '\n'
             << "compile_flags=" << compile_flags_ << '\n'
             << "stack_limit_mb=" << stack_limit_mb_ << '\n'
@@ -1037,7 +1752,69 @@ private:
         });
     }
 
-    void refresh_table() {
+    void add_contestants_from_folder() {
+        if (!archive_operation_available()) {
+            return;
+        }
+        if (contest_root_.empty()) {
+            QMessageBox::information(this, text("no_contest"), text("open_contest_first"));
+            return;
+        }
+
+        QString selected = QFileDialog::getExistingDirectory(
+            this, text("add_contestants_from_folder"));
+        if (selected.isEmpty()) {
+            return;
+        }
+
+        try {
+            fs::path source_root = path_from_qstring(selected);
+            std::vector<fs::path> sources;
+            for (const auto& entry : fs::directory_iterator(source_root)) {
+                if (entry.is_directory()) {
+                    sources.push_back(entry.path());
+                }
+            }
+            if (sources.empty()) {
+                sources.push_back(source_root);
+            }
+            std::sort(sources.begin(), sources.end());
+
+            fs::path destination_root = contest_root_ / contestants_dir_;
+            int imported = 0;
+            int skipped = 0;
+            fs::create_directories(destination_root);
+            for (const fs::path& source : sources) {
+                std::string name = source.filename().string();
+                if (name.empty() || name == "." || name == "..") {
+                    ++skipped;
+                    continue;
+                }
+                fs::path destination = destination_root / name;
+                std::error_code equivalent_error;
+                if (fs::exists(destination) &&
+                    fs::equivalent(source, destination, equivalent_error) &&
+                    !equivalent_error) {
+                    ++skipped;
+                    continue;
+                }
+                fs::create_directories(destination);
+                fs::copy(source, destination,
+                         fs::copy_options::recursive |
+                             fs::copy_options::overwrite_existing |
+                             fs::copy_options::skip_symlinks);
+                ++imported;
+            }
+            mark_contest_dirty();
+            refresh_table(false);
+            log_->appendPlainText(text("contestants_imported")
+                                  .arg(imported).arg(skipped));
+        } catch (const std::exception& ex) {
+            QMessageBox::critical(this, text("contestant_import_failed"), ex.what());
+        }
+    }
+
+    void refresh_table(bool log_opened = true) {
         if (contest_root_.empty()) {
             return;
         }
@@ -1056,8 +1833,10 @@ private:
             load_problem_test_counts();
             load_existing_results();
             populate_table();
-            log_->appendPlainText(text("opened") + " " +
-                                  QString::fromStdString(contest_root_.string()));
+            if (log_opened) {
+                log_->appendPlainText(text("opened") + " " +
+                                      QString::fromStdString(contest_root_.string()));
+            }
         } catch (const std::exception& ex) {
             QMessageBox::critical(this, text("open_failed"), ex.what());
         }
@@ -1978,7 +2757,7 @@ private:
         form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
         auto* theme = new QComboBox(tab);
         theme->addItem(text("dark"), "dark");
-        theme->addItem(text("glassy_dark"), "glassy-dark");
+        theme->addItem(text("cyber"), "cyber");
         int theme_index = theme->findData(QString::fromStdString(theme_));
         if (theme_index >= 0) {
             theme->setCurrentIndex(theme_index);
@@ -2009,7 +2788,7 @@ private:
         blur_layout->setContentsMargins(0, 0, 0, 0);
         blur_layout->setSpacing(10);
         auto* blur = new QSlider(Qt::Horizontal, blur_widget);
-        blur->setRange(0, 36);
+        blur->setRange(0, 120);
         blur->setValue(background_blur_radius_);
         blur->setEnabled(blur_background_);
         auto* blur_value = new QLabel(
@@ -2061,16 +2840,36 @@ private:
             }
         });
 
+        auto apply_visual_preview = [this, theme, transparent_background,
+                                     transparency, blur_background, blur]() {
+            theme_ = theme->currentData().toString().toStdString();
+            transparent_background_ = transparent_background->isChecked();
+            background_transparency_ = transparency->value();
+            blur_background_ = blur_background->isChecked();
+            background_blur_radius_ = blur->value();
+            apply_selected_theme();
+        };
+
+        QObject::connect(theme, &QComboBox::currentTextChanged,
+                         [apply_visual_preview](const QString&) { apply_visual_preview(); });
         QObject::connect(transparent_background, &QCheckBox::toggled,
-                         transparency, &QWidget::setEnabled);
+                         [transparency, apply_visual_preview](bool enabled) {
+                             transparency->setEnabled(enabled);
+                             apply_visual_preview();
+                         });
         QObject::connect(transparency, &QSlider::valueChanged,
-                         [transparency_value](int value) {
+                         [transparency_value, apply_visual_preview](int value) {
                              transparency_value->setText(QString::number(value) + "%");
+                             apply_visual_preview();
                          });
         QObject::connect(blur_background, &QCheckBox::toggled,
-                         blur, &QWidget::setEnabled);
-        QObject::connect(blur, &QSlider::valueChanged, [blur_value](int value) {
+                         [blur, apply_visual_preview](bool enabled) {
+                             blur->setEnabled(enabled);
+                             apply_visual_preview();
+                         });
+        QObject::connect(blur, &QSlider::valueChanged, [blur_value, apply_visual_preview](int value) {
             blur_value->setText(QString::number(value) + " px");
+            apply_visual_preview();
         });
 
         QObject::connect(save, &QPushButton::clicked,
@@ -2301,15 +3100,300 @@ private:
         return tab;
     }
 
+    QWidget* build_server_settings_tab(QWidget* parent) {
+        auto* tab = new QWidget(parent);
+        auto* form = new QFormLayout(tab);
+        form->setContentsMargins(18, 18, 18, 18);
+        form->setHorizontalSpacing(24);
+        form->setVerticalSpacing(14);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        form->setFormAlignment(Qt::AlignTop);
+        form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+        auto* port = new QSpinBox(tab);
+        port->setRange(1024, 65535);
+        port->setValue(server_port_);
+        auto* allow_lan = new QCheckBox(tab);
+        allow_lan->setChecked(server_allow_lan_);
+        auto* enable_ranking = new QCheckBox(tab);
+        enable_ranking->setChecked(server_ranking_enabled_);
+        auto* enable_details = new QCheckBox(tab);
+        enable_details->setChecked(server_contestant_details_enabled_);
+        auto* join_code = new QLineEdit(server_join_code_, tab);
+        auto* admin_password = new QLineEdit(server_admin_password_, tab);
+        auto* database = new QLineEdit(server_database_display_path(), tab);
+        database->setReadOnly(true);
+        auto* warning = new QLabel(text("server_settings_help"), tab);
+        warning->setWordWrap(true);
+        warning->setObjectName("ServerWarning");
+        auto* save = new QPushButton(text("save_server_settings"), tab);
+
+        form->addRow(text("server_port"), port);
+        form->addRow(text("server_allow_lan"), allow_lan);
+        form->addRow(text("server_enable_ranking"), enable_ranking);
+        form->addRow(text("server_enable_contestant_details"), enable_details);
+        form->addRow(text("server_join_code"), join_code);
+        form->addRow(text("server_admin_bootstrap_password"), admin_password);
+        form->addRow(text("server_database"), database);
+        form->addRow(warning);
+        form->addRow(save);
+
+        QObject::connect(save, &QPushButton::clicked, [this, port, allow_lan,
+                                                       enable_ranking, enable_details,
+                                                       join_code, admin_password]() {
+            const QString join = join_code->text().trimmed();
+            const QString admin = admin_password->text();
+            if (join.isEmpty() || admin.isEmpty()) {
+                QMessageBox::warning(this, text("save_failed"),
+                                     text("server_credentials_required"));
+                return;
+            }
+            server_port_ = port->value();
+            server_allow_lan_ = allow_lan->isChecked();
+            server_ranking_enabled_ = enable_ranking->isChecked();
+            server_contestant_details_enabled_ = enable_details->isChecked();
+            server_join_code_ = join;
+            server_admin_password_ = admin;
+            try {
+                save_app_settings();
+                save_contest_config();
+                mark_contest_dirty();
+                log_->appendPlainText(text("saved_server_settings"));
+            } catch (const std::exception& ex) {
+                QMessageBox::critical(this, text("save_failed"), ex.what());
+            }
+        });
+        return tab;
+    }
+
+    void refresh_server_users_table(QTableWidget* users_table) {
+        users_table->setRowCount(0);
+        if (contest_root_.empty()) {
+            return;
+        }
+        fs::path database_path = server_database_path();
+        if (!fs::exists(database_path)) {
+            return;
+        }
+
+        QSqlDatabase database = open_server_database(false);
+        QSqlQuery query(database);
+        if (!query.exec("SELECT username, password, role, created_at FROM users "
+                        "ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, username")) {
+            throw std::runtime_error(query.lastError().text().toStdString());
+        }
+
+        while (query.next()) {
+            const int row = users_table->rowCount();
+            users_table->insertRow(row);
+            const QString username = query.value(0).toString();
+            const QString stored_password = query.value(1).toString();
+            const QString password = stored_password.isEmpty()
+                                         ? text("server_password_reset_required")
+                                         : stored_password;
+            const QString role = query.value(2).toString();
+            const QString role_display = role == "admin"
+                                             ? text("server_role_admin")
+                                             : text("server_role_contestant");
+            const QString created = QDateTime::fromSecsSinceEpoch(query.value(3).toLongLong())
+                                        .toString("yyyy-MM-dd HH:mm");
+
+            auto add_readonly_item = [users_table, row](int column, const QString& value) {
+                auto* item = new QTableWidgetItem(value);
+                item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+                users_table->setItem(row, column, item);
+            };
+            add_readonly_item(0, username);
+            add_readonly_item(1, password);
+            add_readonly_item(2, role_display);
+            add_readonly_item(3, created);
+        }
+    }
+
+    QWidget* build_server_users_tab(QWidget* parent) {
+        auto* tab = new QWidget(parent);
+        auto* layout = new QVBoxLayout(tab);
+        layout->setContentsMargins(18, 18, 18, 18);
+        layout->setSpacing(14);
+
+        auto* form = new QFormLayout;
+        form->setHorizontalSpacing(24);
+        form->setVerticalSpacing(14);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+        auto* database = new QLineEdit(server_database_display_path(), tab);
+        database->setReadOnly(true);
+        auto* username = new QLineEdit(tab);
+        username->setPlaceholderText(text("server_username_hint"));
+        auto* password = new QLineEdit(tab);
+        password->setEchoMode(QLineEdit::Normal);
+        auto* role = new QComboBox(tab);
+        role->addItem(text("server_role_contestant"), "contestant");
+        role->addItem(text("server_role_admin"), "admin");
+        auto* add = new QPushButton(text("add_server_user"), tab);
+        auto* change_password = new QPushButton(text("change_server_password"), tab);
+        auto* remove = new QPushButton(text("remove_server_user"), tab);
+        remove->setObjectName("DangerButton");
+        auto* import_csv = new QPushButton(text("import_server_users_csv"), tab);
+        auto* refresh = new QPushButton(text("refresh"), tab);
+        auto* actions = new QWidget(tab);
+        auto* actions_layout = new QHBoxLayout(actions);
+        actions_layout->setContentsMargins(0, 0, 0, 0);
+        actions_layout->setSpacing(10);
+        actions_layout->addWidget(add);
+        actions_layout->addWidget(change_password);
+        actions_layout->addWidget(remove);
+        actions_layout->addWidget(import_csv);
+        actions_layout->addWidget(refresh);
+        actions_layout->addStretch(1);
+        auto* csv_help = new QLabel(text("server_users_csv_help"), tab);
+        csv_help->setWordWrap(true);
+        csv_help->setObjectName("ServerWarning");
+
+        form->addRow(text("server_database"), database);
+        form->addRow(text("server_user_username"), username);
+        form->addRow(text("server_user_password"), password);
+        form->addRow(text("server_user_role"), role);
+        form->addRow(actions);
+        form->addRow(csv_help);
+        layout->addLayout(form);
+
+        auto* users_table = new QTableWidget(tab);
+        server_users_table_ = users_table;
+        QObject::connect(users_table, &QObject::destroyed, [this, users_table]() {
+            if (server_users_table_ == users_table) {
+                server_users_table_ = nullptr;
+            }
+        });
+        users_table->setObjectName("ServerUsersTable");
+        users_table->setColumnCount(4);
+        users_table->setHorizontalHeaderLabels({
+            text("server_user_username"), text("server_user_password"),
+            text("server_user_role"), text("created_at")
+        });
+        users_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+        users_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        users_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        users_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+        users_table->verticalHeader()->setVisible(false);
+        users_table->setSelectionBehavior(QAbstractItemView::SelectRows);
+        users_table->setSelectionMode(QAbstractItemView::SingleSelection);
+        users_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        layout->addWidget(users_table, 1);
+
+        const bool contest_open = !contest_root_.empty();
+        username->setEnabled(contest_open);
+        password->setEnabled(contest_open);
+        role->setEnabled(contest_open);
+        add->setEnabled(contest_open);
+        change_password->setEnabled(contest_open);
+        remove->setEnabled(contest_open);
+        import_csv->setEnabled(contest_open);
+        refresh->setEnabled(contest_open);
+
+        auto refresh_users = [this, users_table]() {
+            try {
+                refresh_server_users_table(users_table);
+            } catch (const std::exception& ex) {
+                QMessageBox::critical(this, text("server_user_failed"), ex.what());
+            }
+        };
+        QObject::connect(refresh, &QPushButton::clicked, refresh_users);
+        QObject::connect(add, &QPushButton::clicked, [this, username, password, role,
+                                                       users_table]() {
+            try {
+                const QString new_username = username->text().trimmed();
+                create_server_user(new_username, password->text(),
+                                   role->currentData().toString());
+                password->clear();
+                refresh_server_users_table(users_table);
+                refresh_table(false);
+                log_->appendPlainText(text("server_user_created").arg(new_username));
+            } catch (const std::exception& ex) {
+                QMessageBox::critical(this, text("server_user_failed"), ex.what());
+            }
+        });
+        QObject::connect(change_password, &QPushButton::clicked, [this, users_table]() {
+            const int row = users_table->currentRow();
+            if (row < 0 || !users_table->item(row, 0)) {
+                QMessageBox::information(this, text("server_users"),
+                                         text("select_server_user"));
+                return;
+            }
+            const QString selected_username = users_table->item(row, 0)->text();
+            bool accepted = false;
+            const QString new_password = QInputDialog::getText(
+                this, text("change_server_password"),
+                text("new_password_for").arg(selected_username),
+                QLineEdit::Normal, QString(), &accepted);
+            if (!accepted) {
+                return;
+            }
+            try {
+                change_server_user_password(selected_username, new_password);
+                refresh_server_users_table(users_table);
+                log_->appendPlainText(text("server_password_changed").arg(selected_username));
+            } catch (const std::exception& ex) {
+                QMessageBox::critical(this, text("server_user_failed"), ex.what());
+            }
+        });
+        QObject::connect(remove, &QPushButton::clicked, [this, users_table]() {
+            const int row = users_table->currentRow();
+            if (row < 0 || !users_table->item(row, 0)) {
+                QMessageBox::information(this, text("server_users"),
+                                         text("select_server_user"));
+                return;
+            }
+            const QString selected_username = users_table->item(row, 0)->text();
+            const QMessageBox::StandardButton answer = QMessageBox::warning(
+                this, text("remove_server_user"),
+                text("remove_server_user_confirm").arg(selected_username),
+                QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+            if (answer != QMessageBox::Yes) {
+                return;
+            }
+            try {
+                remove_server_user(selected_username);
+                refresh_server_users_table(users_table);
+                refresh_table(false);
+                log_->appendPlainText(text("server_user_removed").arg(selected_username));
+            } catch (const std::exception& ex) {
+                QMessageBox::critical(this, text("server_user_failed"), ex.what());
+            }
+        });
+        QObject::connect(import_csv, &QPushButton::clicked, [this, users_table]() {
+            QString selected = QFileDialog::getOpenFileName(
+                this, text("import_server_users_csv"), QString(),
+                text("csv_users_filter"));
+            if (selected.isEmpty()) {
+                return;
+            }
+            try {
+                auto [created, skipped] = import_server_users_csv(path_from_qstring(selected));
+                refresh_server_users_table(users_table);
+                refresh_table(false);
+                log_->appendPlainText(text("server_users_imported")
+                                      .arg(created).arg(skipped));
+            } catch (const std::exception& ex) {
+                QMessageBox::critical(this, text("server_users_import_failed"), ex.what());
+            }
+        });
+        refresh_users();
+        return tab;
+    }
+
     void open_settings_dialog(int initial_tab) {
         auto* dialog = new QDialog(this);
         dialog->setWindowTitle(text("settings_title"));
-        dialog->resize(760, 640);
+        dialog->resize(820, 680);
         auto* layout = new QVBoxLayout(dialog);
         auto* tabs = new QTabWidget(dialog);
         tabs->addTab(build_visual_tab(tabs), text("application"));
         tabs->addTab(build_contest_tab(tabs), text("contest"));
         tabs->addTab(build_problem_tab(tabs), text("problems"));
+        tabs->addTab(build_server_settings_tab(tabs), text("server_settings"));
+        tabs->addTab(build_server_users_tab(tabs), text("server_users"));
         tabs->setCurrentIndex(initial_tab);
         layout->addWidget(tabs);
         auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
@@ -2362,8 +3446,14 @@ private:
     bool transparent_background_ = false;
     int background_transparency_ = 20;
     bool blur_background_ = false;
-    int background_blur_radius_ = 18;
+    int background_blur_radius_ = 24;
     fs::path temporary_dir_;
+    int server_port_ = 8080;
+    bool server_allow_lan_ = false;
+    bool server_ranking_enabled_ = false;
+    bool server_contestant_details_enabled_ = false;
+    QString server_join_code_;
+    QString server_admin_password_;
     fs::path contest_file_path_;
     fs::path active_temp_root_;
     std::vector<fs::path> temporary_roots_;
@@ -2398,14 +3488,22 @@ private:
     QAction* judge_selected_action_ = nullptr;
     QAction* judge_all_action_ = nullptr;
     QAction* stop_action_ = nullptr;
+    QAction* server_start_action_ = nullptr;
+    QAction* server_stop_action_ = nullptr;
     QProgressBar* progress_ = nullptr;
     QPlainTextEdit* log_ = nullptr;
+    QProcess* server_process_ = nullptr;
+    QTimer* server_refresh_timer_ = nullptr;
     QDialog* detail_dialog_ = nullptr;
     QLabel* detail_progress_label_ = nullptr;
     QTableWidget* core_tasks_table_ = nullptr;
+    QTableWidget* server_users_table_ = nullptr;
     QString detail_progress_text_;
     std::string current_archive_progress_key_;
     std::vector<std::pair<QString, QString>> core_tasks_;
+    fs::file_time_type last_server_database_write_ = fs::file_time_type::min();
+    fs::file_time_type last_server_results_write_ = fs::file_time_type::min();
+    fs::file_time_type last_server_contestants_write_ = fs::file_time_type::min();
     QPoint drag_offset_;
     bool dragging_title_bar_ = false;
 };
