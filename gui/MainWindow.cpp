@@ -5,6 +5,7 @@
 #include "Theme.hpp"
 #include "ThemeBackground.hpp"
 #include "Translations.hpp"
+#include "WindowsBackdrop.hpp"
 #include "WindowResizeHandles.hpp"
 
 #include "neothemis/JudgeCore.hpp"
@@ -21,6 +22,7 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDateTime>
+#include <QElapsedTimer>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGraphicsDropShadowEffect>
@@ -45,6 +47,7 @@
 #include <QRandomGenerator>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QShowEvent>
 #include <QSpinBox>
 #include <QSlider>
 #include <QSqlDatabase>
@@ -64,8 +67,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -111,11 +116,33 @@ using neothemis::gui::write_xlsx_file;
 using neothemis::gui::xlsx_number;
 using neothemis::gui::xlsx_text;
 
+class SettingsDialog final : public QDialog {
+public:
+    explicit SettingsDialog(QWidget* parent) : QDialog(parent) {}
+
+    void add_close_handler(std::function<void()> handler) {
+        close_handlers_.push_back(std::move(handler));
+    }
+
+protected:
+    void closeEvent(QCloseEvent* event) override {
+        auto handlers = std::move(close_handlers_);
+        for (const auto& handler : handlers) {
+            handler();
+        }
+        QDialog::closeEvent(event);
+    }
+
+private:
+    std::vector<std::function<void()>> close_handlers_;
+};
+
 class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(fs::path initial_contest) {
         load_app_settings();
-        setAttribute(Qt::WA_TranslucentBackground, background_transparency_active());
+        setAttribute(Qt::WA_TranslucentBackground,
+                     background_transparency_active() || background_blur_active());
         setWindowTitle(text("window_title"));
         setWindowIcon(QIcon(":/materials/logo.png"));
         setWindowFlags(Qt::FramelessWindowHint | Qt::Window);
@@ -235,6 +262,16 @@ public:
         progress_->setValue(0);
         side_layout->addWidget(progress_);
 
+        judge_elapsed_label_ = new QLabel(side);
+        judge_elapsed_label_->setObjectName("JudgeElapsedLabel");
+        judge_elapsed_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        side_layout->addWidget(judge_elapsed_label_);
+        judge_elapsed_update_timer_ = new QTimer(this);
+        judge_elapsed_update_timer_->setInterval(100);
+        QObject::connect(judge_elapsed_update_timer_, &QTimer::timeout,
+                         [this]() { update_judge_elapsed_label(); });
+        update_judge_elapsed_label();
+
         log_ = new QPlainTextEdit(side);
         log_->setObjectName("LogPanel");
         log_->setReadOnly(true);
@@ -335,6 +372,11 @@ protected:
         event->accept();
     }
 
+    void showEvent(QShowEvent* event) override {
+        QMainWindow::showEvent(event);
+        apply_selected_theme();
+    }
+
 private:
     QString text(const char* key) const {
         return neothemis::gui::translated_text(key, language_ == "vi");
@@ -420,6 +462,7 @@ private:
         if (detail_view_button_) {
             detail_view_button_->setText(text("detail_view"));
         }
+        update_judge_elapsed_label();
         if (server_start_action_) {
             server_start_action_->setText(text("start_local_server"));
         }
@@ -530,10 +573,15 @@ private:
         const bool transparent = background_transparency_active();
         const bool blurred = background_blur_active();
         neothemis::gui::apply_application_theme(theme_);
-        setAttribute(Qt::WA_TranslucentBackground, transparent);
-        const int opacity = transparent
-                                ? 255 * (100 - background_transparency_) / 100
-                                : 255;
+        neothemis::gui::apply_windows_backdrop(
+            this, transparent, background_transparency_, blurred,
+            blurred ? background_blur_radius_ : 0);
+        int opacity = transparent ? 255 * (100 - background_transparency_) / 100 : 255;
+#ifdef Q_OS_WIN
+        if (blurred && !transparent) {
+            opacity = std::clamp(235 - background_blur_radius_, 105, 225);
+        }
+#endif
         if (background_layer_) {
             background_layer_->set_appearance(theme_, opacity,
                                               blurred ? background_blur_radius_ : 0);
@@ -2689,6 +2737,7 @@ private:
         }
         judging_.store(true);
         cancel_requested_.store(false);
+        start_judge_elapsed();
         set_judge_controls_enabled(false);
         reset_run_cells(selected, selected_problem);
         progress_->setRange(0, 0);
@@ -2732,6 +2781,7 @@ private:
                                               QString::fromUtf8(ex.what()));
                         QMessageBox::critical(this, text("csv_write_failed"), ex.what());
                     }
+                    finish_judge_elapsed();
                     judging_.store(false);
                     set_judge_controls_enabled(true);
                 }, Qt::QueuedConnection);
@@ -2742,6 +2792,7 @@ private:
                     progress_->setValue(0);
                     log_->appendPlainText(cancelled ? text("cancelled") + "."
                                                     : text("failed") + ": " + message);
+                    finish_judge_elapsed();
                     judging_.store(false);
                     set_judge_controls_enabled(true);
                     if (!cancelled) {
@@ -2792,10 +2843,64 @@ private:
         if (judge_thread_.joinable()) {
             judge_thread_.join();
         }
+        finish_judge_elapsed();
         judging_.store(false);
     }
 
-    QWidget* build_visual_tab(QWidget* parent) {
+    static QString format_judge_elapsed(qint64 elapsed_ms) {
+        const qint64 total_tenths = std::max<qint64>(0, elapsed_ms) / 100;
+        const qint64 tenths = total_tenths % 10;
+        const qint64 total_seconds = total_tenths / 10;
+        const qint64 seconds = total_seconds % 60;
+        const qint64 total_minutes = total_seconds / 60;
+        const qint64 minutes = total_minutes % 60;
+        const qint64 hours = total_minutes / 60;
+        if (hours > 0) {
+            return QString("%1:%2:%3.%4")
+                .arg(hours)
+                .arg(minutes, 2, 10, QLatin1Char('0'))
+                .arg(seconds, 2, 10, QLatin1Char('0'))
+                .arg(tenths);
+        }
+        return QString("%1:%2.%3")
+            .arg(minutes)
+            .arg(seconds, 2, 10, QLatin1Char('0'))
+            .arg(tenths);
+    }
+
+    void update_judge_elapsed_label() {
+        if (!judge_elapsed_label_) {
+            return;
+        }
+        const qint64 elapsed = judge_elapsed_update_timer_ &&
+                                      judge_elapsed_update_timer_->isActive() &&
+                                      judge_elapsed_clock_.isValid()
+                                  ? judge_elapsed_clock_.elapsed()
+                                  : last_judge_elapsed_ms_;
+        judge_elapsed_label_->setText(text("elapsed_time") + ": " +
+                                      format_judge_elapsed(elapsed));
+    }
+
+    void start_judge_elapsed() {
+        last_judge_elapsed_ms_ = 0;
+        judge_elapsed_clock_.restart();
+        if (judge_elapsed_update_timer_) {
+            judge_elapsed_update_timer_->start();
+        }
+        update_judge_elapsed_label();
+    }
+
+    void finish_judge_elapsed() {
+        if (judge_elapsed_update_timer_ && judge_elapsed_update_timer_->isActive()) {
+            if (judge_elapsed_clock_.isValid()) {
+                last_judge_elapsed_ms_ = judge_elapsed_clock_.elapsed();
+            }
+            judge_elapsed_update_timer_->stop();
+            update_judge_elapsed_label();
+        }
+    }
+
+    QWidget* build_visual_tab(QWidget* parent, SettingsDialog* settings_dialog) {
         auto* tab = new QWidget(parent);
         auto* form = new QFormLayout(tab);
         form->setContentsMargins(18, 18, 18, 18);
@@ -2921,9 +3026,8 @@ private:
             apply_visual_preview();
         });
 
-        QObject::connect(save, &QPushButton::clicked,
-                         [this, theme, transparent_background, transparency,
-                          blur_background, blur, language, temp_dir]() {
+        auto persist = [this, theme, transparent_background, transparency,
+                        blur_background, blur, language, temp_dir](bool notify) {
             try {
                 theme_ = theme->currentData().toString().toStdString();
                 transparent_background_ = transparent_background->isChecked();
@@ -2939,11 +3043,16 @@ private:
                 save_app_settings();
                 apply_selected_theme();
                 apply_language_to_main_window();
-                log_->appendPlainText(text("saved_app_settings"));
+                if (notify) {
+                    log_->appendPlainText(text("saved_app_settings"));
+                }
             } catch (const std::exception& ex) {
                 QMessageBox::critical(this, text("save_failed"), ex.what());
             }
-        });
+        };
+        QObject::connect(save, &QPushButton::clicked,
+                         [persist]() { persist(true); });
+        settings_dialog->add_close_handler([persist]() { persist(false); });
         QObject::connect(association, &QPushButton::clicked, [this, association]() {
             try {
                 neothemis::gui::register_contest_file_association();
@@ -2957,10 +3066,17 @@ private:
         return tab;
     }
 
-    QWidget* build_contest_tab(QWidget* parent) {
+    QWidget* build_contest_tab(QWidget* parent, SettingsDialog* settings_dialog) {
         auto* tab = new QWidget(parent);
         auto* form = new QFormLayout(tab);
-        auto* compiler = new QLineEdit(QString::fromStdString(compiler_), tab);
+        auto* compiler_widget = new QWidget(tab);
+        auto* compiler_layout = new QHBoxLayout(compiler_widget);
+        compiler_layout->setContentsMargins(0, 0, 0, 0);
+        compiler_layout->setSpacing(10);
+        auto* compiler = new QLineEdit(QString::fromStdString(compiler_), compiler_widget);
+        auto* browse_compiler = new QPushButton(text("browse"), compiler_widget);
+        compiler_layout->addWidget(compiler, 1);
+        compiler_layout->addWidget(browse_compiler);
         auto* flags = new QLineEdit(QString::fromStdString(compile_flags_), tab);
         auto* contestants = new QLineEdit(QString::fromStdString(contestants_dir_), tab);
         auto* tests = new QLineEdit(QString::fromStdString(tests_dir_), tab);
@@ -2974,7 +3090,7 @@ private:
         keep->setChecked(keep_workdir_);
         auto* save = new QPushButton(text("save_contest_config"), tab);
 
-        form->addRow(text("compiler"), compiler);
+        form->addRow(text("compiler"), compiler_widget);
         form->addRow(text("compile_flags"), flags);
         form->addRow(text("contestants_dir"), contestants);
         form->addRow(text("tests_dir"), tests);
@@ -2983,28 +3099,69 @@ private:
         form->addRow(text("keep_workdir"), keep);
         form->addRow(save);
 
-        QObject::connect(save, &QPushButton::clicked, [this, compiler, flags,
-                                                       contestants, tests, stack, parallel, keep]() {
-            compiler_ = compiler->text().toStdString();
-            compile_flags_ = flags->text().toStdString();
-            contestants_dir_ = contestants->text().toStdString();
-            tests_dir_ = tests->text().toStdString();
-            stack_limit_mb_ = static_cast<std::uint64_t>(stack->value());
-            parallel_jobs_ = static_cast<unsigned int>(parallel->value());
-            keep_workdir_ = keep->isChecked();
+        QObject::connect(browse_compiler, &QPushButton::clicked, [this, compiler]() {
+#ifdef Q_OS_WIN
+            const QString filter = text("compiler_executable_filter_windows");
+#else
+            const QString filter = text("compiler_executable_filter");
+#endif
+            const QString selected = QFileDialog::getOpenFileName(
+                this, text("select_compiler"), compiler->text(), filter);
+            if (!selected.isEmpty()) {
+                compiler->setText(selected);
+            }
+        });
+
+        auto persist = [this, compiler, flags, contestants, tests, stack,
+                        parallel, keep](bool notify) {
+            if (contest_root_.empty()) {
+                return;
+            }
+            const std::string new_compiler = compiler->text().toStdString();
+            const std::string new_flags = flags->text().toStdString();
+            const std::string new_contestants = contestants->text().toStdString();
+            const std::string new_tests = tests->text().toStdString();
+            const auto new_stack = static_cast<std::uint64_t>(stack->value());
+            const auto new_parallel = static_cast<unsigned int>(parallel->value());
+            const bool new_keep = keep->isChecked();
+            const bool changed = compiler_ != new_compiler ||
+                                 compile_flags_ != new_flags ||
+                                 contestants_dir_ != new_contestants ||
+                                 tests_dir_ != new_tests ||
+                                 stack_limit_mb_ != new_stack ||
+                                 parallel_jobs_ != new_parallel ||
+                                 keep_workdir_ != new_keep;
+            if (!changed) {
+                if (notify) {
+                    log_->appendPlainText(text("saved_contest_config"));
+                }
+                return;
+            }
+            compiler_ = new_compiler;
+            compile_flags_ = new_flags;
+            contestants_dir_ = new_contestants;
+            tests_dir_ = new_tests;
+            stack_limit_mb_ = new_stack;
+            parallel_jobs_ = new_parallel;
+            keep_workdir_ = new_keep;
             try {
                 save_contest_config();
                 mark_contest_dirty();
                 refresh_table();
-                log_->appendPlainText(text("saved_contest_config"));
+                if (notify) {
+                    log_->appendPlainText(text("saved_contest_config"));
+                }
             } catch (const std::exception& ex) {
                 QMessageBox::critical(this, text("save_failed"), ex.what());
             }
-        });
+        };
+        QObject::connect(save, &QPushButton::clicked,
+                         [persist]() { persist(true); });
+        settings_dialog->add_close_handler([persist]() { persist(false); });
         return tab;
     }
 
-    QWidget* build_problem_tab(QWidget* parent) {
+    QWidget* build_problem_tab(QWidget* parent, SettingsDialog* settings_dialog) {
         auto* tab = new QWidget(parent);
         auto* form = new QFormLayout(tab);
         auto* problem = new QComboBox(tab);
@@ -3039,11 +3196,17 @@ private:
         batch_layout->addWidget(apply_batch);
 
         auto* save = new QPushButton(text("save_problem_config"), tab);
+        auto problem_loading = std::make_shared<bool>(false);
+        auto problem_dirty = std::make_shared<bool>(false);
 
-        auto load_problem = [this, problem, time, memory, points, checker, test_table]() {
+        auto load_problem = [this, problem, time, memory, points, checker, test_table,
+                             problem_loading, problem_dirty]() {
+            *problem_loading = true;
             std::string name = problem->currentText().toStdString();
             if (name.empty()) {
                 test_table->setRowCount(0);
+                *problem_loading = false;
+                *problem_dirty = false;
                 return;
             }
             auto values = read_config_file(contest_root_ / tests_dir_ / name / "problem.conf");
@@ -3072,6 +3235,8 @@ private:
                 test_table->setItem(static_cast<int>(row), 1,
                                     new QTableWidgetItem(QString::fromStdString(override_points)));
             }
+            *problem_loading = false;
+            *problem_dirty = false;
         };
         QObject::connect(problem, &QComboBox::currentTextChanged, [load_problem]() { load_problem(); });
 
@@ -3090,10 +3255,18 @@ private:
             }
         });
 
-        QObject::connect(save, &QPushButton::clicked, [this, problem, time, memory, points, checker, test_table]() {
+        auto persist = [this, problem, time, memory, points, checker,
+                        test_table, problem_dirty](bool notify) {
             try {
                 std::string name = problem->currentText().toStdString();
                 if (name.empty()) {
+                    return;
+                }
+                if (!*problem_dirty) {
+                    if (notify) {
+                        log_->appendPlainText(text("saved_problem_config") +
+                                              problem->currentText());
+                    }
                     return;
                 }
                 std::string default_points = trim(points->text().toStdString());
@@ -3129,11 +3302,17 @@ private:
                                      default_points.empty() ? std::string("1") : default_points,
                                      checker->currentText().toStdString(), overrides);
                 mark_contest_dirty();
-                log_->appendPlainText(text("saved_problem_config") + problem->currentText());
+                *problem_dirty = false;
+                if (notify) {
+                    log_->appendPlainText(text("saved_problem_config") + problem->currentText());
+                }
             } catch (const std::exception& ex) {
                 QMessageBox::critical(this, text("save_failed"), ex.what());
             }
-        });
+        };
+        QObject::connect(save, &QPushButton::clicked,
+                         [persist]() { persist(true); });
+        settings_dialog->add_close_handler([persist]() { persist(false); });
 
         form->addRow(text("problem"), problem);
         form->addRow(text("time_limit_ms"), time);
@@ -3146,10 +3325,25 @@ private:
         if (problem->count() > 0) {
             load_problem();
         }
+        auto mark_problem_dirty = [problem_loading, problem_dirty]() {
+            if (!*problem_loading) {
+                *problem_dirty = true;
+            }
+        };
+        QObject::connect(time, &QSpinBox::valueChanged,
+                         [mark_problem_dirty](int) { mark_problem_dirty(); });
+        QObject::connect(memory, &QSpinBox::valueChanged,
+                         [mark_problem_dirty](int) { mark_problem_dirty(); });
+        QObject::connect(points, &QLineEdit::textChanged,
+                         [mark_problem_dirty](const QString&) { mark_problem_dirty(); });
+        QObject::connect(checker, &QComboBox::currentTextChanged,
+                         [mark_problem_dirty](const QString&) { mark_problem_dirty(); });
+        QObject::connect(test_table, &QTableWidget::itemChanged,
+                         [mark_problem_dirty](QTableWidgetItem*) { mark_problem_dirty(); });
         return tab;
     }
 
-    QWidget* build_server_settings_tab(QWidget* parent) {
+    QWidget* build_server_settings_tab(QWidget* parent, SettingsDialog* settings_dialog) {
         auto* tab = new QWidget(parent);
         auto* form = new QFormLayout(tab);
         form->setContentsMargins(18, 18, 18, 18);
@@ -3187,14 +3381,25 @@ private:
         form->addRow(warning);
         form->addRow(save);
 
-        QObject::connect(save, &QPushButton::clicked, [this, port, allow_lan,
-                                                       enable_ranking, enable_details,
-                                                       join_code, admin_password]() {
+        auto persist = [this, port, allow_lan, enable_ranking, enable_details,
+                        join_code, admin_password](bool notify) {
             const QString join = join_code->text().trimmed();
             const QString admin = admin_password->text();
             if (join.isEmpty() || admin.isEmpty()) {
                 QMessageBox::warning(this, text("save_failed"),
                                      text("server_credentials_required"));
+                return;
+            }
+            const bool changed = server_port_ != port->value() ||
+                                 server_allow_lan_ != allow_lan->isChecked() ||
+                                 server_ranking_enabled_ != enable_ranking->isChecked() ||
+                                 server_contestant_details_enabled_ != enable_details->isChecked() ||
+                                 server_join_code_ != join ||
+                                 server_admin_password_ != admin;
+            if (!changed) {
+                if (notify) {
+                    log_->appendPlainText(text("saved_server_settings"));
+                }
                 return;
             }
             server_port_ = port->value();
@@ -3205,13 +3410,20 @@ private:
             server_admin_password_ = admin;
             try {
                 save_app_settings();
-                save_contest_config();
-                mark_contest_dirty();
-                log_->appendPlainText(text("saved_server_settings"));
+                if (!contest_root_.empty()) {
+                    save_contest_config();
+                    mark_contest_dirty();
+                }
+                if (notify) {
+                    log_->appendPlainText(text("saved_server_settings"));
+                }
             } catch (const std::exception& ex) {
                 QMessageBox::critical(this, text("save_failed"), ex.what());
             }
-        });
+        };
+        QObject::connect(save, &QPushButton::clicked,
+                         [persist]() { persist(true); });
+        settings_dialog->add_close_handler([persist]() { persist(false); });
         return tab;
     }
 
@@ -3433,15 +3645,16 @@ private:
     }
 
     void open_settings_dialog(int initial_tab) {
-        auto* dialog = new QDialog(this);
+        auto* dialog = new SettingsDialog(this);
         dialog->setWindowTitle(text("settings_title"));
+        dialog->setWindowModality(Qt::WindowModal);
         dialog->resize(820, 680);
         auto* layout = new QVBoxLayout(dialog);
         auto* tabs = new QTabWidget(dialog);
-        tabs->addTab(build_visual_tab(tabs), text("application"));
-        tabs->addTab(build_contest_tab(tabs), text("contest"));
-        tabs->addTab(build_problem_tab(tabs), text("problems"));
-        tabs->addTab(build_server_settings_tab(tabs), text("server_settings"));
+        tabs->addTab(build_visual_tab(tabs, dialog), text("application"));
+        tabs->addTab(build_contest_tab(tabs, dialog), text("contest"));
+        tabs->addTab(build_problem_tab(tabs, dialog), text("problems"));
+        tabs->addTab(build_server_settings_tab(tabs, dialog), text("server_settings"));
         tabs->addTab(build_server_users_tab(tabs), text("server_users"));
         tabs->setCurrentIndex(initial_tab);
         layout->addWidget(tabs);
@@ -3540,6 +3753,10 @@ private:
     QAction* server_start_action_ = nullptr;
     QAction* server_stop_action_ = nullptr;
     QProgressBar* progress_ = nullptr;
+    QLabel* judge_elapsed_label_ = nullptr;
+    QTimer* judge_elapsed_update_timer_ = nullptr;
+    QElapsedTimer judge_elapsed_clock_;
+    qint64 last_judge_elapsed_ms_ = 0;
     QPlainTextEdit* log_ = nullptr;
     QProcess* server_process_ = nullptr;
     QTimer* server_refresh_timer_ = nullptr;

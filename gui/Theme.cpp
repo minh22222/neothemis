@@ -218,6 +218,10 @@ void apply_application_theme(const std::string& theme) {
                 stop:0 #61d7c7, stop:0.68 #8ef7e3, stop:1 #e86a82);
             border-radius: 7px;
         }
+        QLabel#JudgeElapsedLabel {
+            color: #9fb3bd;
+            padding: 0 4px 2px 4px;
+        }
         QSlider::groove:horizontal {
             background: rgba(7, 12, 17, 190);
             border: 1px solid rgba(255, 255, 255, 42);

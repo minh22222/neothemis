@@ -28,6 +28,8 @@ add_executable(neothemis-gui
     Translations.hpp
     WindowResizeHandles.cpp
     WindowResizeHandles.hpp
+    WindowsBackdrop.cpp
+    WindowsBackdrop.hpp
 )
 
 if (WIN32)
