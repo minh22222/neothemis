@@ -63,7 +63,7 @@ struct ContestSettings {
     fs::path output_csv = "results.csv";
     std::string core_name = "builtin";
     std::string compiler = "g++";
-    std::string compile_flags = "-std=c++17 -O2 -pipe";
+    std::string compile_flags = "-std=c++14 -O2 -pipe";
     std::uint64_t stack_limit_mb = 64;
     unsigned int parallel_jobs = 1;
     std::vector<std::string> forbidden_patterns;
@@ -284,14 +284,17 @@ void write_text_file(const fs::path& path, const std::string& content) {
     out << content;
 }
 
-std::vector<std::string> parse_csv_line(const std::string& line) {
+std::vector<std::vector<std::string>> parse_csv_records(const std::string& text) {
+    std::vector<std::vector<std::string>> records;
     std::vector<std::string> fields;
     std::string cell;
     bool in_quotes = false;
-    for (std::size_t i = 0; i < line.size(); ++i) {
-        char ch = line[i];
+    bool have_data = false;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+        have_data = true;
         if (in_quotes) {
-            if (ch == '"' && i + 1 < line.size() && line[i + 1] == '"') {
+            if (ch == '"' && i + 1 < text.size() && text[i + 1] == '"') {
                 cell.push_back('"');
                 ++i;
             } else if (ch == '"') {
@@ -306,12 +309,31 @@ std::vector<std::string> parse_csv_line(const std::string& line) {
         } else if (ch == ',') {
             fields.push_back(cell);
             cell.clear();
+        } else if (ch == '\n') {
+            fields.push_back(cell);
+            cell.clear();
+            records.push_back(fields);
+            fields.clear();
+            have_data = false;
         } else if (ch != '\r') {
             cell.push_back(ch);
         }
     }
-    fields.push_back(cell);
-    return fields;
+    if (have_data || !cell.empty() || !fields.empty()) {
+        fields.push_back(cell);
+        records.push_back(fields);
+    }
+    return records;
+}
+
+std::vector<std::vector<std::string>> read_csv_records(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        return {};
+    }
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return parse_csv_records(contents.str());
 }
 
 std::string csv_escape(std::string value) {
@@ -325,6 +347,17 @@ std::string csv_escape(std::string value) {
         }
     }
     return needs_quotes ? "\"" + escaped + "\"" : escaped;
+}
+
+std::string csv_record(const std::vector<std::string>& fields) {
+    std::string record;
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (i > 0) {
+            record.push_back(',');
+        }
+        record += csv_escape(fields[i]);
+    }
+    return record;
 }
 
 class Database {
@@ -1381,7 +1414,7 @@ private:
                     QString::number(row.exit_code) + "</td><td>" +
                     QString::number(row.earned_points, 'f', 2) + "/" +
                     QString::number(row.max_points, 'f', 2) + "</td><td>" +
-                    html_escape(row.message.left(500)) + "</td></tr>";
+                    html_escape(row.message) + "</td></tr>";
         }
         body += "</tbody></table></section>";
         return html_response(render_shell("Details", body, user));
@@ -1399,35 +1432,25 @@ private:
 
         std::set<QString> known_problems(table.problems.begin(), table.problems.end());
         fs::path output_path = contest_output_path(settings_.output_csv);
-        if (fs::exists(output_path)) {
-            std::ifstream input(output_path, std::ios::binary);
-            std::string line;
-            bool first = true;
-            while (std::getline(input, line)) {
-                if (!line.empty() && line.back() == '\r') {
-                    line.pop_back();
-                }
-                if (first) {
-                    first = false;
-                    if (line.rfind("contestant,problem,test,", 0) == 0) {
-                        continue;
-                    }
-                }
-                const std::vector<std::string> fields = parse_csv_line(line);
-                if (fields.size() < 8) {
-                    continue;
-                }
-                const QString username = QString::fromStdString(fields[0]);
-                const QString problem = QString::fromStdString(fields[1]);
-                auto row = row_by_username.find(username);
-                if (row == row_by_username.end() || known_problems.count(problem) == 0) {
-                    continue;
-                }
-                try {
-                    table.rows[row->second].problem_scores[problem] += std::stod(fields[7]);
-                } catch (const std::exception&) {
-                    continue;
-                }
+        const auto records = read_csv_records(output_path);
+        for (std::size_t index = 0; index < records.size(); ++index) {
+            const std::vector<std::string>& fields = records[index];
+            if (index == 0 && !fields.empty() && fields[0] == "contestant") {
+                continue;
+            }
+            if (fields.size() < 8) {
+                continue;
+            }
+            const QString username = QString::fromStdString(fields[0]);
+            const QString problem = QString::fromStdString(fields[1]);
+            auto row = row_by_username.find(username);
+            if (row == row_by_username.end() || known_problems.count(problem) == 0) {
+                continue;
+            }
+            try {
+                table.rows[row->second].problem_scores[problem] += std::stod(fields[7]);
+            } catch (const std::exception&) {
+                continue;
             }
         }
 
@@ -1537,29 +1560,19 @@ private:
         fs::create_directories(output_path.parent_path());
 
         std::vector<std::string> kept_lines;
-        if (fs::exists(output_path)) {
-            std::ifstream in(output_path, std::ios::binary);
-            std::string line;
-            bool first = true;
-            while (std::getline(in, line)) {
-                if (!line.empty() && line.back() == '\r') {
-                    line.pop_back();
-                }
-                if (first) {
-                    first = false;
-                    if (line.rfind("contestant,problem,test,", 0) == 0) {
-                        continue;
-                    }
-                }
-                std::vector<std::string> fields = parse_csv_line(line);
-                if (fields.size() >= 2 &&
-                    fields[0] == contestant.toStdString() &&
-                    fields[1] == problem.toStdString()) {
-                    continue;
-                }
-                if (!line.empty()) {
-                    kept_lines.push_back(line);
-                }
+        const auto existing_records = read_csv_records(output_path);
+        for (std::size_t index = 0; index < existing_records.size(); ++index) {
+            const std::vector<std::string>& fields = existing_records[index];
+            if (index == 0 && !fields.empty() && fields[0] == "contestant") {
+                continue;
+            }
+            if (fields.size() >= 2 &&
+                fields[0] == contestant.toStdString() &&
+                fields[1] == problem.toStdString()) {
+                continue;
+            }
+            if (!fields.empty()) {
+                kept_lines.push_back(csv_record(fields));
             }
         }
 
@@ -1589,19 +1602,14 @@ private:
         std::vector<std::string> replacement_lines;
         std::ostringstream generated;
         neothemis::write_csv(generated, results);
-        std::istringstream generated_input(generated.str());
-        std::string line;
-        bool first = true;
-        while (std::getline(generated_input, line)) {
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            if (first) {
-                first = false;
+        const auto generated_records = parse_csv_records(generated.str());
+        for (std::size_t index = 0; index < generated_records.size(); ++index) {
+            if (index == 0 && !generated_records[index].empty() &&
+                generated_records[index][0] == "contestant") {
                 continue;
             }
-            if (!line.empty()) {
-                replacement_lines.push_back(line);
+            if (!generated_records[index].empty()) {
+                replacement_lines.push_back(csv_record(generated_records[index]));
             }
         }
 

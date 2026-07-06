@@ -1114,7 +1114,7 @@ void write_default_neothemis_config(const fs::path& new_root) {
         << "server_ranking_enabled=false\n"
         << "server_contestant_details_enabled=false\n"
         << "compiler=g++\n"
-        << "compile_flags=-std=c++17 -O2 -pipe\n"
+        << "compile_flags=-std=c++14 -O2 -pipe\n"
         << "stack_limit_mb=64\n"
         << "parallel_jobs=0\n"
         << "forbidden_pattern=system(\n"

@@ -258,9 +258,17 @@ Output symlinks are ignored. This is hardening, not a full sandbox; run
 untrusted submissions inside an OS-level sandbox or container if strong
 isolation is required.
 
-`parallel_jobs=0` uses the number of physical CPU cores when available, or half
-the logical thread count as a fallback. Set it to `1` for serial judging or a
-positive number to cap the worker queue.
+`parallel_jobs=0` limits workers to the highest Windows CPU efficiency class or
+the highest-capacity Linux physical cores when the OS exposes heterogeneous CPU
+information. It falls back to physical cores, then half the logical thread
+count. Work remains in one shared queue, so faster P-core workers naturally take
+more tests than slower workers. Set it to `1` for serial judging or a positive
+number to override the automatic cap.
+
+Compiler warnings never cause `CE`: NeoThemis removes warning-as-error flags,
+adds the compiler's warning-tolerant option, and accepts the build whenever a
+non-empty executable was produced. Actual compile failures remain `CE` and keep
+their complete compiler diagnostic.
 
 ## Checkers And Verdicts
 
@@ -358,6 +366,10 @@ Detailed CSV rows use:
 contestant,problem,test,verdict,time_ms,exit_code,max_points,earned_points,message
 ```
 
+The `message` field is stored in full, including quoted multiline diagnostics.
+In the GUI result-detail table, long descriptions are visually elided; hover the
+description cell for the pointer cursor and click it to open the full text.
+
 The simplified scoreboard has one row per contestant, one column per problem,
 and a numeric `total` column. Missing source cells are written as `MS(0)`;
 compile-error cells are written as `CE(0)`.
@@ -377,7 +389,7 @@ keep_workdir=false
 server_ranking_enabled=false
 server_contestant_details_enabled=false
 compiler=g++
-compile_flags=-std=c++17 -O2 -pipe
+compile_flags=-std=c++14 -O2 -pipe
 stack_limit_mb=64
 parallel_jobs=0
 
@@ -428,7 +440,7 @@ custom checker sources.
 
 `compile_flags`
 : Compiler flags used for submissions and custom checker sources. Default:
-`-std=c++17 -O2 -pipe`.
+`-std=c++14 -O2 -pipe`.
 
 `stack_limit_mb`
 : Contest-wide maximum stack size, in megabytes. Default: `64`. Use `0` to
@@ -439,7 +451,8 @@ Windows, supported compilers receive a stack reserve linker flag.
 
 `parallel_jobs`
 : Number of worker jobs for compilation preparation and test judging. Default:
-`0`, which auto-detects available CPU cores.
+`0`, which prefers detected performance cores on heterogeneous CPUs and falls
+back to physical cores or half the logical thread count.
 
 `forbidden_pattern`
 : Repeatable source-code text filter. Matching is case-insensitive.

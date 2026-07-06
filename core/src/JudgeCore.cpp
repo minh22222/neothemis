@@ -226,6 +226,63 @@ bool signal_can_indicate_memory_limit(int signal_number) {
 }
 
 #if defined(__linux__)
+unsigned int linux_performance_core_count() {
+    const fs::path cpu_root = "/sys/devices/system/cpu";
+    std::map<std::pair<std::string, std::string>, std::uint64_t> core_frequencies;
+    std::error_code directory_error;
+    fs::directory_iterator entries(cpu_root, directory_error);
+    if (directory_error) {
+        return 0;
+    }
+
+    for (const auto& entry : entries) {
+        const std::string name = entry.path().filename().string();
+        if (name.size() <= 3 || name.rfind("cpu", 0) != 0 ||
+            !std::all_of(name.begin() + 3, name.end(), [](unsigned char ch) {
+                return std::isdigit(ch) != 0;
+            })) {
+            continue;
+        }
+
+        auto read_value = [&](const fs::path& path, std::string& value) {
+            std::ifstream input(path);
+            return static_cast<bool>(input >> value);
+        };
+        std::string package_id;
+        std::string core_id;
+        std::string maximum_frequency;
+        if (!read_value(entry.path() / "topology" / "physical_package_id", package_id) ||
+            !read_value(entry.path() / "topology" / "core_id", core_id) ||
+            !read_value(entry.path() / "cpufreq" / "cpuinfo_max_freq", maximum_frequency)) {
+            continue;
+        }
+        try {
+            const std::uint64_t frequency = std::stoull(maximum_frequency);
+            auto& stored = core_frequencies[{package_id, core_id}];
+            stored = std::max(stored, frequency);
+        } catch (const std::exception&) {
+        }
+    }
+
+    if (core_frequencies.empty()) {
+        return 0;
+    }
+    std::uint64_t maximum_frequency = 0;
+    for (const auto& [core, frequency] : core_frequencies) {
+        (void)core;
+        maximum_frequency = std::max(maximum_frequency, frequency);
+    }
+    const std::uint64_t performance_threshold = maximum_frequency * 9 / 10;
+    unsigned int performance_cores = 0;
+    for (const auto& [core, frequency] : core_frequencies) {
+        (void)core;
+        if (frequency >= performance_threshold) {
+            ++performance_cores;
+        }
+    }
+    return performance_cores;
+}
+
 unsigned int linux_physical_core_count() {
     std::ifstream cpuinfo("/proc/cpuinfo");
     if (!cpuinfo) {
@@ -272,7 +329,7 @@ unsigned int linux_physical_core_count() {
 #endif
 
 #ifdef _WIN32
-unsigned int windows_physical_core_count() {
+unsigned int windows_performance_core_count() {
     DWORD length = 0;
     if (GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length) ||
         GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
@@ -287,20 +344,23 @@ unsigned int windows_physical_core_count() {
         return 0;
     }
 
-    unsigned int cores = 0;
+    std::map<BYTE, unsigned int> cores_by_efficiency_class;
     DWORD offset = 0;
     while (offset < length) {
         auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
             buffer.data() + offset);
         if (info->Relationship == RelationProcessorCore) {
-            ++cores;
+            ++cores_by_efficiency_class[info->Processor.EfficiencyClass];
         }
         if (info->Size == 0) {
             break;
         }
         offset += info->Size;
     }
-    return cores;
+    if (cores_by_efficiency_class.empty()) {
+        return 0;
+    }
+    return cores_by_efficiency_class.rbegin()->second;
 }
 
 std::string windows_error_message(DWORD error) {
@@ -926,6 +986,25 @@ std::string lower_ascii(std::string value) {
     return value;
 }
 
+std::vector<std::string> warning_tolerant_compile_flags(const std::string& compiler,
+                                                        const std::string& flags) {
+    std::vector<std::string> filtered;
+    for (const std::string& flag : split_words(flags)) {
+        const std::string lower = lower_ascii(flag);
+        if (lower == "-werror" || lower.rfind("-werror=", 0) == 0 ||
+            lower == "-pedantic-errors" || lower == "/wx" || lower.rfind("/wx:", 0) == 0) {
+            continue;
+        }
+        filtered.push_back(flag);
+    }
+
+    const std::string compiler_name = lower_ascii(fs::path(compiler).filename().string());
+    filtered.push_back(compiler_name == "cl" || compiler_name == "cl.exe"
+                           ? "/WX-"
+                           : "-Wno-error");
+    return filtered;
+}
+
 bool has_shell_metachar(const std::string& value) {
     return value.find_first_of("&;|<>$`\n\r") != std::string::npos;
 }
@@ -1285,11 +1364,6 @@ std::string first_existing_file_text(const std::initializer_list<fs::path>& path
                 if (text.empty()) {
                     continue;
                 }
-                constexpr std::size_t max_len = 300;
-                if (text.size() > max_len) {
-                    text.resize(max_len);
-                    text += "...";
-                }
                 return text;
             } catch (...) {
             }
@@ -1353,13 +1427,13 @@ fs::path resolve_checker_source(const ProblemSettings& settings,
 }
 
 std::string read_checker_message(const fs::path& path) {
-    std::string text = first_existing_file_text({path});
-    constexpr std::size_t max_len = 300;
-    if (text.size() > max_len) {
-        text.resize(max_len);
-        text += "...";
-    }
-    return text;
+    return first_existing_file_text({path});
+}
+
+bool nonempty_executable_exists(const fs::path& executable) {
+    std::error_code error;
+    return fs::is_regular_file(executable, error) && !error &&
+           fs::file_size(executable, error) > 0 && !error;
 }
 
 bool parse_first_number(const std::string& text, double& value) {
@@ -1429,14 +1503,20 @@ fs::path compile_checker(const ProblemSettings& settings,
 
     fs::path compile_log = problem_dir / "checker-compile.err";
     std::string compile_cmd = quote_command_token(options.compiler) + " " +
-                              quote_command_tokens(split_words(options.compile_flags)) + " " +
+                              quote_command_tokens(warning_tolerant_compile_flags(
+                                  options.compiler, options.compile_flags)) + " " +
                               stack_guard_compile_flags(options.compiler, options.stack_limit_mb) + " " +
                               "-I " + quote_path(problem_dir) + " " +
                               quote_path(checker_source) + " -o " + quote_path(checker_executable);
     ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log,
                                         0, 0, 0, options.should_cancel);
-    if (compile.exit_code != 0) {
-        throw std::runtime_error("checker compile failed: " + read_checker_message(compile_log));
+    if (!nonempty_executable_exists(checker_executable)) {
+        std::string message = read_checker_message(compile_log);
+        if (message.empty()) {
+            message = "compiler exited with code " + std::to_string(compile.exit_code) +
+                      " without producing a checker executable";
+        }
+        throw std::runtime_error("checker compile failed: " + message);
     }
     return checker_executable;
 }
@@ -1615,16 +1695,22 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
 #endif
     fs::path compile_log = build_dir / "compile.err";
     std::string compile_cmd = quote_command_token(options.compiler) + " " +
-                              quote_command_tokens(split_words(options.compile_flags)) + " " +
+                              quote_command_tokens(warning_tolerant_compile_flags(
+                                  options.compiler, options.compile_flags)) + " " +
                               stack_guard_compile_flags(options.compiler, options.stack_limit_mb) + " " +
                               quote_path(source) + " -o " + quote_path(prepared.executable);
     ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log,
                                         0, 0, 0, options.should_cancel);
-    if (compile.exit_code != 0) {
+    if (!nonempty_executable_exists(prepared.executable)) {
+        std::string message = first_existing_file_text({compile_log});
+        if (message.empty()) {
+            message = "compiler exited with code " + std::to_string(compile.exit_code) +
+                      " without producing an executable";
+        }
         prepared.immediate_results =
             rows_for_problem_tests(prepared.contestant, problem, Verdict::CompileError,
                                    compile.exit_code, compile.elapsed_ms,
-                                   first_existing_file_text({compile_log}));
+                                   message);
         return prepared;
     }
 
@@ -1746,9 +1832,12 @@ unsigned int configured_worker_count(const JudgeOptions& options) {
     unsigned int worker_count = options.parallel_jobs;
     if (worker_count == 0) {
 #ifdef _WIN32
-        worker_count = windows_physical_core_count();
+        worker_count = windows_performance_core_count();
 #elif defined(__linux__)
-        worker_count = linux_physical_core_count();
+        worker_count = linux_performance_core_count();
+        if (worker_count == 0) {
+            worker_count = linux_physical_core_count();
+        }
 #endif
         if (worker_count == 0) {
             worker_count = std::thread::hardware_concurrency();

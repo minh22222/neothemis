@@ -1322,7 +1322,7 @@ private:
 
     void reset_contest_config_defaults() {
         compiler_ = "g++";
-        compile_flags_ = "-std=c++17 -O2 -pipe";
+        compile_flags_ = "-std=c++14 -O2 -pipe";
         contestants_dir_ = "contestants";
         tests_dir_ = "tests";
         stack_limit_mb_ = 64;
@@ -2403,25 +2403,9 @@ private:
             return a.test < b.test;
         });
 
-        QString text;
         std::uint64_t maximum_time_ms = 0;
         for (const auto& result : rows) {
             maximum_time_ms = std::max(maximum_time_ms, result.time_ms);
-        }
-        if (rows.empty()) {
-            text = this->text("no_judged_tests");
-        } else {
-            for (const auto& result : rows) {
-                QString description = QString::fromStdString(neothemis::to_string(result.verdict));
-                if (!result.message.empty()) {
-                    description += ": " + QString::fromStdString(result.message);
-                }
-                text += QString::fromStdString(result.test) + ": " +
-                        format_points(result.earned_points) + "/" +
-                        format_points(result.max_points) + " " + this->text("point") + "\n";
-                text += this->text("run_time") + ": " + QString::number(result.time_ms) + " ms\n";
-                text += this->text("description") + ": " + description + "\n\n";
-            }
         }
 
         auto* dialog = new QDialog(this);
@@ -2433,9 +2417,74 @@ private:
         auto* maximum_time = new QLabel(
             this->text("maximum_test_time") + ": " + QString::number(maximum_time_ms) + " ms",
             dialog);
-        auto* details = new QPlainTextEdit(dialog);
-        details->setReadOnly(true);
-        details->setPlainText(text);
+        auto* details = new QTableWidget(dialog);
+        details->setColumnCount(4);
+        details->setHorizontalHeaderLabels({this->text("test"), this->text("point"),
+                                             this->text("run_time"),
+                                             this->text("description")});
+        details->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+        details->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        details->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+        details->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
+        details->verticalHeader()->setVisible(false);
+        details->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        details->setSelectionMode(QAbstractItemView::NoSelection);
+        details->setTextElideMode(Qt::ElideRight);
+        details->setMouseTracking(true);
+        details->setRowCount(static_cast<int>(rows.size()));
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+            const auto& result = rows[row];
+            QString description = QString::fromStdString(neothemis::to_string(result.verdict));
+            if (!result.message.empty()) {
+                description += ": " + QString::fromStdString(result.message);
+            }
+            details->setItem(static_cast<int>(row), 0,
+                             new QTableWidgetItem(QString::fromStdString(result.test)));
+            details->setItem(static_cast<int>(row), 1,
+                             new QTableWidgetItem(format_points(result.earned_points) + "/" +
+                                                  format_points(result.max_points)));
+            details->setItem(static_cast<int>(row), 2,
+                             new QTableWidgetItem(QString::number(result.time_ms) + " ms"));
+            auto* description_item = new QTableWidgetItem(description);
+            description_item->setData(Qt::UserRole, description);
+            description_item->setToolTip(this->text("open_full_description"));
+            details->setItem(static_cast<int>(row), 3, description_item);
+        }
+        if (rows.empty()) {
+            details->setRowCount(1);
+            details->setItem(0, 0, new QTableWidgetItem(this->text("no_judged_tests")));
+            details->setSpan(0, 0, 1, 4);
+        }
+        QObject::connect(details, &QTableWidget::cellEntered,
+                         [details](int, int column) {
+            details->viewport()->setCursor(column == 3 ? Qt::PointingHandCursor
+                                                        : Qt::ArrowCursor);
+        });
+        QObject::connect(details, &QTableWidget::cellClicked,
+                         [this, dialog, details](int row, int column) {
+            if (column != 3) {
+                return;
+            }
+            QTableWidgetItem* item = details->item(row, column);
+            if (!item) {
+                return;
+            }
+            auto* description_dialog = new QDialog(dialog);
+            description_dialog->setWindowTitle(this->text("full_description"));
+            description_dialog->resize(760, 500);
+            auto* description_layout = new QVBoxLayout(description_dialog);
+            auto* full_description = new QPlainTextEdit(description_dialog);
+            full_description->setReadOnly(true);
+            full_description->setPlainText(item->data(Qt::UserRole).toString());
+            auto* close_buttons = new QDialogButtonBox(QDialogButtonBox::Close,
+                                                       description_dialog);
+            QObject::connect(close_buttons, &QDialogButtonBox::rejected,
+                             description_dialog, &QDialog::close);
+            description_layout->addWidget(full_description, 1);
+            description_layout->addWidget(close_buttons);
+            description_dialog->setAttribute(Qt::WA_DeleteOnClose);
+            description_dialog->show();
+        });
         auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
         QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::close);
         layout->addWidget(title);
@@ -3438,7 +3487,7 @@ private:
     bool sort_ascending_ = true;
 
     std::string compiler_ = "g++";
-    std::string compile_flags_ = "-std=c++17 -O2 -pipe";
+    std::string compile_flags_ = "-std=c++14 -O2 -pipe";
     std::string contestants_dir_ = "contestants";
     std::string tests_dir_ = "tests";
     std::string language_ = "en";

@@ -32,7 +32,7 @@ struct JudgeOptions {
     std::filesystem::path scoreboard_csv = "scoreboard.csv";
     std::string core_name = "builtin";
     std::string compiler = "g++";
-    std::string compile_flags = "-std=c++17 -O2 -pipe";
+    std::string compile_flags = "-std=c++14 -O2 -pipe";
     std::uint64_t stack_limit_mb = 64;
     unsigned int parallel_jobs = 0;
     std::vector<std::string> selected_problems;

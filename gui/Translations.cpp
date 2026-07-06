@@ -154,6 +154,8 @@ const UiTextEntry kUiText[] = {
     {"run_time", "Run time", u8"Thời gian chạy"},
     {"point", "Point", u8"Điểm"},
     {"description", "Description", u8"Mô tả"},
+    {"full_description", "Full Description", u8"Mô tả đầy đủ"},
+    {"open_full_description", "Click to open the full description", u8"Nhấp để mở mô tả đầy đủ"},
     {"no_judged_tests", "No judged tests for this cell yet.", u8"Ô này chưa có test nào được chấm."},
     {"point_override", "Point override", u8"Điểm riêng"},
     {"selected_point", "Selected point", u8"Điểm cho test đã chọn"},

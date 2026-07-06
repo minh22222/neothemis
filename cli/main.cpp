@@ -82,14 +82,14 @@ void print_contest_config_reference(std::ostream& out) {
         << "      Let contestants view per-test details for their own web submissions.\n"
         << "  compiler=g++\n"
         << "      C++ compiler command used for submissions and checkers.\n"
-        << "  compile_flags=-std=c++17 -O2 -pipe\n"
+        << "  compile_flags=-std=c++14 -O2 -pipe\n"
         << "      Compiler flags used for submissions and checkers.\n"
         << "  stack_limit_mb=64\n"
         << "      Contest-wide maximum stack size in megabytes. Use 0 for unlimited.\n"
         << "      Linux enforces this at runtime with RLIMIT_STACK and disables sibling-call optimization.\n"
         << "      Windows passes a compiler/linker stack reserve flag where supported.\n"
         << "  parallel_jobs=0\n"
-        << "      Worker count for compile preparation and judging. 0 uses physical CPU cores.\n"
+        << "      Worker count for compile preparation and judging. 0 prefers performance cores.\n"
         << "  forbidden_pattern=<text>\n"
         << "      Repeatable case-insensitive source-code security filter; matching submissions get SV.\n";
 }
@@ -295,9 +295,9 @@ void write_default_settings(const fs::path& settings_path) {
         << "server_ranking_enabled=false\n"
         << "server_contestant_details_enabled=false\n"
         << "compiler=g++\n"
-        << "compile_flags=-std=c++17 -O2 -pipe\n"
+        << "compile_flags=-std=c++14 -O2 -pipe\n"
         << "stack_limit_mb=64\n"
-        << "# 0 uses physical CPU cores, or half logical threads if detection is unavailable.\n"
+        << "# 0 prefers performance cores, then physical cores, then half logical threads.\n"
         << "parallel_jobs=0\n"
         << "\n"
         << "# Submissions containing these text patterns are rejected with SV.\n";
@@ -321,6 +321,10 @@ void apply_setting(neothemis::JudgeOptions& options,
         options.scoreboard_csv = value;
     } else if (key == "keep_workdir") {
         options.keep_workdir = parse_bool(value, key);
+    } else if (key == "server_ranking_enabled" ||
+               key == "server_contestant_details_enabled") {
+        (void)parse_bool(value, key);
+        // Server visibility settings do not affect local CLI judging.
     } else if (key == "compiler") {
         options.compiler = value;
     } else if (key == "compile_flags") {
@@ -588,15 +592,18 @@ std::string xlsx_column_name(std::size_t index) {
     return name;
 }
 
-std::vector<std::string> parse_csv_row(const std::string& line) {
+std::vector<std::vector<std::string>> parse_csv_records(const std::string& text) {
+    std::vector<std::vector<std::string>> rows;
     std::vector<std::string> row;
     std::string cell;
     bool quoted = false;
-    for (std::size_t i = 0; i < line.size(); ++i) {
-        char ch = line[i];
+    bool have_data = false;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+        have_data = true;
         if (quoted) {
             if (ch == '"') {
-                if (i + 1 < line.size() && line[i + 1] == '"') {
+                if (i + 1 < text.size() && text[i + 1] == '"') {
                     cell.push_back('"');
                     ++i;
                 } else {
@@ -612,12 +619,21 @@ std::vector<std::string> parse_csv_row(const std::string& line) {
         } else if (ch == ',') {
             row.push_back(cell);
             cell.clear();
-        } else {
+        } else if (ch == '\n') {
+            row.push_back(cell);
+            cell.clear();
+            rows.push_back(row);
+            row.clear();
+            have_data = false;
+        } else if (ch != '\r') {
             cell.push_back(ch);
         }
     }
-    row.push_back(cell);
-    return row;
+    if (have_data || !cell.empty() || !row.empty()) {
+        row.push_back(cell);
+        rows.push_back(row);
+    }
+    return rows;
 }
 
 std::vector<std::vector<std::string>> read_csv_rows(const fs::path& path) {
@@ -625,15 +641,9 @@ std::vector<std::vector<std::string>> read_csv_rows(const fs::path& path) {
     if (!in) {
         throw std::runtime_error("failed to read CSV file: " + path.string());
     }
-    std::vector<std::vector<std::string>> rows;
-    std::string line;
-    while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        rows.push_back(parse_csv_row(line));
-    }
-    return rows;
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    return parse_csv_records(contents.str());
 }
 
 std::string xlsx_sheet_xml(const std::vector<std::vector<std::string>>& rows) {
