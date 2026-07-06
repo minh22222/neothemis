@@ -350,7 +350,10 @@ unsigned int windows_performance_core_count() {
         auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
             buffer.data() + offset);
         if (info->Relationship == RelationProcessorCore) {
-            ++cores_by_efficiency_class[info->Processor.EfficiencyClass];
+            // Older MinGW headers name the documented EfficiencyClass byte as padding.
+            const auto* relationship_bytes =
+                reinterpret_cast<const unsigned char*>(&info->Processor);
+            ++cores_by_efficiency_class[relationship_bytes[1]];
         }
         if (info->Size == 0) {
             break;
