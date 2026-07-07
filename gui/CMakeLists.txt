@@ -9,6 +9,9 @@ if (NOT Qt6_FOUND)
 endif()
 find_package(ZLIB QUIET)
 find_package(Qt6ZlibPrivate QUIET)
+if (UNIX AND NOT APPLE)
+    find_package(KF6WindowSystem QUIET)
+endif()
 
 add_executable(neothemis-gui
     main.cpp
@@ -44,6 +47,10 @@ qt_add_resources(neothemis-gui neothemis_gui_resources
 )
 
 target_link_libraries(neothemis-gui PRIVATE neothemis_core Qt6::Widgets Qt6::Sql)
+if (TARGET KF6::WindowSystem)
+    target_link_libraries(neothemis-gui PRIVATE KF6::WindowSystem)
+    target_compile_definitions(neothemis-gui PRIVATE NEOTHEMIS_HAS_KWINDOWSYSTEM=1)
+endif()
 if (TARGET Qt6::ZlibPrivate)
     target_link_libraries(neothemis-gui PRIVATE Qt6::ZlibPrivate)
     target_compile_definitions(neothemis-gui PRIVATE NEOTHEMIS_HAS_ZLIB=1)

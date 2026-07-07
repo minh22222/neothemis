@@ -125,7 +125,7 @@ const UiTextEntry kUiText[] = {
     {"transparent_background", "Enable transparent background", u8"Bật nền trong suốt"},
     {"background_transparency", "Background transparency", u8"Độ trong suốt nền"},
     {"blur_background", "Enable background blur", u8"Bật làm mờ nền"},
-    {"background_blur", "Background blur", u8"Độ mờ nền"},
+    {"background_blur", "Background blur strength", u8"Cường độ làm mờ nền"},
     {"language", "Language", u8"Ngôn ngữ"},
     {"temporary_dir", "Temporary directory", u8"Thư mục tạm"},
     {"browse", "Browse", u8"Chọn"},

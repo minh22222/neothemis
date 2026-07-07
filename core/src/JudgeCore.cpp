@@ -173,33 +173,6 @@ std::vector<std::string> test_point_keys(const std::string& test_name) {
     return keys;
 }
 
-std::string quote_path(const fs::path& path) {
-    std::string s = path.string();
-#ifdef _WIN32
-    std::string out = "\"";
-    for (char ch : s) {
-        if (ch == '"') {
-            out += "\\\"";
-        } else {
-            out += ch;
-        }
-    }
-    out += "\"";
-    return out;
-#else
-    std::string out = "'";
-    for (char ch : s) {
-        if (ch == '\'') {
-            out += "'\\''";
-        } else {
-            out += ch;
-        }
-    }
-    out += "'";
-    return out;
-#endif
-}
-
 #ifndef _WIN32
 void apply_child_limits(std::uint64_t memory_limit_mb, std::uint64_t stack_limit_mb) {
     constexpr std::uint64_t bytes_per_mb = 1024ULL * 1024ULL;
@@ -366,6 +339,37 @@ unsigned int windows_performance_core_count() {
     return cores_by_efficiency_class.rbegin()->second;
 }
 
+unsigned int windows_physical_core_count() {
+    DWORD length = 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        return 0;
+    }
+
+    std::vector<unsigned char> buffer(length);
+    if (!GetLogicalProcessorInformationEx(
+            RelationProcessorCore,
+            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+            &length)) {
+        return 0;
+    }
+
+    unsigned int cores = 0;
+    DWORD offset = 0;
+    while (offset < length) {
+        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+            buffer.data() + offset);
+        if (info->Relationship == RelationProcessorCore) {
+            ++cores;
+        }
+        if (info->Size == 0) {
+            break;
+        }
+        offset += info->Size;
+    }
+    return cores;
+}
+
 std::string windows_error_message(DWORD error) {
     LPSTR buffer = nullptr;
     DWORD size = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
@@ -468,242 +472,6 @@ std::uint64_t windows_cpu_timeout_ms(std::uint64_t timeout_ms) {
 }
 #endif
 
-ProcessResult run_command(const std::string& command,
-                          const fs::path* working_dir,
-                          const fs::path* stdin_path,
-                          const fs::path* stdout_path,
-                          const fs::path* stderr_path,
-                          std::uint64_t timeout_ms,
-                          std::uint64_t memory_limit_mb = 0,
-                          std::uint64_t stack_limit_mb = 0,
-                          const std::function<bool()>& should_cancel = {}) {
-    fs::path absolute_working_dir;
-    fs::path absolute_stdin;
-    fs::path absolute_stdout;
-    fs::path absolute_stderr;
-    if (working_dir) {
-        absolute_working_dir = fs::absolute(*working_dir);
-        working_dir = &absolute_working_dir;
-    }
-    if (stdin_path) {
-#ifdef _WIN32
-        absolute_stdin = windows_open_path(*stdin_path);
-#else
-        absolute_stdin = fs::absolute(*stdin_path);
-#endif
-        stdin_path = &absolute_stdin;
-    }
-    if (stdout_path) {
-#ifdef _WIN32
-        absolute_stdout = windows_open_path(*stdout_path);
-#else
-        absolute_stdout = fs::absolute(*stdout_path);
-#endif
-        stdout_path = &absolute_stdout;
-    }
-    if (stderr_path) {
-#ifdef _WIN32
-        absolute_stderr = windows_open_path(*stderr_path);
-#else
-        absolute_stderr = fs::absolute(*stderr_path);
-#endif
-        stderr_path = &absolute_stderr;
-    }
-
-    auto begin = std::chrono::steady_clock::now();
-#ifndef _WIN32
-    pid_t pid = fork();
-    if (pid < 0) {
-        throw std::runtime_error("fork failed");
-    }
-
-    if (pid == 0) {
-        setpgid(0, 0);
-        if (working_dir && chdir(working_dir->c_str()) != 0) {
-            _exit(125);
-        }
-        if (stdin_path) {
-            int fd = open(stdin_path->c_str(), O_RDONLY);
-            if (fd < 0) _exit(126);
-            dup2(fd, STDIN_FILENO);
-            close(fd);
-        }
-        if (stdout_path) {
-            int fd = open(stdout_path->c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) _exit(126);
-            dup2(fd, STDOUT_FILENO);
-            close(fd);
-        }
-        if (stderr_path) {
-            int fd = open(stderr_path->c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) _exit(126);
-            dup2(fd, STDERR_FILENO);
-            close(fd);
-        }
-        apply_child_limits(memory_limit_mb, stack_limit_mb);
-        execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
-        _exit(127);
-    }
-
-    int status = 0;
-    bool timed_out = false;
-    while (true) {
-        pid_t done = waitpid(pid, &status, WNOHANG);
-        if (done == pid) {
-            break;
-        }
-        if (done < 0) {
-            throw std::runtime_error("waitpid failed");
-        }
-
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
-        if (should_cancel && should_cancel()) {
-            kill(-pid, SIGKILL);
-            kill(pid, SIGKILL);
-            waitpid(pid, &status, 0);
-            throw std::runtime_error("judging cancelled");
-        }
-        if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
-            timed_out = true;
-            kill(-pid, SIGKILL);
-            kill(pid, SIGKILL);
-            waitpid(pid, &status, 0);
-            break;
-        }
-        usleep(1000);
-    }
-
-    auto end = std::chrono::steady_clock::now();
-    ProcessResult result;
-    result.timed_out = timed_out;
-    result.elapsed_ms = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
-    if (WIFEXITED(status)) {
-        result.exit_code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        int signal_number = WTERMSIG(status);
-        result.exit_code = 128 + signal_number;
-        result.memory_exceeded = !timed_out && memory_limit_mb > 0 &&
-                                 signal_can_indicate_memory_limit(signal_number);
-    }
-    return result;
-#else
-    (void)memory_limit_mb;
-    (void)stack_limit_mb;
-
-    HANDLE child_stdin = GetStdHandle(STD_INPUT_HANDLE);
-    HANDLE child_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
-    HANDLE child_stderr = GetStdHandle(STD_ERROR_HANDLE);
-    HANDLE opened_stdin = INVALID_HANDLE_VALUE;
-    HANDLE opened_stdout = INVALID_HANDLE_VALUE;
-    HANDLE opened_stderr = INVALID_HANDLE_VALUE;
-
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = nullptr;
-    sa.bInheritHandle = TRUE;
-
-    auto open_file = [&](const fs::path& p, DWORD access, DWORD creation) {
-        return CreateFileA(p.string().c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           &sa, creation, FILE_ATTRIBUTE_NORMAL, nullptr);
-    };
-
-    if (stdin_path) {
-        opened_stdin = open_file(*stdin_path, GENERIC_READ, OPEN_EXISTING);
-        if (opened_stdin == INVALID_HANDLE_VALUE) throw std::runtime_error("failed to open stdin file");
-        child_stdin = opened_stdin;
-    }
-    if (stdout_path) {
-        opened_stdout = open_file(*stdout_path, GENERIC_WRITE, CREATE_ALWAYS);
-        if (opened_stdout == INVALID_HANDLE_VALUE) throw std::runtime_error("failed to open stdout file");
-        child_stdout = opened_stdout;
-    }
-    if (stderr_path) {
-        opened_stderr = open_file(*stderr_path, GENERIC_WRITE, CREATE_ALWAYS);
-        if (opened_stderr == INVALID_HANDLE_VALUE) throw std::runtime_error("failed to open stderr file");
-        child_stderr = opened_stderr;
-    }
-
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = child_stdin;
-    si.hStdOutput = child_stdout;
-    si.hStdError = child_stderr;
-
-    PROCESS_INFORMATION pi{};
-    std::string cmd = "cmd.exe /C " + command;
-    BOOL ok = CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                             CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                             nullptr, working_dir ? working_dir->string().c_str() : nullptr, &si, &pi);
-    if (!ok) {
-        if (opened_stdin != INVALID_HANDLE_VALUE) CloseHandle(opened_stdin);
-        if (opened_stdout != INVALID_HANDLE_VALUE) CloseHandle(opened_stdout);
-        if (opened_stderr != INVALID_HANDLE_VALUE) CloseHandle(opened_stderr);
-        throw std::runtime_error("CreateProcess failed");
-    }
-
-    HANDLE job = CreateJobObjectA(nullptr, nullptr);
-    bool has_job = job != nullptr && AssignProcessToJobObject(job, pi.hProcess);
-    ResumeThread(pi.hThread);
-
-    bool timed_out = false;
-    while (true) {
-        DWORD wait_result = WaitForSingleObject(pi.hProcess, 50);
-        if (wait_result == WAIT_OBJECT_0) {
-            break;
-        }
-        if (wait_result != WAIT_TIMEOUT) {
-            break;
-        }
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
-        if (should_cancel && should_cancel()) {
-            if (has_job) {
-                TerminateJobObject(job, 125);
-            } else {
-                TerminateProcess(pi.hProcess, 125);
-            }
-            WaitForSingleObject(pi.hProcess, INFINITE);
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            if (job) CloseHandle(job);
-            if (opened_stdin != INVALID_HANDLE_VALUE) CloseHandle(opened_stdin);
-            if (opened_stdout != INVALID_HANDLE_VALUE) CloseHandle(opened_stdout);
-            if (opened_stderr != INVALID_HANDLE_VALUE) CloseHandle(opened_stderr);
-            throw std::runtime_error("judging cancelled");
-        }
-        if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
-            timed_out = true;
-            break;
-        }
-    }
-    if (timed_out) {
-        if (has_job) {
-            TerminateJobObject(job, 124);
-        } else {
-            TerminateProcess(pi.hProcess, 124);
-        }
-        WaitForSingleObject(pi.hProcess, INFINITE);
-    }
-
-    DWORD exit_code = 0;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    if (job) CloseHandle(job);
-    if (opened_stdin != INVALID_HANDLE_VALUE) CloseHandle(opened_stdin);
-    if (opened_stdout != INVALID_HANDLE_VALUE) CloseHandle(opened_stdout);
-    if (opened_stderr != INVALID_HANDLE_VALUE) CloseHandle(opened_stderr);
-
-    auto end = std::chrono::steady_clock::now();
-    return ProcessResult{static_cast<int>(exit_code), timed_out, false,
-                         static_cast<std::uint64_t>(
-                             std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count())};
-#endif
-}
-
 ProcessResult run_program(const std::vector<std::string>& args,
                           const fs::path* working_dir,
                           const fs::path* stdout_path,
@@ -769,7 +537,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
             argv.push_back(const_cast<char*>(arg.c_str()));
         }
         argv.push_back(nullptr);
-        execv(argv.front(), argv.data());
+        execvp(argv.front(), argv.data());
         _exit(127);
     }
 
@@ -885,7 +653,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
     std::string command_line = windows_command_line(args);
     std::string application_name = args.front();
     auto begin = std::chrono::steady_clock::now();
-    BOOL ok = CreateProcessA(application_name.c_str(), command_line.data(),
+    BOOL ok = CreateProcessA(nullptr, command_line.data(),
                              nullptr, nullptr, TRUE,
                              CREATE_NO_WINDOW | CREATE_SUSPENDED,
                              nullptr,
@@ -973,12 +741,35 @@ std::string read_file(const fs::path& path) {
 }
 
 std::vector<std::string> split_words(const std::string& text) {
-    std::istringstream in(text);
     std::vector<std::string> result;
     std::string token;
-    while (in >> token) {
-        result.push_back(token);
+    char quote = '\0';
+
+    auto flush = [&]() {
+        if (!token.empty()) {
+            result.push_back(token);
+            token.clear();
+        }
+    };
+
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+        if (ch == '\\' && quote != '\0' && i + 1 < text.size() &&
+            (text[i + 1] == quote || text[i + 1] == '\\')) {
+            token.push_back(text[++i]);
+            continue;
+        }
+        if ((ch == '"' || ch == '\'') && (quote == '\0' || quote == ch)) {
+            quote = quote == ch ? '\0' : ch;
+            continue;
+        }
+        if (quote == '\0' && std::isspace(static_cast<unsigned char>(ch))) {
+            flush();
+            continue;
+        }
+        token.push_back(ch);
     }
+    flush();
     return result;
 }
 
@@ -1008,34 +799,39 @@ std::vector<std::string> warning_tolerant_compile_flags(const std::string& compi
     return filtered;
 }
 
-bool has_shell_metachar(const std::string& value) {
-    return value.find_first_of("&;|<>$`\n\r") != std::string::npos;
+std::string unquote_configured_program(std::string value) {
+    value = trim(value);
+    if (value.size() >= 2 &&
+        ((value.front() == '"' && value.back() == '"') ||
+         (value.front() == '\'' && value.back() == '\''))) {
+        return value.substr(1, value.size() - 2);
+    }
+    return value;
 }
 
-std::string quote_command_token(const std::string& token) {
-    if (token.empty() || has_shell_metachar(token)) {
-        throw std::runtime_error("unsafe compiler setting: " + token);
+std::vector<std::string> configured_compiler_args(std::string value) {
+    value = trim(value);
+    if (value.empty()) {
+        return {""};
     }
-#ifdef _WIN32
-    if (token.find_first_of(" \t\"") == std::string::npos) {
-        return token;
-    }
-#endif
-    return quote_path(fs::path(token));
-}
 
-std::string quote_command_tokens(const std::vector<std::string>& values) {
-    std::string result;
-    for (const auto& value : values) {
-        if (!result.empty()) {
-            result += ' ';
+    const bool starts_with_quote = value.front() == '"' || value.front() == '\'';
+    if (!starts_with_quote) {
+        std::error_code ec;
+        if (fs::exists(fs::path(value), ec) && !ec) {
+            return {value};
         }
-        result += quote_command_token(value);
     }
-    return result;
+
+    std::vector<std::string> args = split_words(value);
+    if (args.empty()) {
+        args.push_back(unquote_configured_program(value));
+    }
+    return args;
 }
 
-std::string stack_compile_flags(const std::string& compiler, std::uint64_t stack_limit_mb) {
+std::vector<std::string> stack_compile_args(const std::string& compiler,
+                                            std::uint64_t stack_limit_mb) {
     if (stack_limit_mb == 0) {
         return {};
     }
@@ -1045,11 +841,9 @@ std::string stack_compile_flags(const std::string& compiler, std::uint64_t stack
     std::string lower_compiler = lower_ascii(fs::path(compiler).filename().string());
     std::uint64_t bytes = stack_limit_mb * bytes_per_mb;
     if (lower_compiler == "cl" || lower_compiler == "cl.exe") {
-        return quote_command_token("/F" + std::to_string(bytes)) + " " +
-               quote_command_token("/link") + " " +
-               quote_command_token("/STACK:" + std::to_string(bytes));
+        return {"/F" + std::to_string(bytes), "/link", "/STACK:" + std::to_string(bytes)};
     }
-    return quote_command_token("-Wl,--stack," + std::to_string(bytes));
+    return {"-Wl,--stack," + std::to_string(bytes)};
 #else
     (void)compiler;
     (void)stack_limit_mb;
@@ -1057,19 +851,26 @@ std::string stack_compile_flags(const std::string& compiler, std::uint64_t stack
 #endif
 }
 
-std::string stack_guard_compile_flags(const std::string& compiler, std::uint64_t stack_limit_mb) {
-    if (stack_limit_mb == 0) {
-        return {};
-    }
-    std::string result = stack_compile_flags(compiler, stack_limit_mb);
+std::vector<std::string> stack_guard_compile_args(const std::string& compiler,
+                                                  std::uint64_t stack_limit_mb) {
+    std::vector<std::string> result = stack_compile_args(compiler, stack_limit_mb);
     std::string lower_compiler = lower_ascii(fs::path(compiler).filename().string());
-    if (lower_compiler != "cl" && lower_compiler != "cl.exe") {
-        if (!result.empty()) {
-            result += ' ';
-        }
-        result += quote_command_token("-fno-optimize-sibling-calls");
+    if (stack_limit_mb > 0 && lower_compiler != "cl" && lower_compiler != "cl.exe") {
+        result.push_back("-fno-optimize-sibling-calls");
     }
     return result;
+}
+
+std::vector<std::string> compiler_base_args(const JudgeOptions& options) {
+    std::vector<std::string> args = configured_compiler_args(options.compiler);
+    const std::string compiler = args.empty() ? std::string() : args.front();
+    std::vector<std::string> flags =
+        warning_tolerant_compile_flags(compiler, options.compile_flags);
+    args.insert(args.end(), flags.begin(), flags.end());
+    std::vector<std::string> stack_args =
+        stack_guard_compile_args(compiler, options.stack_limit_mb);
+    args.insert(args.end(), stack_args.begin(), stack_args.end());
+    return args;
 }
 
 class FastTokenReader {
@@ -1505,13 +1306,13 @@ fs::path compile_checker(const ProblemSettings& settings,
     }
 
     fs::path compile_log = problem_dir / "checker-compile.err";
-    std::string compile_cmd = quote_command_token(options.compiler) + " " +
-                              quote_command_tokens(warning_tolerant_compile_flags(
-                                  options.compiler, options.compile_flags)) + " " +
-                              stack_guard_compile_flags(options.compiler, options.stack_limit_mb) + " " +
-                              "-I " + quote_path(problem_dir) + " " +
-                              quote_path(checker_source) + " -o " + quote_path(checker_executable);
-    ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log,
+    std::vector<std::string> compile_args = compiler_base_args(options);
+    compile_args.push_back("-I");
+    compile_args.push_back(problem_dir.string());
+    compile_args.push_back(checker_source.string());
+    compile_args.push_back("-o");
+    compile_args.push_back(checker_executable.string());
+    ProcessResult compile = run_program(compile_args, nullptr, nullptr, &compile_log,
                                         0, 0, 0, options.should_cancel);
     if (!nonempty_executable_exists(checker_executable)) {
         std::string message = read_checker_message(compile_log);
@@ -1697,12 +1498,11 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
     prepared.executable = build_dir / problem.name;
 #endif
     fs::path compile_log = build_dir / "compile.err";
-    std::string compile_cmd = quote_command_token(options.compiler) + " " +
-                              quote_command_tokens(warning_tolerant_compile_flags(
-                                  options.compiler, options.compile_flags)) + " " +
-                              stack_guard_compile_flags(options.compiler, options.stack_limit_mb) + " " +
-                              quote_path(source) + " -o " + quote_path(prepared.executable);
-    ProcessResult compile = run_command(compile_cmd, nullptr, nullptr, nullptr, &compile_log,
+    std::vector<std::string> compile_args = compiler_base_args(options);
+    compile_args.push_back(source.string());
+    compile_args.push_back("-o");
+    compile_args.push_back(prepared.executable.string());
+    ProcessResult compile = run_program(compile_args, nullptr, nullptr, &compile_log,
                                         0, 0, 0, options.should_cancel);
     if (!nonempty_executable_exists(prepared.executable)) {
         std::string message = first_existing_file_text({compile_log});
@@ -1832,16 +1632,22 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
 }
 
 unsigned int configured_worker_count(const JudgeOptions& options) {
+    unsigned int physical_cores = 0;
+    unsigned int performance_cores = 0;
+#ifdef _WIN32
+    physical_cores = windows_physical_core_count();
+    performance_cores = windows_performance_core_count();
+#elif defined(__linux__)
+    physical_cores = linux_physical_core_count();
+    performance_cores = linux_performance_core_count();
+#endif
+
     unsigned int worker_count = options.parallel_jobs;
     if (worker_count == 0) {
-#ifdef _WIN32
-        worker_count = windows_performance_core_count();
-#elif defined(__linux__)
-        worker_count = linux_performance_core_count();
+        worker_count = performance_cores;
         if (worker_count == 0) {
-            worker_count = linux_physical_core_count();
+            worker_count = physical_cores;
         }
-#endif
         if (worker_count == 0) {
             worker_count = std::thread::hardware_concurrency();
             if (worker_count > 1) {
@@ -1850,6 +1656,14 @@ unsigned int configured_worker_count(const JudgeOptions& options) {
         }
         if (worker_count == 0) {
             worker_count = 1;
+        }
+    } else {
+        unsigned int cap = physical_cores;
+        if (cap == 0) {
+            cap = std::thread::hardware_concurrency();
+        }
+        if (cap > 0) {
+            worker_count = std::min(worker_count, cap);
         }
     }
     return std::max(1U, worker_count);

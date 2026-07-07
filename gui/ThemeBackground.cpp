@@ -1,6 +1,5 @@
 #include "ThemeBackground.hpp"
 
-#include <QImage>
 #include <QLinearGradient>
 #include <QPaintEvent>
 #include <QPainter>
@@ -129,18 +128,19 @@ ThemeBackground::ThemeBackground(QWidget* parent) : QWidget(parent) {
     setObjectName("ThemeBackground");
     setAttribute(Qt::WA_TransparentForMouseEvents);
     setAttribute(Qt::WA_NoSystemBackground);
+    setAttribute(Qt::WA_TranslucentBackground);
+    setAutoFillBackground(false);
 }
 
 void ThemeBackground::set_appearance(const std::string& theme, int opacity, int blur_radius) {
     const int clamped_opacity = std::clamp(opacity, 0, 255);
-    const int clamped_blur = std::clamp(blur_radius, 0, 120);
+    const int clamped_blur = std::clamp(blur_radius, 0, 240);
     if (theme_ == theme && opacity_ == clamped_opacity && blur_radius_ == clamped_blur) {
         return;
     }
     theme_ = theme;
     opacity_ = clamped_opacity;
     blur_radius_ = clamped_blur;
-    cached_blurred_background_ = QImage();
     update();
 }
 
@@ -150,40 +150,10 @@ void ThemeBackground::paintEvent(QPaintEvent* event) {
         return;
     }
     QPainter painter(this);
-
-    if (blur_radius_ <= 0) {
-        paint_background(painter, width(), height(), theme_, opacity_, 0);
-        return;
-    }
-
-    const bool cache_valid =
-        !cached_blurred_background_.isNull() &&
-        cached_size_ == size() &&
-        cached_theme_ == theme_ &&
-        cached_opacity_ == opacity_ &&
-        cached_blur_radius_ == blur_radius_;
-    if (!cache_valid) {
-        QImage source(size(), QImage::Format_ARGB32_Premultiplied);
-        source.fill(Qt::transparent);
-
-        QPainter source_painter(&source);
-        paint_background(source_painter, width(), height(), theme_, opacity_, blur_radius_);
-        source_painter.end();
-
-        const int divisor = std::clamp(2 + blur_radius_ / 3, 2, 42);
-        const QSize blur_size(std::max(1, width() / divisor),
-                              std::max(1, height() / divisor));
-        QImage downsampled =
-            source.scaled(blur_size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        cached_blurred_background_ =
-            downsampled.scaled(size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        cached_size_ = size();
-        cached_theme_ = theme_;
-        cached_opacity_ = opacity_;
-        cached_blur_radius_ = blur_radius_;
-    }
-
-    painter.drawImage(rect(), cached_blurred_background_);
+    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    painter.fillRect(rect(), Qt::transparent);
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    paint_background(painter, width(), height(), theme_, opacity_, blur_radius_);
 }
 
 } // namespace neothemis::gui

@@ -89,7 +89,8 @@ void print_contest_config_reference(std::ostream& out) {
         << "      Linux enforces this at runtime with RLIMIT_STACK and disables sibling-call optimization.\n"
         << "      Windows passes a compiler/linker stack reserve flag where supported.\n"
         << "  parallel_jobs=0\n"
-        << "      Worker count for compile preparation and judging. 0 prefers performance cores.\n"
+        << "      Worker count for compile preparation and judging.\n"
+        << "      0 prefers performance cores; manual values are capped at physical cores.\n"
         << "  forbidden_pattern=<text>\n"
         << "      Repeatable case-insensitive source-code security filter; matching submissions get SV.\n";
 }
@@ -297,7 +298,7 @@ void write_default_settings(const fs::path& settings_path) {
         << "compiler=g++\n"
         << "compile_flags=-std=c++14 -O2 -pipe\n"
         << "stack_limit_mb=64\n"
-        << "# 0 prefers performance cores, then physical cores, then half logical threads.\n"
+        << "# 0 prefers performance cores. Manual values above physical cores are capped.\n"
         << "parallel_jobs=0\n"
         << "\n"
         << "# Submissions containing these text patterns are rejected with SV.\n";

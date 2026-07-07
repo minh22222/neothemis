@@ -141,8 +141,9 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(fs::path initial_contest) {
         load_app_settings();
-        setAttribute(Qt::WA_TranslucentBackground,
-                     background_transparency_active() || background_blur_active());
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAutoFillBackground(false);
         setWindowTitle(text("window_title"));
         setWindowIcon(QIcon(":/materials/logo.png"));
         setWindowFlags(Qt::FramelessWindowHint | Qt::Window);
@@ -260,6 +261,7 @@ public:
         progress_ = new QProgressBar(side);
         progress_->setRange(0, 100);
         progress_->setValue(0);
+        progress_->setFixedHeight(30);
         side_layout->addWidget(progress_);
 
         judge_elapsed_label_ = new QLabel(side);
@@ -405,10 +407,10 @@ private:
         }
         transparent_background_ = settings.value("transparent_background", false).toBool();
         background_transparency_ =
-            std::clamp(settings.value("background_transparency", 20).toInt(), 0, 80);
+            std::clamp(settings.value("background_transparency", 20).toInt(), 0, 95);
         blur_background_ = settings.value("blur_background", false).toBool();
         background_blur_radius_ =
-            std::clamp(settings.value("background_blur_radius", 24).toInt(), 0, 120);
+            std::clamp(settings.value("background_blur_radius", 24).toInt(), 0, 240);
         temporary_dir_ = settings.value(
             "temporary_dir",
             QString::fromStdString(default_temporary_dir().string())).toString().toStdString();
@@ -568,20 +570,36 @@ private:
         widget->setGraphicsEffect(shadow);
     }
 
+    void apply_translucent_surface_attributes() {
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAutoFillBackground(false);
+
+        if (QWidget* root = centralWidget()) {
+            root->setAttribute(Qt::WA_NoSystemBackground, true);
+            root->setAutoFillBackground(false);
+        }
+        if (background_layer_) {
+            background_layer_->setAttribute(Qt::WA_NoSystemBackground, true);
+            background_layer_->setAttribute(Qt::WA_TranslucentBackground, true);
+            background_layer_->setAutoFillBackground(false);
+        }
+    }
+
     void apply_selected_theme() {
         const bool cyber = theme_ == "cyber";
         const bool transparent = background_transparency_active();
-        const bool blurred = background_blur_active();
+        const bool blurred = transparent && background_blur_active();
+        apply_translucent_surface_attributes();
         neothemis::gui::apply_application_theme(theme_);
         neothemis::gui::apply_windows_backdrop(
             this, transparent, background_transparency_, blurred,
             blurred ? background_blur_radius_ : 0);
         int opacity = transparent ? 255 * (100 - background_transparency_) / 100 : 255;
-#ifdef Q_OS_WIN
-        if (blurred && !transparent) {
-            opacity = std::clamp(235 - background_blur_radius_, 105, 225);
+        if (blurred) {
+            const int blur = std::clamp(background_blur_radius_, 0, 240);
+            opacity = opacity * (100 - std::min(55, blur / 4)) / 100;
         }
-#endif
         if (background_layer_) {
             background_layer_->set_appearance(theme_, opacity,
                                               blurred ? background_blur_radius_ : 0);
@@ -2924,7 +2942,7 @@ private:
         transparency_layout->setContentsMargins(0, 0, 0, 0);
         transparency_layout->setSpacing(10);
         auto* transparency = new QSlider(Qt::Horizontal, transparency_widget);
-        transparency->setRange(0, 80);
+        transparency->setRange(0, 95);
         transparency->setValue(background_transparency_);
         transparency->setEnabled(transparent_background_);
         auto* transparency_value = new QLabel(
@@ -2942,12 +2960,11 @@ private:
         blur_layout->setContentsMargins(0, 0, 0, 0);
         blur_layout->setSpacing(10);
         auto* blur = new QSlider(Qt::Horizontal, blur_widget);
-        blur->setRange(0, 120);
+        blur->setRange(0, 240);
         blur->setValue(background_blur_radius_);
         blur->setEnabled(blur_background_);
-        auto* blur_value = new QLabel(
-            QString::number(background_blur_radius_) + " px", blur_widget);
-        blur_value->setFixedWidth(52);
+        auto* blur_value = new QLabel(QString::number(background_blur_radius_), blur_widget);
+        blur_value->setFixedWidth(42);
         blur_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         blur_layout->addWidget(blur, 1);
         blur_layout->addWidget(blur_value);
@@ -3022,7 +3039,7 @@ private:
                              apply_visual_preview();
                          });
         QObject::connect(blur, &QSlider::valueChanged, [blur_value, apply_visual_preview](int value) {
-            blur_value->setText(QString::number(value) + " px");
+            blur_value->setText(QString::number(value));
             apply_visual_preview();
         });
 

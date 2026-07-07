@@ -210,7 +210,8 @@ void apply_application_theme(const std::string& theme) {
             background: rgba(7, 12, 17, 190);
             border: 1px solid rgba(255, 255, 255, 42);
             border-radius: 8px;
-            height: 18px;
+            min-height: 28px;
+            max-height: 28px;
             text-align: center;
         }
         QProgressBar::chunk {
