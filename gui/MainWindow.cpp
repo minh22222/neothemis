@@ -31,6 +31,7 @@
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QIcon>
+#include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
@@ -81,6 +82,8 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+constexpr int kBackgroundBlurVisualStrength = 72;
 
 struct CellScore {
     double earned = 0.0;
@@ -377,6 +380,7 @@ protected:
     void showEvent(QShowEvent* event) override {
         QMainWindow::showEvent(event);
         apply_selected_theme();
+        schedule_backdrop_startup_passes();
     }
 
 private:
@@ -389,7 +393,7 @@ private:
     }
 
     bool background_blur_active() const {
-        return blur_background_ && background_blur_radius_ > 0;
+        return blur_background_;
     }
 
     void load_app_settings() {
@@ -409,8 +413,6 @@ private:
         background_transparency_ =
             std::clamp(settings.value("background_transparency", 20).toInt(), 0, 95);
         blur_background_ = settings.value("blur_background", false).toBool();
-        background_blur_radius_ =
-            std::clamp(settings.value("background_blur_radius", 24).toInt(), 0, 240);
         temporary_dir_ = settings.value(
             "temporary_dir",
             QString::fromStdString(default_temporary_dir().string())).toString().toStdString();
@@ -436,7 +438,7 @@ private:
         settings.setValue("transparent_background", transparent_background_);
         settings.setValue("background_transparency", background_transparency_);
         settings.setValue("blur_background", blur_background_);
-        settings.setValue("background_blur_radius", background_blur_radius_);
+        settings.remove("background_blur_radius");
         settings.setValue("temporary_dir", QString::fromStdString(temporary_dir_.string()));
         settings.setValue("server_port", server_port_);
         settings.setValue("server_allow_lan", server_allow_lan_);
@@ -488,11 +490,22 @@ private:
         bar->clear();
 
         auto* contest_menu = bar->addMenu(text("contest"));
-        contest_menu->addAction(text("open_folder"), [this]() { open_contest(); });
-        contest_menu->addAction(text("open_contest_file"), [this]() { open_contest_file(); });
+        auto* open_folder_action =
+            contest_menu->addAction(text("open_folder"), [this]() { open_contest(); });
+        open_folder_action->setShortcut(QKeySequence("Ctrl+O"));
+        auto* open_file_action =
+            contest_menu->addAction(text("open_contest_file"),
+                                    [this]() { open_contest_file(); });
+        open_file_action->setShortcut(QKeySequence("Ctrl+Shift+O"));
         contest_menu->addSeparator();
-        contest_menu->addAction(text("save_contest_file"), [this]() { save_contest_container(false); });
-        contest_menu->addAction(text("save_contest_file_as"), [this]() { save_contest_container(true); });
+        auto* save_action =
+            contest_menu->addAction(text("save_contest_file"),
+                                    [this]() { save_contest_container(false); });
+        save_action->setShortcut(QKeySequence("Ctrl+S"));
+        auto* save_as_action =
+            contest_menu->addAction(text("save_contest_file_as"),
+                                    [this]() { save_contest_container(true); });
+        save_as_action->setShortcut(QKeySequence("Ctrl+Shift+S"));
         contest_menu->addSeparator();
         contest_menu->addAction(text("refresh"), [this]() { refresh_table(); });
 
@@ -592,22 +605,40 @@ private:
         const bool blurred = transparent && background_blur_active();
         apply_translucent_surface_attributes();
         neothemis::gui::apply_application_theme(theme_);
-        neothemis::gui::apply_windows_backdrop(
-            this, transparent, background_transparency_, blurred,
-            blurred ? background_blur_radius_ : 0);
+        apply_native_backdrop(false);
         int opacity = transparent ? 255 * (100 - background_transparency_) / 100 : 255;
         if (blurred) {
-            const int blur = std::clamp(background_blur_radius_, 0, 240);
-            opacity = opacity * (100 - std::min(55, blur / 4)) / 100;
+            opacity = opacity *
+                      (100 - std::min(55, kBackgroundBlurVisualStrength / 4)) / 100;
         }
         if (background_layer_) {
             background_layer_->set_appearance(theme_, opacity,
-                                              blurred ? background_blur_radius_ : 0);
+                                              blurred ? kBackgroundBlurVisualStrength : 0);
         }
         add_soft_shadow(table_, cyber ? 56 : 34,
                         cyber ? QColor(55, 8, 32, 178) : QColor(0, 0, 0, 120));
         add_soft_shadow(side_panel_, cyber ? 60 : 36,
                         cyber ? QColor(72, 10, 39, 188) : QColor(0, 0, 0, 135));
+    }
+
+    void apply_native_backdrop(bool force_compositor_update) {
+        const bool transparent = background_transparency_active();
+        const bool blurred = transparent && background_blur_active();
+        neothemis::gui::apply_windows_backdrop(
+            this, transparent, background_transparency_, blurred,
+            force_compositor_update);
+    }
+
+    void schedule_backdrop_startup_passes() {
+        // Native compositors register a newly shown window asynchronously.
+        // Reassert the current state after registration and window-rule handling.
+        for (int delay_ms : {0, 75, 250, 700}) {
+            QTimer::singleShot(delay_ms, this, [this]() {
+                if (isVisible()) {
+                    apply_native_backdrop(true);
+                }
+            });
+        }
     }
 
     QString generated_server_secret(int chars) const {
@@ -2954,20 +2985,6 @@ private:
 
         auto* blur_background = new QCheckBox(tab);
         blur_background->setChecked(blur_background_);
-        auto* blur_widget = new QWidget(tab);
-        blur_widget->setObjectName("InlineControl");
-        auto* blur_layout = new QHBoxLayout(blur_widget);
-        blur_layout->setContentsMargins(0, 0, 0, 0);
-        blur_layout->setSpacing(10);
-        auto* blur = new QSlider(Qt::Horizontal, blur_widget);
-        blur->setRange(0, 240);
-        blur->setValue(background_blur_radius_);
-        blur->setEnabled(blur_background_);
-        auto* blur_value = new QLabel(QString::number(background_blur_radius_), blur_widget);
-        blur_value->setFixedWidth(42);
-        blur_value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-        blur_layout->addWidget(blur, 1);
-        blur_layout->addWidget(blur_value);
 
         auto* language = new QComboBox(tab);
         language->addItem(text("english"), "en");
@@ -2997,7 +3014,6 @@ private:
         form->addRow(text("transparent_background"), transparent_background);
         form->addRow(text("background_transparency"), transparency_widget);
         form->addRow(text("blur_background"), blur_background);
-        form->addRow(text("background_blur"), blur_widget);
         form->addRow(text("language"), language);
         form->addRow(text("temporary_dir"), temp_widget);
         form->addRow(text("ncontest_file_association"), association);
@@ -3012,12 +3028,11 @@ private:
         });
 
         auto apply_visual_preview = [this, theme, transparent_background,
-                                     transparency, blur_background, blur]() {
+                                     transparency, blur_background]() {
             theme_ = theme->currentData().toString().toStdString();
             transparent_background_ = transparent_background->isChecked();
             background_transparency_ = transparency->value();
             blur_background_ = blur_background->isChecked();
-            background_blur_radius_ = blur->value();
             apply_selected_theme();
         };
 
@@ -3034,23 +3049,17 @@ private:
                              apply_visual_preview();
                          });
         QObject::connect(blur_background, &QCheckBox::toggled,
-                         [blur, apply_visual_preview](bool enabled) {
-                             blur->setEnabled(enabled);
+                         [apply_visual_preview](bool) {
                              apply_visual_preview();
                          });
-        QObject::connect(blur, &QSlider::valueChanged, [blur_value, apply_visual_preview](int value) {
-            blur_value->setText(QString::number(value));
-            apply_visual_preview();
-        });
 
         auto persist = [this, theme, transparent_background, transparency,
-                        blur_background, blur, language, temp_dir](bool notify) {
+                        blur_background, language, temp_dir](bool notify) {
             try {
                 theme_ = theme->currentData().toString().toStdString();
                 transparent_background_ = transparent_background->isChecked();
                 background_transparency_ = transparency->value();
                 blur_background_ = blur_background->isChecked();
-                background_blur_radius_ = blur->value();
                 language_ = language->currentData().toString().toStdString();
                 temporary_dir_ = temp_dir->text().toStdString();
                 if (temporary_dir_.empty()) {
@@ -3725,7 +3734,6 @@ private:
     bool transparent_background_ = false;
     int background_transparency_ = 20;
     bool blur_background_ = false;
-    int background_blur_radius_ = 24;
     fs::path temporary_dir_;
     int server_port_ = 8080;
     bool server_allow_lan_ = false;

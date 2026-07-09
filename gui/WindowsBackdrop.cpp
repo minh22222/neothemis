@@ -17,6 +17,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dwmapi.h>
 #endif
 
 #ifdef NEOTHEMIS_HAS_KWINDOWSYSTEM
@@ -69,17 +70,25 @@ QString hyprland_window_address(QWidget* window) {
 bool run_hyprctl_setprop(const QString& address,
                          const QString& property,
                          const QString& value) {
+    auto run = [](const QStringList& arguments) {
+        QProcess process;
+        process.start("hyprctl", arguments);
+        return process.waitForFinished(700) &&
+               process.exitStatus() == QProcess::NormalExit &&
+               process.exitCode() == 0;
+    };
+
     const QString target = "address:" + address;
     const QStringList dispatch_args{"dispatch", "setprop", target, property, value};
-    if (QProcess::execute("hyprctl", dispatch_args) == 0) {
+    if (run(dispatch_args)) {
         return true;
     }
 
     const QStringList legacy_args{"setprop", target, property, value};
-    return QProcess::execute("hyprctl", legacy_args) == 0;
+    return run(legacy_args);
 }
 
-void apply_hyprland_blur(QWidget* window, bool blur_enabled) {
+void apply_hyprland_blur(QWidget* window, bool blur_enabled, bool force_update) {
     static std::mutex cache_mutex;
     static std::map<WId, bool> last_blur_state;
 
@@ -90,7 +99,8 @@ void apply_hyprland_blur(QWidget* window, bool blur_enabled) {
     {
         std::lock_guard<std::mutex> lock(cache_mutex);
         auto found = last_blur_state.find(id);
-        if (found != last_blur_state.end() && found->second == blur_enabled) {
+        if (!force_update && found != last_blur_state.end() &&
+            found->second == blur_enabled) {
             return;
         }
     }
@@ -105,14 +115,14 @@ void apply_hyprland_blur(QWidget* window, bool blur_enabled) {
     if (!ok) {
         ok = run_hyprctl_setprop(address, "noblur", no_blur);
     }
-    (void)ok;
-
-    std::lock_guard<std::mutex> lock(cache_mutex);
-    last_blur_state[id] = blur_enabled;
+    if (ok) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        last_blur_state[id] = blur_enabled;
+    }
 }
 #endif
 
-void apply_compositor_blur(QWidget* window, bool blur_enabled) {
+void apply_compositor_blur(QWidget* window, bool blur_enabled, bool force_update) {
 #ifdef NEOTHEMIS_HAS_KWINDOWSYSTEM
     if (window) {
         window->winId();
@@ -123,10 +133,11 @@ void apply_compositor_blur(QWidget* window, bool blur_enabled) {
 #else
     (void)window;
     (void)blur_enabled;
+    (void)force_update;
 #endif
 
 #if defined(Q_OS_LINUX)
-    apply_hyprland_blur(window, blur_enabled);
+    apply_hyprland_blur(window, blur_enabled, force_update);
 #endif
 }
 
@@ -138,7 +149,7 @@ void apply_windows_backdrop(QWidget* window,
                             bool transparency_enabled,
                             int transparency_percent,
                             bool blur_enabled,
-                            int blur_radius) {
+                            bool force_compositor_update) {
     if (!window) {
         return;
     }
@@ -147,7 +158,8 @@ void apply_windows_backdrop(QWidget* window,
     window->setAttribute(Qt::WA_TranslucentBackground, true);
     window->setAttribute(Qt::WA_NoSystemBackground, true);
     window->setAutoFillBackground(false);
-    apply_compositor_blur(window, blur_enabled && transparency_enabled);
+    apply_compositor_blur(window, blur_enabled && transparency_enabled,
+                          force_compositor_update);
 
 #ifdef Q_OS_WIN
     enum AccentState {
@@ -171,6 +183,8 @@ void apply_windows_backdrop(QWidget* window,
         BOOL(WINAPI*)(HWND, CompositionAttributeData*);
 
     using DwmSetWindowAttributeFn = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    using DwmEnableBlurBehindWindowFn =
+        HRESULT(WINAPI*)(HWND, const DWM_BLURBEHIND*);
 
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     auto set_composition = user32
@@ -189,8 +203,8 @@ void apply_windows_backdrop(QWidget* window,
                             ? 255 * (100 - transparency) / 100
                             : 255;
             if (blur_enabled) {
-                const int blur = std::clamp(blur_radius, 0, 240);
-                alpha = std::min(alpha, std::clamp(232 - blur * 2 / 3, 42, 220));
+                constexpr int acrylic_tint_alpha = 112;
+                alpha = std::min(alpha, acrylic_tint_alpha);
             }
             // GradientColor is AABBGGRR. The dark tint keeps text contrast stable.
             policy.gradient_color = (static_cast<DWORD>(alpha) << 24U) |
@@ -214,6 +228,18 @@ void apply_windows_backdrop(QWidget* window,
                                  ? reinterpret_cast<DwmSetWindowAttributeFn>(
                                        GetProcAddress(dwmapi, "DwmSetWindowAttribute"))
                                  : nullptr;
+    auto enable_dwm_blur = dwmapi
+                               ? reinterpret_cast<DwmEnableBlurBehindWindowFn>(
+                                     GetProcAddress(dwmapi, "DwmEnableBlurBehindWindow"))
+                               : nullptr;
+    HWND handle = reinterpret_cast<HWND>(window->winId());
+    if (enable_dwm_blur) {
+        DWM_BLURBEHIND blur_behind{};
+        blur_behind.dwFlags = DWM_BB_ENABLE | DWM_BB_TRANSITIONONMAXIMIZED;
+        blur_behind.fEnable = blur_enabled && transparency_enabled;
+        blur_behind.fTransitionOnMaximized = TRUE;
+        enable_dwm_blur(handle, &blur_behind);
+    }
     if (set_dwm_attribute) {
         constexpr DWORD use_immersive_dark_mode = 20;
         constexpr DWORD system_backdrop_type = 38;
@@ -221,7 +247,6 @@ void apply_windows_backdrop(QWidget* window,
         constexpr int backdrop_acrylic = 3;
         const BOOL dark_mode = TRUE;
         const int backdrop = blur_enabled ? backdrop_acrylic : backdrop_none;
-        HWND handle = reinterpret_cast<HWND>(window->winId());
         set_dwm_attribute(handle, use_immersive_dark_mode,
                           &dark_mode, sizeof(dark_mode));
         set_dwm_attribute(handle, system_backdrop_type,
@@ -235,7 +260,6 @@ void apply_windows_backdrop(QWidget* window,
 #else
     (void)enabled;
     (void)transparency_percent;
-    (void)blur_radius;
 #endif
     window->update();
 }

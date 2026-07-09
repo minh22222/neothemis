@@ -8,6 +8,6 @@ void apply_windows_backdrop(QWidget* window,
                             bool transparency_enabled,
                             int transparency_percent,
                             bool blur_enabled,
-                            int blur_radius);
+                            bool force_compositor_update = false);
 
 } // namespace neothemis::gui
