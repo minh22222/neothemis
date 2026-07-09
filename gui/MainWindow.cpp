@@ -393,7 +393,8 @@ private:
     }
 
     bool background_blur_active() const {
-        return blur_background_;
+        return blur_background_ &&
+               neothemis::gui::native_background_blur_supported();
     }
 
     void load_app_settings() {
@@ -590,6 +591,7 @@ private:
 
         if (QWidget* root = centralWidget()) {
             root->setAttribute(Qt::WA_NoSystemBackground, true);
+            root->setAttribute(Qt::WA_TranslucentBackground, true);
             root->setAutoFillBackground(false);
         }
         if (background_layer_) {
@@ -625,8 +627,7 @@ private:
         const bool transparent = background_transparency_active();
         const bool blurred = transparent && background_blur_active();
         neothemis::gui::apply_windows_backdrop(
-            this, transparent, background_transparency_, blurred,
-            force_compositor_update);
+            this, transparent, blurred, force_compositor_update);
     }
 
     void schedule_backdrop_startup_passes() {
@@ -636,6 +637,10 @@ private:
             QTimer::singleShot(delay_ms, this, [this]() {
                 if (isVisible()) {
                     apply_native_backdrop(true);
+                    if (background_layer_) {
+                        background_layer_->repaint();
+                    }
+                    repaint();
                 }
             });
         }
@@ -2984,7 +2989,9 @@ private:
         transparency_layout->addWidget(transparency_value);
 
         auto* blur_background = new QCheckBox(tab);
-        blur_background->setChecked(blur_background_);
+        const bool blur_supported =
+            neothemis::gui::native_background_blur_supported();
+        blur_background->setChecked(blur_supported && blur_background_);
 
         auto* language = new QComboBox(tab);
         language->addItem(text("english"), "en");
@@ -3013,7 +3020,9 @@ private:
         form->addRow(text("theme"), theme);
         form->addRow(text("transparent_background"), transparent_background);
         form->addRow(text("background_transparency"), transparency_widget);
-        form->addRow(text("blur_background"), blur_background);
+        if (blur_supported) {
+            form->addRow(text("blur_background"), blur_background);
+        }
         form->addRow(text("language"), language);
         form->addRow(text("temporary_dir"), temp_widget);
         form->addRow(text("ncontest_file_association"), association);

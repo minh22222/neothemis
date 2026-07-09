@@ -36,8 +36,15 @@ add_executable(neothemis-gui
 )
 
 if (WIN32)
-    target_sources(neothemis-gui PRIVATE ${CMAKE_SOURCE_DIR}/materials/neothemis.rc)
-    target_link_libraries(neothemis-gui PRIVATE shell32)
+    if (MINGW AND CMAKE_CXX_COMPILER MATCHES "[ \t]")
+        message(WARNING
+            "Skipping the optional executable icon because MinGW windres "
+            "cannot reliably invoke its preprocessor from a path containing spaces: "
+            "${CMAKE_CXX_COMPILER}")
+    else()
+        target_sources(neothemis-gui PRIVATE ${CMAKE_SOURCE_DIR}/materials/neothemis.rc)
+    endif()
+    target_link_libraries(neothemis-gui PRIVATE shell32 dwmapi)
 endif()
 
 qt_add_resources(neothemis-gui neothemis_gui_resources
