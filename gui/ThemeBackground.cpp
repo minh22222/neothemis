@@ -144,6 +144,29 @@ void ThemeBackground::set_appearance(const std::string& theme, int opacity, int 
     update();
 }
 
+void ThemeBackground::set_desktop_backdrop(
+    const QPixmap& backdrop,
+    const QPoint& virtual_desktop_origin,
+    int scale) {
+    desktop_backdrop_ = backdrop;
+    virtual_desktop_origin_ = virtual_desktop_origin;
+    desktop_backdrop_scale_ = std::max(1, scale);
+    update();
+}
+
+void ThemeBackground::freeze_desktop_backdrop_alignment() {
+    if (desktop_backdrop_.isNull() || desktop_backdrop_alignment_frozen_) {
+        return;
+    }
+    frozen_desktop_backdrop_source_ =
+        mapToGlobal(QPoint(0, 0)) - virtual_desktop_origin_;
+    desktop_backdrop_alignment_frozen_ = true;
+}
+
+void ThemeBackground::unfreeze_desktop_backdrop_alignment() {
+    desktop_backdrop_alignment_frozen_ = false;
+}
+
 void ThemeBackground::paintEvent(QPaintEvent* event) {
     (void)event;
     if (width() <= 0 || height() <= 0) {
@@ -153,6 +176,19 @@ void ThemeBackground::paintEvent(QPaintEvent* event) {
     painter.setCompositionMode(QPainter::CompositionMode_Source);
     painter.fillRect(rect(), Qt::transparent);
     painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    if (blur_radius_ > 0 && !desktop_backdrop_.isNull()) {
+        const QPoint source_top_left = desktop_backdrop_alignment_frozen_
+                                           ? frozen_desktop_backdrop_source_
+                                           : mapToGlobal(QPoint(0, 0)) -
+                                                 virtual_desktop_origin_;
+        const qreal scale = desktop_backdrop_scale_;
+        const QRectF source(source_top_left.x() / scale,
+                            source_top_left.y() / scale,
+                            width() / scale,
+                            height() / scale);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        painter.drawPixmap(QRectF(rect()), desktop_backdrop_, source);
+    }
     paint_background(painter, width(), height(), theme_, opacity_, blur_radius_);
 }
 

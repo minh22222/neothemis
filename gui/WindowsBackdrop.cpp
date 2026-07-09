@@ -151,8 +151,9 @@ bool native_background_blur_supported() {
         const QOperatingSystemVersion version =
             QOperatingSystemVersion::current();
         return version.type() == QOperatingSystemVersion::Windows &&
-               version.majorVersion() >= 10 &&
-               version.microVersion() >= 22621;
+               (version.majorVersion() > 10 ||
+                (version.majorVersion() == 10 &&
+                 version.microVersion() >= 22621));
     }();
     return supported;
 #else
@@ -167,10 +168,10 @@ void apply_windows_backdrop(QWidget* window,
     if (!window) {
         return;
     }
-    window->setAttribute(Qt::WA_TranslucentBackground, true);
     window->setAttribute(Qt::WA_NoSystemBackground, true);
     window->setAutoFillBackground(false);
-    apply_compositor_blur(window, blur_enabled && transparency_enabled,
+    const bool backdrop_enabled = blur_enabled && transparency_enabled;
+    apply_compositor_blur(window, backdrop_enabled,
                           force_compositor_update);
 
 #ifdef Q_OS_WIN
@@ -179,17 +180,17 @@ void apply_windows_backdrop(QWidget* window,
         constexpr DWORD use_immersive_dark_mode = 20;
         constexpr DWORD system_backdrop_type = 38;
         constexpr int backdrop_none = 1;
-        constexpr int backdrop_desktop_acrylic = 3;
         const BOOL dark_mode = TRUE;
-        const bool acrylic_enabled =
-            blur_enabled && transparency_enabled;
-        const int backdrop = acrylic_enabled
-                                 ? backdrop_desktop_acrylic
-                                 : backdrop_none;
+        // Qt renders the Windows blur from a captured desktop image. Native
+        // Mica and Desktop Acrylic both supply an occluding tint on Windows
+        // 11, which hides the background this setting is meant to reveal.
+        const int backdrop = backdrop_none;
+        const MARGINS client_area{0, 0, 0, 0};
         DwmSetWindowAttribute(handle, use_immersive_dark_mode,
                               &dark_mode, sizeof(dark_mode));
         DwmSetWindowAttribute(handle, system_backdrop_type,
                               &backdrop, sizeof(backdrop));
+        DwmExtendFrameIntoClientArea(handle, &client_area);
         RedrawWindow(handle, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN);
     }

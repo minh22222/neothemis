@@ -26,6 +26,7 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGraphicsDropShadowEffect>
+#include <QGuiApplication>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -39,6 +40,8 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
+#include <QMoveEvent>
+#include <QPainter>
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QProgressBar>
@@ -47,6 +50,7 @@
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
+#include <QScreen>
 #include <QSettings>
 #include <QShowEvent>
 #include <QSpinBox>
@@ -61,6 +65,14 @@
 #include <QToolButton>
 #include <QVariant>
 #include <QVBoxLayout>
+#include <QWindow>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -84,6 +96,10 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr int kBackgroundBlurVisualStrength = 72;
+constexpr int kBackdropRealignDelayMs = 100;
+constexpr int kDesktopBackdropScale = 2;
+constexpr int kDesktopBackdropBlurDownscale = 2;
+constexpr int kDesktopBackdropBlurPasses = 3;
 
 struct CellScore {
     double earned = 0.0;
@@ -287,6 +303,16 @@ public:
         setCentralWidget(central);
         neothemis::gui::install_windows_resize_handles(this);
         side_panel_ = side;
+        backdrop_realign_timer_ = new QTimer(this);
+        backdrop_realign_timer_->setSingleShot(true);
+        QObject::connect(backdrop_realign_timer_, &QTimer::timeout, [this]() {
+            if (!background_layer_) {
+                return;
+            }
+            background_layer_->unfreeze_desktop_backdrop_alignment();
+            background_layer_->update();
+        });
+        refresh_windows_desktop_backdrop();
         apply_selected_theme();
 
         QObject::connect(judge_selected_button_, &QPushButton::clicked, [this]() { start_judge(true); });
@@ -340,6 +366,14 @@ protected:
             if (event->type() == QEvent::MouseButtonPress) {
                 auto* mouse = static_cast<QMouseEvent*>(event);
                 if (mouse->button() == Qt::LeftButton) {
+                    if (background_layer_ && background_blur_active()) {
+                        background_layer_->freeze_desktop_backdrop_alignment();
+                    }
+                    if (QWindow* handle = windowHandle(); handle &&
+                        handle->startSystemMove()) {
+                        dragging_title_bar_ = false;
+                        return true;
+                    }
                     dragging_title_bar_ = true;
                     drag_offset_ = mouse->globalPosition().toPoint() - frameGeometry().topLeft();
                     return true;
@@ -354,6 +388,7 @@ protected:
             }
             if (event->type() == QEvent::MouseButtonRelease) {
                 dragging_title_bar_ = false;
+                schedule_backdrop_realign(0);
             }
         }
         return QMainWindow::eventFilter(watched, event);
@@ -383,6 +418,50 @@ protected:
         schedule_backdrop_startup_passes();
     }
 
+    void moveEvent(QMoveEvent* event) override {
+        QMainWindow::moveEvent(event);
+        if (background_layer_ && background_blur_active()) {
+            background_layer_->freeze_desktop_backdrop_alignment();
+            schedule_backdrop_realign(kBackdropRealignDelayMs);
+        }
+    }
+
+    bool nativeEvent(const QByteArray& event_type,
+                     void* message,
+                     qintptr* result) override {
+#ifdef Q_OS_WIN
+        if ((event_type == "windows_generic_MSG" ||
+             event_type == "windows_dispatcher_MSG") &&
+            message) {
+            const auto* native_message = static_cast<MSG*>(message);
+            if (native_message->message == WM_ENTERSIZEMOVE &&
+                background_layer_ && background_blur_active()) {
+                background_layer_->freeze_desktop_backdrop_alignment();
+            } else if (native_message->message == WM_EXITSIZEMOVE) {
+                schedule_backdrop_realign(0);
+            }
+        }
+#else
+        (void)event_type;
+        (void)message;
+        (void)result;
+#endif
+        return QMainWindow::nativeEvent(event_type, message, result);
+    }
+
+    void changeEvent(QEvent* event) override {
+        QMainWindow::changeEvent(event);
+#ifdef Q_OS_WIN
+        if (event->type() == QEvent::WindowStateChange && isMinimized()) {
+            QTimer::singleShot(150, this, [this]() {
+                if (isMinimized()) {
+                    refresh_windows_desktop_backdrop();
+                }
+            });
+        }
+#endif
+    }
+
 private:
     QString text(const char* key) const {
         return neothemis::gui::translated_text(key, language_ == "vi");
@@ -393,7 +472,8 @@ private:
     }
 
     bool background_blur_active() const {
-        return blur_background_ &&
+        return background_transparency_active() &&
+               blur_background_ &&
                neothemis::gui::native_background_blur_supported();
     }
 
@@ -599,6 +679,90 @@ private:
             background_layer_->setAttribute(Qt::WA_TranslucentBackground, true);
             background_layer_->setAutoFillBackground(false);
         }
+    }
+
+    void schedule_backdrop_realign(int delay_ms) {
+        if (!background_layer_ || !background_blur_active()) {
+            return;
+        }
+        if (!backdrop_realign_timer_) {
+            background_layer_->unfreeze_desktop_backdrop_alignment();
+            background_layer_->update();
+            return;
+        }
+        backdrop_realign_timer_->start(std::max(0, delay_ms));
+    }
+
+    void refresh_windows_desktop_backdrop() {
+#ifdef Q_OS_WIN
+        if (!background_layer_) {
+            return;
+        }
+        const QList<QScreen*> screens = QGuiApplication::screens();
+        if (screens.isEmpty()) {
+            return;
+        }
+
+        QRect virtual_geometry;
+        for (QScreen* screen : screens) {
+            virtual_geometry = virtual_geometry.united(screen->geometry());
+        }
+        if (virtual_geometry.isEmpty()) {
+            return;
+        }
+
+        const auto scaled_size = [=](const QSize& size) {
+            return QSize(
+                std::max(1, (size.width() + kDesktopBackdropScale - 1) /
+                                kDesktopBackdropScale),
+                std::max(1, (size.height() + kDesktopBackdropScale - 1) /
+                                kDesktopBackdropScale));
+        };
+        QPixmap desktop(scaled_size(virtual_geometry.size()));
+        desktop.fill(Qt::transparent);
+        QPainter painter(&desktop);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+        for (QScreen* screen : screens) {
+            const QPixmap capture = screen->grabWindow(0);
+            const QRect screen_geometry =
+                screen->geometry().translated(-virtual_geometry.topLeft());
+            const QRect target(
+                screen_geometry.x() / kDesktopBackdropScale,
+                screen_geometry.y() / kDesktopBackdropScale,
+                (screen_geometry.x() + screen_geometry.width() +
+                 kDesktopBackdropScale - 1) /
+                        kDesktopBackdropScale -
+                    screen_geometry.x() / kDesktopBackdropScale,
+                (screen_geometry.y() + screen_geometry.height() +
+                 kDesktopBackdropScale - 1) /
+                        kDesktopBackdropScale -
+                    screen_geometry.y() / kDesktopBackdropScale);
+            painter.drawPixmap(target, capture, capture.rect());
+        }
+        painter.end();
+
+        for (int pass = 0; pass < kDesktopBackdropBlurPasses; ++pass) {
+            const QSize softened_size(
+                std::max(1, desktop.width() / kDesktopBackdropBlurDownscale),
+                std::max(1, desktop.height() / kDesktopBackdropBlurDownscale));
+            QPixmap softened(softened_size);
+            softened.fill(Qt::transparent);
+
+            QPainter downsample(&softened);
+            downsample.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            downsample.drawPixmap(softened.rect(), desktop, desktop.rect());
+            downsample.end();
+
+            desktop.fill(Qt::transparent);
+            QPainter upsample(&desktop);
+            upsample.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            upsample.drawPixmap(desktop.rect(), softened, softened.rect());
+            upsample.end();
+        }
+
+        background_layer_->set_desktop_backdrop(
+            desktop, virtual_geometry.topLeft(), kDesktopBackdropScale);
+#endif
     }
 
     void apply_selected_theme() {
@@ -2991,7 +3155,11 @@ private:
         auto* blur_background = new QCheckBox(tab);
         const bool blur_supported =
             neothemis::gui::native_background_blur_supported();
-        blur_background->setChecked(blur_supported && blur_background_);
+        const bool transparency_active =
+            transparent_background_ && background_transparency_ > 0;
+        blur_background->setChecked(
+            blur_supported && transparency_active && blur_background_);
+        blur_background->setEnabled(blur_supported && transparency_active);
 
         auto* language = new QComboBox(tab);
         language->addItem(text("english"), "en");
@@ -3048,13 +3216,29 @@ private:
         QObject::connect(theme, &QComboBox::currentTextChanged,
                          [apply_visual_preview](const QString&) { apply_visual_preview(); });
         QObject::connect(transparent_background, &QCheckBox::toggled,
-                         [transparency, apply_visual_preview](bool enabled) {
+                         [transparency, blur_background, blur_supported,
+                          apply_visual_preview](bool enabled) {
                              transparency->setEnabled(enabled);
+                             blur_background->setEnabled(
+                                 blur_supported && enabled &&
+                                 transparency->value() > 0);
+                             if (!enabled) {
+                                 blur_background->setChecked(false);
+                             }
                              apply_visual_preview();
                          });
         QObject::connect(transparency, &QSlider::valueChanged,
-                         [transparency_value, apply_visual_preview](int value) {
+                         [transparent_background, transparency_value,
+                          blur_background, blur_supported,
+                          apply_visual_preview](int value) {
                              transparency_value->setText(QString::number(value) + "%");
+                             const bool can_blur =
+                                 blur_supported &&
+                                 transparent_background->isChecked() && value > 0;
+                             blur_background->setEnabled(can_blur);
+                             if (!can_blur) {
+                                 blur_background->setChecked(false);
+                             }
                              apply_visual_preview();
                          });
         QObject::connect(blur_background, &QCheckBox::toggled,
@@ -3789,6 +3973,7 @@ private:
     QProgressBar* progress_ = nullptr;
     QLabel* judge_elapsed_label_ = nullptr;
     QTimer* judge_elapsed_update_timer_ = nullptr;
+    QTimer* backdrop_realign_timer_ = nullptr;
     QElapsedTimer judge_elapsed_clock_;
     qint64 last_judge_elapsed_ms_ = 0;
     QPlainTextEdit* log_ = nullptr;
