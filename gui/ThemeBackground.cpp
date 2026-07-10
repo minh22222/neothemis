@@ -211,12 +211,20 @@ void ThemeBackground::set_appearance(const std::string& theme,
     const CyberThemeColors resolved_colors{
         usable_color(cyber_colors.background, defaults.background),
         usable_color(cyber_colors.primary, defaults.primary),
-        usable_color(cyber_colors.secondary, defaults.secondary)};
+        usable_color(cyber_colors.secondary, defaults.secondary),
+        usable_color(cyber_colors.text, defaults.text),
+        usable_color(cyber_colors.muted_text, defaults.muted_text),
+        usable_color(cyber_colors.primary_text, defaults.primary_text),
+        usable_color(cyber_colors.secondary_text, defaults.secondary_text)};
     if (theme_ == theme && opacity_ == clamped_opacity &&
         blur_radius_ == clamped_blur &&
         cyber_colors_.background == resolved_colors.background &&
         cyber_colors_.primary == resolved_colors.primary &&
-        cyber_colors_.secondary == resolved_colors.secondary) {
+        cyber_colors_.secondary == resolved_colors.secondary &&
+        cyber_colors_.text == resolved_colors.text &&
+        cyber_colors_.muted_text == resolved_colors.muted_text &&
+        cyber_colors_.primary_text == resolved_colors.primary_text &&
+        cyber_colors_.secondary_text == resolved_colors.secondary_text) {
         return;
     }
     theme_ = theme;

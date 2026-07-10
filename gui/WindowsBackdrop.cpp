@@ -44,16 +44,43 @@ enum class WindowsBackdropBackend {
     none,
     dwm_desktop_acrylic,
     accent_policy,
+    accent_transparent,
     accent_host_backdrop,
+};
+
+enum class WindowsBackdropMode {
+    none,
+    transparent,
+    blur,
 };
 
 struct WindowsBackdropState {
     HWND window = nullptr;
-    bool enabled = false;
+    WindowsBackdropMode mode = WindowsBackdropMode::none;
     WindowsBackdropBackend backend = WindowsBackdropBackend::none;
     QColor tint;
     int tint_opacity = 0;
 };
+
+bool backend_satisfies_mode(WindowsBackdropMode mode,
+                            WindowsBackdropBackend backend) {
+    switch (mode) {
+    case WindowsBackdropMode::none:
+        return backend == WindowsBackdropBackend::none;
+    case WindowsBackdropMode::transparent:
+        return backend == WindowsBackdropBackend::accent_transparent;
+    case WindowsBackdropMode::blur:
+        return backend == WindowsBackdropBackend::dwm_desktop_acrylic ||
+               backend == WindowsBackdropBackend::accent_policy ||
+               backend == WindowsBackdropBackend::accent_host_backdrop;
+    }
+    return false;
+}
+
+bool backend_has_verified_blur(WindowsBackdropBackend backend) {
+    return backend == WindowsBackdropBackend::dwm_desktop_acrylic ||
+           backend == WindowsBackdropBackend::accent_policy;
+}
 
 enum class WindowCompositionAttribute : int {
     accent_policy = 19,
@@ -61,6 +88,7 @@ enum class WindowCompositionAttribute : int {
 
 enum class AccentState : int {
     disabled = 0,
+    transparent_gradient = 2,
     acrylic_blur_behind = 4,
     host_backdrop = 5,
 };
@@ -163,7 +191,8 @@ bool set_accent_policy(HWND window,
     }
     AccentPolicy policy;
     policy.state = state;
-    if (state == AccentState::acrylic_blur_behind ||
+    if (state == AccentState::transparent_gradient ||
+        state == AccentState::acrylic_blur_behind ||
         state == AccentState::host_backdrop) {
         policy.gradient_color = accent_gradient_color(tint, tint_opacity);
     }
@@ -190,9 +219,25 @@ void disable_windows_backdrop(HWND window) {
     DwmExtendFrameIntoClientArea(window, &client_area);
 }
 
-WindowsBackdropBackend enable_windows_backdrop(HWND window,
-                                                const QColor& tint,
-                                                int tint_opacity) {
+WindowsBackdropBackend enable_windows_transparency(HWND window,
+                                                   const QColor& tint,
+                                                   int tint_opacity) {
+    const int none = kDwmBackdropNone;
+    DwmSetWindowAttribute(window, kDwmSystemBackdropType,
+                          &none, sizeof(none));
+    const MARGINS client_area{0, 0, 0, 0};
+    DwmExtendFrameIntoClientArea(window, &client_area);
+    if (set_accent_policy(window, AccentState::transparent_gradient,
+                          tint, tint_opacity)) {
+        return WindowsBackdropBackend::accent_transparent;
+    }
+    disable_windows_backdrop(window);
+    return WindowsBackdropBackend::none;
+}
+
+WindowsBackdropBackend enable_windows_blur(HWND window,
+                                           const QColor& tint,
+                                           int tint_opacity) {
     const BOOL dark_mode = tint.isValid() && tint.lightness() < 150 ? TRUE : FALSE;
     DwmSetWindowAttribute(window, kDwmUseImmersiveDarkMode,
                           &dark_mode, sizeof(dark_mode));
@@ -207,6 +252,20 @@ WindowsBackdropBackend enable_windows_backdrop(HWND window,
                               tint, tint_opacity)) {
             return WindowsBackdropBackend::accent_host_backdrop;
         }
+    }
+
+    // Accent Acrylic is the only native path that exposes the applications
+    // directly underneath this frameless Qt window with a controllable tint.
+    // DWM owns the blur and tracks movement/background animation in real time.
+    const int none = kDwmBackdropNone;
+    DwmSetWindowAttribute(window, kDwmSystemBackdropType,
+                          &none, sizeof(none));
+    const MARGINS client_area{0, 0, 0, 0};
+    DwmExtendFrameIntoClientArea(window, &client_area);
+    if (windows_build_number() >= kMinimumPrivateAcrylicBuild &&
+        set_accent_policy(window, AccentState::acrylic_blur_behind,
+                          tint, tint_opacity)) {
+        return WindowsBackdropBackend::accent_policy;
     }
 
     if (windows_build_number() >= kMinimumSystemBackdropBuild) {
@@ -226,10 +285,10 @@ WindowsBackdropBackend enable_windows_backdrop(HWND window,
                               &none, sizeof(none));
     }
 
-    if (windows_build_number() >= kMinimumPrivateAcrylicBuild &&
-        set_accent_policy(window, AccentState::acrylic_blur_behind,
-                          tint, tint_opacity)) {
-        return WindowsBackdropBackend::accent_policy;
+    const WindowsBackdropBackend transparent =
+        enable_windows_transparency(window, tint, tint_opacity);
+    if (transparent != WindowsBackdropBackend::none) {
+        return transparent;
     }
     disable_windows_backdrop(window);
     return WindowsBackdropBackend::none;
@@ -400,9 +459,14 @@ bool apply_windows_backdrop(QWidget* window,
     if (!window) {
         return false;
     }
-    const bool backdrop_enabled = blur_enabled && transparency_enabled;
+    const bool blur_requested = blur_enabled && transparency_enabled;
 
 #ifdef Q_OS_WIN
+    const WindowsBackdropMode requested_mode =
+        !transparency_enabled
+            ? WindowsBackdropMode::none
+            : (blur_requested ? WindowsBackdropMode::blur
+                              : WindowsBackdropMode::transparent);
     HWND handle = reinterpret_cast<HWND>(window->winId());
     if (!handle) {
         return false;
@@ -413,54 +477,60 @@ bool apply_windows_backdrop(QWidget* window,
         auto found = windows_backdrop_states.find(window);
         if (found != windows_backdrop_states.end() &&
             found->second.window != handle) {
-            if (found->second.enabled && IsWindow(found->second.window)) {
+            if (found->second.mode != WindowsBackdropMode::none &&
+                IsWindow(found->second.window)) {
                 disable_windows_backdrop(found->second.window);
             }
             windows_backdrop_states.erase(found);
             found = windows_backdrop_states.end();
         }
         if (!force_compositor_update && found != windows_backdrop_states.end() &&
-            found->second.enabled == backdrop_enabled &&
-            (!backdrop_enabled ||
+            found->second.mode == requested_mode &&
+            (requested_mode == WindowsBackdropMode::none ||
              (found->second.tint == tint &&
-              found->second.tint_opacity == clamped_tint_opacity))) {
-            return found->second.enabled;
+              found->second.tint_opacity == clamped_tint_opacity)) &&
+            backend_satisfies_mode(requested_mode, found->second.backend)) {
+            return requested_mode == WindowsBackdropMode::blur &&
+                   backend_has_verified_blur(found->second.backend);
         }
 
-        if (!backdrop_enabled) {
-            if (found != windows_backdrop_states.end() && !found->second.enabled) {
+        if (requested_mode == WindowsBackdropMode::none) {
+            if (found != windows_backdrop_states.end() &&
+                found->second.mode == WindowsBackdropMode::none) {
                 return false;
             }
-            const bool was_enabled =
-                found != windows_backdrop_states.end() && found->second.enabled;
+            const bool was_active = found != windows_backdrop_states.end() &&
+                                    found->second.mode != WindowsBackdropMode::none;
             disable_windows_backdrop(handle);
             windows_backdrop_states[window] =
-                {handle, false, WindowsBackdropBackend::none, {}, 0};
-            if (was_enabled) {
+                {handle, WindowsBackdropMode::none,
+                 WindowsBackdropBackend::none, {}, 0};
+            if (was_active) {
                 request_frame_refresh(handle);
                 window->update();
             }
             return false;
         }
 
-        const WindowsBackdropBackend backend =
-            enable_windows_backdrop(handle, tint, clamped_tint_opacity);
-        const bool enabled = backend != WindowsBackdropBackend::none;
+        const WindowsBackdropBackend backend = requested_mode == WindowsBackdropMode::blur
+            ? enable_windows_blur(handle, tint, clamped_tint_opacity)
+            : enable_windows_transparency(handle, tint, clamped_tint_opacity);
         windows_backdrop_states[window] =
-            {handle, enabled, backend, tint, clamped_tint_opacity};
+            {handle, requested_mode, backend, tint, clamped_tint_opacity};
         request_frame_refresh(handle);
         window->update();
-        return enabled;
+        return requested_mode == WindowsBackdropMode::blur &&
+               backend_has_verified_blur(backend);
     }
 #else
     window->setAttribute(Qt::WA_NoSystemBackground, true);
     window->setAutoFillBackground(false);
-    apply_compositor_blur(window, backdrop_enabled,
+    apply_compositor_blur(window, blur_requested,
                           force_compositor_update);
     window->update();
     (void)tint;
     (void)tint_opacity;
-    return backdrop_enabled;
+    return blur_requested;
 #endif
 }
 
@@ -474,7 +544,8 @@ void release_windows_backdrop(QWidget* window) {
     if (found == windows_backdrop_states.end()) {
         return;
     }
-    if (found->second.enabled && IsWindow(found->second.window)) {
+    if (found->second.mode != WindowsBackdropMode::none &&
+        IsWindow(found->second.window)) {
         disable_windows_backdrop(found->second.window);
     }
     windows_backdrop_states.erase(found);

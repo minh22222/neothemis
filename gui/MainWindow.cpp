@@ -27,6 +27,7 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGraphicsDropShadowEffect>
+#include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -111,13 +112,6 @@ QColor blend_theme_colors(const QColor& background,
                    0, 255));
 }
 
-QColor readable_theme_text(const QColor& surface) {
-    const int luminance =
-        (surface.red() * 299 + surface.green() * 587 + surface.blue() * 114) /
-        1000;
-    return luminance > 150 ? QColor(18, 24, 32) : QColor(237, 243, 247);
-}
-
 struct CellScore {
     double earned = 0.0;
     double max = 0.0;
@@ -177,7 +171,9 @@ class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(fs::path initial_contest) {
         load_app_settings();
+#ifndef Q_OS_WIN
         setAttribute(Qt::WA_TranslucentBackground, true);
+#endif
         setAttribute(Qt::WA_NoSystemBackground, true);
         setAutoFillBackground(false);
         setWindowTitle(text("window_title"));
@@ -336,7 +332,7 @@ public:
                          [this](const QPoint& pos) { show_header_menu(pos); });
         QObject::connect(minimize, &QToolButton::clicked, this, &QWidget::showMinimized);
         QObject::connect(maximize, &QToolButton::clicked, [this]() {
-            isMaximized() ? showNormal() : showMaximized();
+            neothemis::gui::toggle_window_maximized(this);
         });
         QObject::connect(close, &QToolButton::clicked, this, &QWidget::close);
 
@@ -367,7 +363,7 @@ protected:
             if (event->type() == QEvent::MouseButtonDblClick) {
                 auto* mouse = static_cast<QMouseEvent*>(event);
                 if (mouse->button() == Qt::LeftButton) {
-                    isMaximized() ? showNormal() : showMaximized();
+                    neothemis::gui::toggle_window_maximized(this);
                     return true;
                 }
             }
@@ -426,13 +422,13 @@ protected:
                      void* message,
                      qintptr* result) override {
 #ifdef Q_OS_WIN
-        if (background_blur_active() &&
+        if (background_transparency_active() &&
             neothemis::gui::windows_backdrop_message_requires_refresh(message) &&
             !backdrop_refresh_queued_) {
             backdrop_refresh_queued_ = true;
             QTimer::singleShot(0, this, [this]() {
                 backdrop_refresh_queued_ = false;
-                if (background_blur_active()) {
+                if (background_transparency_active()) {
                     apply_native_backdrop(true);
                 }
             });
@@ -458,7 +454,9 @@ private:
 
     neothemis::gui::CyberThemeColors cyber_theme_colors() const {
         return {cyber_background_color_, cyber_primary_color_,
-                cyber_secondary_color_};
+                cyber_secondary_color_, cyber_text_color_,
+                cyber_muted_text_color_, cyber_primary_text_color_,
+                cyber_secondary_text_color_};
     }
 
     static QColor color_setting_or_default(const QVariant& value,
@@ -494,6 +492,22 @@ private:
             settings.value("cyber_secondary_color",
                            default_cyber_colors.secondary.name(QColor::HexRgb)),
             default_cyber_colors.secondary);
+        cyber_text_color_ = color_setting_or_default(
+            settings.value("cyber_text_color",
+                           default_cyber_colors.text.name(QColor::HexRgb)),
+            default_cyber_colors.text);
+        cyber_muted_text_color_ = color_setting_or_default(
+            settings.value("cyber_muted_text_color",
+                           default_cyber_colors.muted_text.name(QColor::HexRgb)),
+            default_cyber_colors.muted_text);
+        cyber_primary_text_color_ = color_setting_or_default(
+            settings.value("cyber_primary_text_color",
+                           default_cyber_colors.primary_text.name(QColor::HexRgb)),
+            default_cyber_colors.primary_text);
+        cyber_secondary_text_color_ = color_setting_or_default(
+            settings.value("cyber_secondary_text_color",
+                           default_cyber_colors.secondary_text.name(QColor::HexRgb)),
+            default_cyber_colors.secondary_text);
         transparent_background_ = settings.value("transparent_background", false).toBool();
         background_transparency_ =
             std::clamp(settings.value("background_transparency", 20).toInt(), 0, 95);
@@ -526,6 +540,14 @@ private:
                           cyber_primary_color_.name(QColor::HexRgb));
         settings.setValue("cyber_secondary_color",
                           cyber_secondary_color_.name(QColor::HexRgb));
+        settings.setValue("cyber_text_color",
+                          cyber_text_color_.name(QColor::HexRgb));
+        settings.setValue("cyber_muted_text_color",
+                          cyber_muted_text_color_.name(QColor::HexRgb));
+        settings.setValue("cyber_primary_text_color",
+                          cyber_primary_text_color_.name(QColor::HexRgb));
+        settings.setValue("cyber_secondary_text_color",
+                          cyber_secondary_text_color_.name(QColor::HexRgb));
         settings.setValue("transparent_background", transparent_background_);
         settings.setValue("background_transparency", background_transparency_);
         settings.setValue("blur_background", blur_background_);
@@ -676,18 +698,24 @@ private:
     }
 
     void apply_translucent_surface_attributes() {
+#ifndef Q_OS_WIN
         setAttribute(Qt::WA_TranslucentBackground, true);
+#endif
         setAttribute(Qt::WA_NoSystemBackground, true);
         setAutoFillBackground(false);
 
         if (QWidget* root = centralWidget()) {
             root->setAttribute(Qt::WA_NoSystemBackground, true);
+#ifndef Q_OS_WIN
             root->setAttribute(Qt::WA_TranslucentBackground, true);
+#endif
             root->setAutoFillBackground(false);
         }
         if (background_layer_) {
             background_layer_->setAttribute(Qt::WA_NoSystemBackground, true);
+#ifndef Q_OS_WIN
             background_layer_->setAttribute(Qt::WA_TranslucentBackground, true);
+#endif
             background_layer_->setAutoFillBackground(false);
         }
     }
@@ -2525,7 +2553,8 @@ private:
             const QColor surface = blend_theme_colors(
                 cyber_background_color_, cyber_primary_color_,
                 cyber_secondary_color_, 0.08, 0.0);
-            item->setForeground(readable_theme_text(surface));
+            item->setForeground(neothemis::gui::ensure_theme_text_contrast(
+                cyber_text_color_, surface));
             item->setBackground(surface);
             return;
         }
@@ -2546,7 +2575,8 @@ private:
             const QColor surface = blend_theme_colors(
                 cyber_background_color_, cyber_primary_color_,
                 cyber_secondary_color_, primary_weight, secondary_weight);
-            item->setForeground(readable_theme_text(surface));
+            item->setForeground(neothemis::gui::ensure_theme_text_contrast(
+                cyber_text_color_, surface));
             item->setBackground(surface);
         };
         if (!terminal_status.isEmpty()) {
@@ -2637,7 +2667,8 @@ private:
             const QColor surface = blend_theme_colors(
                 cyber_background_color_, cyber_primary_color_,
                 cyber_secondary_color_, primary_weight, secondary_weight);
-            item->setForeground(readable_theme_text(surface));
+            item->setForeground(neothemis::gui::ensure_theme_text_contrast(
+                cyber_text_color_, surface));
             item->setBackground(surface);
         };
         if (max > 0.0 && earned + 1e-9 >= max) {
@@ -3166,7 +3197,7 @@ private:
         auto* cyber_colors_label = new QLabel(text("cyber_colors"), tab);
         auto* cyber_colors_widget = new QWidget(tab);
         cyber_colors_widget->setObjectName("InlineControl");
-        auto* cyber_colors_layout = new QHBoxLayout(cyber_colors_widget);
+        auto* cyber_colors_layout = new QGridLayout(cyber_colors_widget);
         cyber_colors_layout->setContentsMargins(0, 0, 0, 0);
         cyber_colors_layout->setSpacing(10);
         auto* cyber_background = new QPushButton(cyber_colors_widget);
@@ -3174,11 +3205,26 @@ private:
         auto* cyber_secondary = new QPushButton(cyber_colors_widget);
         auto* reset_cyber_colors = new QPushButton(text("reset_cyber_colors"),
                                                    cyber_colors_widget);
-        cyber_colors_layout->addWidget(cyber_background);
-        cyber_colors_layout->addWidget(cyber_primary);
-        cyber_colors_layout->addWidget(cyber_secondary);
-        cyber_colors_layout->addWidget(reset_cyber_colors);
-        cyber_colors_layout->addStretch(1);
+        cyber_colors_layout->addWidget(cyber_background, 0, 0);
+        cyber_colors_layout->addWidget(cyber_primary, 0, 1);
+        cyber_colors_layout->addWidget(cyber_secondary, 1, 0);
+        cyber_colors_layout->addWidget(reset_cyber_colors, 1, 1);
+        auto* cyber_text_colors_label =
+            new QLabel(text("cyber_text_colors"), tab);
+        auto* cyber_text_colors_widget = new QWidget(tab);
+        cyber_text_colors_widget->setObjectName("InlineControl");
+        auto* cyber_text_colors_layout =
+            new QGridLayout(cyber_text_colors_widget);
+        cyber_text_colors_layout->setContentsMargins(0, 0, 0, 0);
+        cyber_text_colors_layout->setSpacing(10);
+        auto* cyber_text = new QPushButton(cyber_text_colors_widget);
+        auto* cyber_muted_text = new QPushButton(cyber_text_colors_widget);
+        auto* cyber_primary_text = new QPushButton(cyber_text_colors_widget);
+        auto* cyber_secondary_text = new QPushButton(cyber_text_colors_widget);
+        cyber_text_colors_layout->addWidget(cyber_text, 0, 0);
+        cyber_text_colors_layout->addWidget(cyber_muted_text, 0, 1);
+        cyber_text_colors_layout->addWidget(cyber_primary_text, 1, 0);
+        cyber_text_colors_layout->addWidget(cyber_secondary_text, 1, 1);
         auto color_text = [](const QColor& background) {
             const int luminance =
                 (background.red() * 299 + background.green() * 587 +
@@ -3218,6 +3264,16 @@ private:
                          cyber_primary_color_);
         set_color_button(cyber_secondary, text("cyber_secondary_color"),
                          cyber_secondary_color_);
+        set_color_button(cyber_text, text("cyber_text_color"),
+                         cyber_text_color_);
+        set_color_button(cyber_muted_text, text("cyber_muted_text_color"),
+                         cyber_muted_text_color_);
+        set_color_button(cyber_primary_text,
+                         text("cyber_primary_text_color"),
+                         cyber_primary_text_color_);
+        set_color_button(cyber_secondary_text,
+                         text("cyber_secondary_text_color"),
+                         cyber_secondary_text_color_);
         auto* transparent_background = new QCheckBox(tab);
         transparent_background->setChecked(transparent_background_);
         auto* transparency_widget = new QWidget(tab);
@@ -3272,6 +3328,7 @@ private:
 
         form->addRow(text("theme"), theme);
         form->addRow(cyber_colors_label, cyber_colors_widget);
+        form->addRow(cyber_text_colors_label, cyber_text_colors_widget);
         form->addRow(text("transparent_background"), transparent_background);
         form->addRow(text("background_transparency"), transparency_widget);
         if (blur_supported) {
@@ -3293,11 +3350,17 @@ private:
         auto apply_visual_preview = [this, theme, transparent_background,
                                      transparency, blur_background,
                                      cyber_background, cyber_primary,
-                                     cyber_secondary, selected_color]() {
+                                     cyber_secondary, cyber_text,
+                                     cyber_muted_text, cyber_primary_text,
+                                     cyber_secondary_text, selected_color]() {
             theme_ = theme->currentData().toString().toStdString();
             const QColor background = selected_color(cyber_background);
             const QColor primary = selected_color(cyber_primary);
             const QColor secondary = selected_color(cyber_secondary);
+            const QColor body_text = selected_color(cyber_text);
+            const QColor muted_text = selected_color(cyber_muted_text);
+            const QColor primary_text = selected_color(cyber_primary_text);
+            const QColor secondary_text = selected_color(cyber_secondary_text);
             if (background.isValid()) {
                 cyber_background_color_ = background;
             }
@@ -3307,17 +3370,32 @@ private:
             if (secondary.isValid()) {
                 cyber_secondary_color_ = secondary;
             }
+            if (body_text.isValid()) {
+                cyber_text_color_ = body_text;
+            }
+            if (muted_text.isValid()) {
+                cyber_muted_text_color_ = muted_text;
+            }
+            if (primary_text.isValid()) {
+                cyber_primary_text_color_ = primary_text;
+            }
+            if (secondary_text.isValid()) {
+                cyber_secondary_text_color_ = secondary_text;
+            }
             transparent_background_ = transparent_background->isChecked();
             background_transparency_ = transparency->value();
             blur_background_ = blur_background->isChecked();
             apply_selected_theme();
         };
         auto update_cyber_color_visibility =
-            [theme, cyber_colors_label, cyber_colors_widget]() {
+            [theme, cyber_colors_label, cyber_colors_widget,
+             cyber_text_colors_label, cyber_text_colors_widget]() {
                 const bool visible =
                     theme->currentData().toString().toStdString() == "cyber";
                 cyber_colors_label->setVisible(visible);
                 cyber_colors_widget->setVisible(visible);
+                cyber_text_colors_label->setVisible(visible);
+                cyber_text_colors_widget->setVisible(visible);
             };
         update_cyber_color_visibility();
 
@@ -3360,9 +3438,35 @@ private:
                                               text("cyber_secondary_color"),
                                               "cyber_secondary_color");
                          });
+        QObject::connect(cyber_text, &QPushButton::clicked,
+                         [pick_cyber_color, cyber_text, this]() {
+                             pick_cyber_color(cyber_text,
+                                              text("cyber_text_color"),
+                                              "cyber_text_color");
+                         });
+        QObject::connect(cyber_muted_text, &QPushButton::clicked,
+                         [pick_cyber_color, cyber_muted_text, this]() {
+                             pick_cyber_color(cyber_muted_text,
+                                              text("cyber_muted_text_color"),
+                                              "cyber_muted_text_color");
+                         });
+        QObject::connect(cyber_primary_text, &QPushButton::clicked,
+                         [pick_cyber_color, cyber_primary_text, this]() {
+                             pick_cyber_color(cyber_primary_text,
+                                              text("cyber_primary_text_color"),
+                                              "cyber_primary_text_color");
+                         });
+        QObject::connect(cyber_secondary_text, &QPushButton::clicked,
+                         [pick_cyber_color, cyber_secondary_text, this]() {
+                             pick_cyber_color(cyber_secondary_text,
+                                              text("cyber_secondary_text_color"),
+                                              "cyber_secondary_text_color");
+                         });
         QObject::connect(reset_cyber_colors, &QPushButton::clicked,
                          [this, set_color_button, cyber_background,
-                          cyber_primary, cyber_secondary,
+                          cyber_primary, cyber_secondary, cyber_text,
+                          cyber_muted_text, cyber_primary_text,
+                          cyber_secondary_text,
                           apply_visual_preview]() {
                              const neothemis::gui::CyberThemeColors defaults =
                                  neothemis::gui::default_cyber_theme_colors();
@@ -3375,6 +3479,18 @@ private:
                              set_color_button(cyber_secondary,
                                               text("cyber_secondary_color"),
                                               defaults.secondary);
+                             set_color_button(cyber_text,
+                                              text("cyber_text_color"),
+                                              defaults.text);
+                             set_color_button(cyber_muted_text,
+                                              text("cyber_muted_text_color"),
+                                              defaults.muted_text);
+                             set_color_button(cyber_primary_text,
+                                              text("cyber_primary_text_color"),
+                                              defaults.primary_text);
+                             set_color_button(cyber_secondary_text,
+                                              text("cyber_secondary_text_color"),
+                                              defaults.secondary_text);
                              apply_visual_preview();
                          });
         QObject::connect(transparent_background, &QCheckBox::toggled,
@@ -3410,13 +3526,19 @@ private:
 
         auto persist = [this, theme, transparent_background, transparency,
                         blur_background, language, temp_dir, cyber_background,
-                        cyber_primary, cyber_secondary,
+                        cyber_primary, cyber_secondary, cyber_text,
+                        cyber_muted_text, cyber_primary_text,
+                        cyber_secondary_text,
                         selected_color](bool notify) {
             try {
                 theme_ = theme->currentData().toString().toStdString();
                 const QColor background = selected_color(cyber_background);
                 const QColor primary = selected_color(cyber_primary);
                 const QColor secondary = selected_color(cyber_secondary);
+                const QColor body_text = selected_color(cyber_text);
+                const QColor muted_text = selected_color(cyber_muted_text);
+                const QColor primary_text = selected_color(cyber_primary_text);
+                const QColor secondary_text = selected_color(cyber_secondary_text);
                 if (background.isValid()) {
                     cyber_background_color_ = background;
                 }
@@ -3425,6 +3547,18 @@ private:
                 }
                 if (secondary.isValid()) {
                     cyber_secondary_color_ = secondary;
+                }
+                if (body_text.isValid()) {
+                    cyber_text_color_ = body_text;
+                }
+                if (muted_text.isValid()) {
+                    cyber_muted_text_color_ = muted_text;
+                }
+                if (primary_text.isValid()) {
+                    cyber_primary_text_color_ = primary_text;
+                }
+                if (secondary_text.isValid()) {
+                    cyber_secondary_text_color_ = secondary_text;
                 }
                 transparent_background_ = transparent_background->isChecked();
                 background_transparency_ = transparency->value();
@@ -4106,6 +4240,14 @@ private:
         neothemis::gui::default_cyber_theme_colors().primary;
     QColor cyber_secondary_color_ =
         neothemis::gui::default_cyber_theme_colors().secondary;
+    QColor cyber_text_color_ =
+        neothemis::gui::default_cyber_theme_colors().text;
+    QColor cyber_muted_text_color_ =
+        neothemis::gui::default_cyber_theme_colors().muted_text;
+    QColor cyber_primary_text_color_ =
+        neothemis::gui::default_cyber_theme_colors().primary_text;
+    QColor cyber_secondary_text_color_ =
+        neothemis::gui::default_cyber_theme_colors().secondary_text;
     bool transparent_background_ = false;
     int background_transparency_ = 20;
     bool blur_background_ = false;

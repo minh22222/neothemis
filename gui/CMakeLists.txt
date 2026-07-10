@@ -50,7 +50,12 @@ endif()
 qt_add_resources(neothemis-gui neothemis_gui_resources
     PREFIX "/"
     BASE ${CMAKE_SOURCE_DIR}
-    FILES ${CMAKE_SOURCE_DIR}/materials/logo.png
+    FILES
+        ${CMAKE_SOURCE_DIR}/materials/logo.png
+        ${CMAKE_SOURCE_DIR}/materials/spin-up-light.xpm
+        ${CMAKE_SOURCE_DIR}/materials/spin-down-light.xpm
+        ${CMAKE_SOURCE_DIR}/materials/spin-up-dark.xpm
+        ${CMAKE_SOURCE_DIR}/materials/spin-down-dark.xpm
 )
 
 target_link_libraries(neothemis-gui PRIVATE neothemis_core Qt6::Widgets Qt6::Sql)

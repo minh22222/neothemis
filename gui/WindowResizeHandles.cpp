@@ -8,9 +8,40 @@
 
 #include <array>
 
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 constexpr int kResizeBorderWidth = 7;
+
+void enable_windows_aero_snap(QWidget* window) {
+#ifdef Q_OS_WIN
+    if (!window) {
+        return;
+    }
+    const HWND handle = reinterpret_cast<HWND>(window->winId());
+    if (!handle) {
+        return;
+    }
+    constexpr LONG_PTR required_styles =
+        WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
+    const LONG_PTR current_styles = GetWindowLongPtrW(handle, GWL_STYLE);
+    if ((current_styles & required_styles) == required_styles) {
+        return;
+    }
+    SetWindowLongPtrW(handle, GWL_STYLE, current_styles | required_styles);
+    SetWindowPos(handle, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                     SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER);
+#else
+    (void)window;
+#endif
+}
 
 Qt::CursorShape resize_cursor(Qt::Edges edges) {
     if (edges == (Qt::TopEdge | Qt::LeftEdge) ||
@@ -75,11 +106,17 @@ public:
             handles_[index] = new ResizeHandle(window_, edges[index]);
         }
         window_->installEventFilter(this);
+        enable_windows_aero_snap(window_);
         update_handles();
     }
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override {
+        if (watched == window_ &&
+            (event->type() == QEvent::Show ||
+             event->type() == QEvent::WinIdChange)) {
+            enable_windows_aero_snap(window_);
+        }
         if (watched == window_ &&
             (event->type() == QEvent::Resize || event->type() == QEvent::Show ||
              event->type() == QEvent::WindowStateChange)) {
@@ -135,6 +172,20 @@ void install_windows_resize_handles(QWidget* window) {
 #else
     (void)window;
 #endif
+}
+
+void toggle_window_maximized(QWidget* window) {
+    if (!window) {
+        return;
+    }
+#ifdef Q_OS_WIN
+    const HWND handle = reinterpret_cast<HWND>(window->winId());
+    if (handle) {
+        ShowWindow(handle, IsZoomed(handle) ? SW_RESTORE : SW_MAXIMIZE);
+        return;
+    }
+#endif
+    window->isMaximized() ? window->showNormal() : window->showMaximized();
 }
 
 } // namespace neothemis::gui

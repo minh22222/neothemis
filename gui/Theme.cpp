@@ -4,6 +4,7 @@
 #include <QPalette>
 
 #include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -24,6 +25,48 @@ QColor mix_color(const QColor& first, const QColor& second, double second_weight
         std::clamp(static_cast<int>(first.blue() * first_weight +
                                     second.blue() * weight),
                    0, 255));
+}
+
+double color_luminance(const QColor& color) {
+    auto channel = [](int value) {
+        const double normalized = value / 255.0;
+        return normalized <= 0.04045
+                   ? normalized / 12.92
+                   : std::pow((normalized + 0.055) / 1.055, 2.4);
+    };
+    return channel(color.red()) * 0.2126 +
+           channel(color.green()) * 0.7152 +
+           channel(color.blue()) * 0.0722;
+}
+
+double contrast_ratio(const QColor& first, const QColor& second) {
+    const double first_luminance = color_luminance(first);
+    const double second_luminance = color_luminance(second);
+    const double lighter = std::max(first_luminance, second_luminance);
+    const double darker = std::min(first_luminance, second_luminance);
+    return (lighter + 0.05) / (darker + 0.05);
+}
+
+QColor ensure_contrast(const QColor& preferred,
+                       const QColor& surface,
+                       double minimum_ratio) {
+    if (contrast_ratio(preferred, surface) >= minimum_ratio) {
+        return preferred;
+    }
+    const QColor black(9, 13, 18);
+    const QColor white(247, 251, 253);
+    const QColor target = contrast_ratio(black, surface) >=
+                                  contrast_ratio(white, surface)
+                              ? black
+                              : white;
+    for (int step = 1; step <= 12; ++step) {
+        const QColor adjusted =
+            mix_color(preferred, target, static_cast<double>(step) / 12.0);
+        if (contrast_ratio(adjusted, surface) >= minimum_ratio) {
+            return adjusted;
+        }
+    }
+    return target;
 }
 
 QString color_hex(const QColor& color) {
@@ -52,7 +95,23 @@ void replace_token(QString& text, const QString& token, const QString& color) {
 namespace neothemis::gui {
 
 CyberThemeColors default_cyber_theme_colors() {
-    return {QColor(13, 43, 52), QColor(83, 220, 203), QColor(211, 76, 112)};
+    const QColor background(13, 43, 52);
+    const QColor primary(83, 220, 203);
+    const QColor secondary(211, 76, 112);
+    const QColor text(237, 243, 247);
+    return {background,
+            primary,
+            secondary,
+            text,
+            mix_color(text, background, 0.38),
+            mix_color(primary, QColor(255, 255, 255), 0.72),
+            mix_color(secondary, QColor(255, 255, 255), 0.58)};
+}
+
+QColor ensure_theme_text_contrast(const QColor& preferred,
+                                  const QColor& surface,
+                                  double minimum_ratio) {
+    return ensure_contrast(preferred, surface, minimum_ratio);
 }
 
 void apply_application_theme(const std::string& theme) {
@@ -72,10 +131,6 @@ void apply_application_theme(const std::string& theme,
     const QColor secondary =
         usable_color(cyber_colors.secondary, defaults.secondary);
     const bool light_background = background.lightness() > 170;
-    const QColor foreground =
-        light_background ? QColor(18, 24, 32) : QColor(237, 243, 247);
-    const QColor muted_foreground =
-        mix_color(foreground, background, light_background ? 0.30 : 0.38);
     const QColor primary_light = light_background
                                      ? mix_color(background, primary, 0.72)
                                      : mix_color(primary, QColor(255, 255, 255), 0.38);
@@ -104,12 +159,20 @@ void apply_application_theme(const std::string& theme,
     const QColor secondary_deep = light_background
                                       ? mix_color(background, secondary, 0.48)
                                       : secondary.darker(330);
-    const QColor light_text = light_background
-                                  ? foreground
-                                  : mix_color(primary, QColor(255, 255, 255), 0.72);
-    const QColor secondary_text = light_background
-                                      ? foreground
-                                      : mix_color(secondary, QColor(255, 255, 255), 0.58);
+    const QColor selection_surface = mix_color(background, secondary, 0.34);
+    const QColor foreground = ensure_contrast(
+        usable_color(cyber_colors.text, defaults.text), background_mid, 4.5);
+    const QColor muted_foreground = ensure_contrast(
+        usable_color(cyber_colors.muted_text, defaults.muted_text),
+        background_mid, 3.0);
+    const QColor light_text = ensure_contrast(
+        usable_color(cyber_colors.primary_text, defaults.primary_text),
+        background_mid, 3.4);
+    const QColor secondary_text = ensure_contrast(
+        usable_color(cyber_colors.secondary_text, defaults.secondary_text),
+        selection_surface, 3.4);
+    const QColor selection_text =
+        ensure_contrast(foreground, selection_surface, 4.5);
     QString style_sheet = QString::fromUtf8(R"(
         QWidget {
             background: #090d12;
@@ -230,12 +293,54 @@ void apply_application_theme(const std::string& theme,
             background: rgba(84, 211, 194, 38);
             color: #9dfdec;
         }
-        QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QComboBox {
+        QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QDoubleSpinBox,
+        QComboBox {
             background: rgba(17, 24, 31, 204);
             border: 1px solid rgba(255, 255, 255, 36);
             border-radius: 8px;
             padding: 5px;
             color: #edf3f7;
+        }
+        QSpinBox, QDoubleSpinBox {
+            padding: 5px 30px 5px 8px;
+            min-height: 24px;
+        }
+        QSpinBox::up-button, QDoubleSpinBox::up-button {
+            subcontrol-origin: border;
+            subcontrol-position: top right;
+            width: 25px;
+            background: rgba(31, 43, 52, 218);
+            border: 0;
+            border-left: 1px solid rgba(142, 247, 227, 54);
+            border-bottom: 1px solid rgba(142, 247, 227, 34);
+            border-top-right-radius: 7px;
+        }
+        QSpinBox::down-button, QDoubleSpinBox::down-button {
+            subcontrol-origin: border;
+            subcontrol-position: bottom right;
+            width: 25px;
+            background: rgba(31, 43, 52, 218);
+            border: 0;
+            border-left: 1px solid rgba(142, 247, 227, 54);
+            border-bottom-right-radius: 7px;
+        }
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+            background: rgba(58, 92, 94, 232);
+        }
+        QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+        QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
+            background: rgba(17, 24, 31, 238);
+        }
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+            image: url(:/materials/spin-up-light.xpm);
+            width: 9px;
+            height: 5px;
+        }
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+            image: url(:/materials/spin-down-light.xpm);
+            width: 9px;
+            height: 5px;
         }
         QWidget#SidePanel {
             background: rgba(16, 23, 31, 174);
@@ -621,6 +726,46 @@ void apply_application_theme(const std::string& theme,
                 background: @inputBackground;
                 color: @foreground;
             }
+            QSpinBox, QDoubleSpinBox {
+                padding: 5px 30px 5px 8px;
+            }
+            QSpinBox::up-button, QDoubleSpinBox::up-button {
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 25px;
+                background: @spinButtonBackground;
+                border: 0;
+                border-left: 1px solid @spinSeparator;
+                border-bottom: 1px solid @spinDivider;
+                border-top-right-radius: 6px;
+            }
+            QSpinBox::down-button, QDoubleSpinBox::down-button {
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 25px;
+                background: @spinButtonBackground;
+                border: 0;
+                border-left: 1px solid @spinSeparator;
+                border-bottom-right-radius: 6px;
+            }
+            QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+            QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+                background: @spinButtonHover;
+            }
+            QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+            QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
+                background: @spinButtonPressed;
+            }
+            QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+                image: @spinUpArrow;
+                width: 9px;
+                height: 5px;
+            }
+            QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+                image: @spinDownArrow;
+                width: 9px;
+                height: 5px;
+            }
             QTextEdit, QListView, QTreeView, QDoubleSpinBox, QDateEdit,
             QTimeEdit, QDateTimeEdit, QAbstractItemView {
                 background: @inputBackground;
@@ -669,6 +814,7 @@ void apply_application_theme(const std::string& theme,
                     stop:0 @buttonHoverPrimary,
                     stop:1 @buttonHoverSecondary);
                 border-color: @secondaryText;
+                color: @foreground;
             }
             QPushButton:pressed {
                 background: @pressedSecondary;
@@ -682,12 +828,13 @@ void apply_application_theme(const std::string& theme,
             QPushButton#StopButton, QPushButton#DangerButton {
                 background: @dangerBackground;
                 border-color: @secondaryStrongBorder;
+                color: @selectionText;
             }
             QPushButton#StopButton:hover, QPushButton#DangerButton:hover,
             QToolButton#WindowCloseButton:hover {
                 background: @dangerHover;
                 border-color: @secondaryLight;
-                color: @foreground;
+                color: @selectionText;
             }
             QMenu {
                 background: @menuPopupBackground;
@@ -783,7 +930,7 @@ void apply_application_theme(const std::string& theme,
         )");
         replace_token(cyber_accent, "@mutedForeground", muted_foreground);
         replace_token(cyber_accent, "@foreground", foreground);
-        replace_token(cyber_accent, "@selectionText", foreground);
+        replace_token(cyber_accent, "@selectionText", selection_text);
         replace_token(cyber_accent, "@selectionBackground",
                       rgba(mix_color(background, secondary, 0.34), 224));
         replace_token(cyber_accent, "@dialogBackground", rgba(background_mid, 238));
@@ -808,6 +955,22 @@ void apply_application_theme(const std::string& theme,
         replace_token(cyber_accent, "@checkboxBackground", rgba(background_mid, 190));
         replace_token(cyber_accent, "@tabPaneBackground", rgba(background_mid, 152));
         replace_token(cyber_accent, "@tabBackground", rgba(background_mid, 186));
+        replace_token(cyber_accent, "@spinButtonBackground",
+                      rgba(background_mid, 194));
+        replace_token(cyber_accent, "@spinButtonHover",
+                      rgba(mix_color(background_mid, primary, 0.24), 226));
+        replace_token(cyber_accent, "@spinButtonPressed",
+                      rgba(mix_color(background_mid, secondary, 0.16), 238));
+        replace_token(cyber_accent, "@spinSeparator", rgba(foreground, 48));
+        replace_token(cyber_accent, "@spinDivider", rgba(foreground, 28));
+        replace_token(
+            cyber_accent, "@spinUpArrow",
+            light_background ? QString("url(:/materials/spin-up-dark.xpm)")
+                             : QString("url(:/materials/spin-up-light.xpm)"));
+        replace_token(
+            cyber_accent, "@spinDownArrow",
+            light_background ? QString("url(:/materials/spin-down-dark.xpm)")
+                             : QString("url(:/materials/spin-down-light.xpm)"));
         replace_token(cyber_accent, "@primaryMenuBorder", rgba(primary_light, 76));
         replace_token(cyber_accent, "@primaryTableBorder", rgba(primary_light, 66));
         replace_token(cyber_accent, "@primaryStrongBorder", rgba(primary_light, 126));
@@ -824,8 +987,7 @@ void apply_application_theme(const std::string& theme,
         replace_token(cyber_accent, "@secondaryText", secondary_text);
         replace_token(cyber_accent, "@disabledBackground",
                       rgba(mix_color(background, primary, 0.08), 176));
-        replace_token(cyber_accent, "@disabledText",
-                      mix_color(foreground, background, 0.48));
+        replace_token(cyber_accent, "@disabledText", muted_foreground);
         replace_token(cyber_accent, "@disabledBorder",
                       rgba(mix_color(background, secondary, 0.22), 92));
         replace_token(cyber_accent, "@titlePrimary", rgba(background_dark, 218));
@@ -872,9 +1034,9 @@ void apply_application_theme(const std::string& theme,
         palette.setColor(QPalette::Text, foreground);
         palette.setColor(QPalette::Button, surface);
         palette.setColor(QPalette::ButtonText, foreground);
-        palette.setColor(QPalette::BrightText, foreground);
+        palette.setColor(QPalette::BrightText, light_text);
         palette.setColor(QPalette::Highlight, highlight);
-        palette.setColor(QPalette::HighlightedText, foreground);
+        palette.setColor(QPalette::HighlightedText, selection_text);
         palette.setColor(QPalette::PlaceholderText, muted_foreground);
         palette.setColor(QPalette::Light, primary_light);
         palette.setColor(QPalette::Midlight, surface);
