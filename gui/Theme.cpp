@@ -1,11 +1,115 @@
 #include "Theme.hpp"
 
 #include <QApplication>
+#include <QPalette>
+
+#include <algorithm>
+
+namespace {
+
+QColor usable_color(const QColor& color, const QColor& fallback) {
+    return color.isValid() ? color : fallback;
+}
+
+QColor mix_color(const QColor& first, const QColor& second, double second_weight) {
+    const double weight = std::clamp(second_weight, 0.0, 1.0);
+    const double first_weight = 1.0 - weight;
+    return QColor(
+        std::clamp(static_cast<int>(first.red() * first_weight +
+                                    second.red() * weight),
+                   0, 255),
+        std::clamp(static_cast<int>(first.green() * first_weight +
+                                    second.green() * weight),
+                   0, 255),
+        std::clamp(static_cast<int>(first.blue() * first_weight +
+                                    second.blue() * weight),
+                   0, 255));
+}
+
+QString color_hex(const QColor& color) {
+    return color.name(QColor::HexRgb);
+}
+
+QString rgba(QColor color, int alpha) {
+    color.setAlpha(std::clamp(alpha, 0, 255));
+    return QString("rgba(%1, %2, %3, %4)")
+        .arg(color.red())
+        .arg(color.green())
+        .arg(color.blue())
+        .arg(color.alpha());
+}
+
+void replace_token(QString& text, const QString& token, const QColor& color) {
+    text.replace(token, color_hex(color));
+}
+
+void replace_token(QString& text, const QString& token, const QString& color) {
+    text.replace(token, color);
+}
+
+} // namespace
 
 namespace neothemis::gui {
 
+CyberThemeColors default_cyber_theme_colors() {
+    return {QColor(13, 43, 52), QColor(83, 220, 203), QColor(211, 76, 112)};
+}
+
 void apply_application_theme(const std::string& theme) {
+    apply_application_theme(theme, default_cyber_theme_colors());
+}
+
+void apply_application_theme(const std::string& theme,
+                             const CyberThemeColors& cyber_colors) {
+    static const QPalette system_palette = qApp->palette();
+    qApp->setPalette(system_palette);
     const bool cyber = theme == "cyber" || theme == "glassy-dark";
+    QApplication::setAttribute(Qt::AA_DontUseNativeDialogs, cyber);
+    const CyberThemeColors defaults = default_cyber_theme_colors();
+    const QColor background =
+        usable_color(cyber_colors.background, defaults.background);
+    const QColor primary = usable_color(cyber_colors.primary, defaults.primary);
+    const QColor secondary =
+        usable_color(cyber_colors.secondary, defaults.secondary);
+    const bool light_background = background.lightness() > 170;
+    const QColor foreground =
+        light_background ? QColor(18, 24, 32) : QColor(237, 243, 247);
+    const QColor muted_foreground =
+        mix_color(foreground, background, light_background ? 0.30 : 0.38);
+    const QColor primary_light = light_background
+                                     ? mix_color(background, primary, 0.72)
+                                     : mix_color(primary, QColor(255, 255, 255), 0.38);
+    const QColor secondary_light = light_background
+                                       ? mix_color(background, secondary, 0.72)
+                                       : mix_color(secondary, QColor(255, 255, 255), 0.34);
+    const QColor background_dark =
+        light_background ? mix_color(background, primary, 0.08)
+                         : background.darker(210);
+    const QColor background_deep =
+        light_background ? mix_color(background, secondary, 0.14)
+                         : background.darker(310);
+    const QColor background_mid =
+        light_background
+            ? mix_color(background, mix_color(primary, secondary, 0.5), 0.05)
+            : background.darker(155);
+    const QColor primary_dark = light_background
+                                    ? mix_color(background, primary, 0.30)
+                                    : primary.darker(210);
+    const QColor secondary_dark = light_background
+                                      ? mix_color(background, secondary, 0.30)
+                                      : secondary.darker(210);
+    const QColor primary_deep = light_background
+                                    ? mix_color(background, primary, 0.48)
+                                    : primary.darker(330);
+    const QColor secondary_deep = light_background
+                                      ? mix_color(background, secondary, 0.48)
+                                      : secondary.darker(330);
+    const QColor light_text = light_background
+                                  ? foreground
+                                  : mix_color(primary, QColor(255, 255, 255), 0.72);
+    const QColor secondary_text = light_background
+                                      ? foreground
+                                      : mix_color(secondary, QColor(255, 255, 255), 0.58);
     QString style_sheet = QString::fromUtf8(R"(
         QWidget {
             background: #090d12;
@@ -452,6 +556,332 @@ void apply_application_theme(const std::string& theme) {
                 background: rgba(139, 242, 224, 168);
             }
         )");
+        QString cyber_accent = QString::fromUtf8(R"(
+            QWidget {
+                background: transparent;
+                color: @foreground;
+                selection-background-color: @selectionBackground;
+                selection-color: @selectionText;
+            }
+            QLabel {
+                background: transparent;
+                color: @foreground;
+            }
+            QLabel#WindowAppName, QMenuBar, QMenuBar::item,
+            QToolButton#WindowButton, QToolButton#WindowCloseButton {
+                background: transparent;
+                color: @foreground;
+            }
+            QLabel#ContestTitle, QLabel#JudgeElapsedLabel {
+                color: @mutedForeground;
+            }
+            QDialog, QMessageBox, QFileDialog, QColorDialog, QInputDialog {
+                background: @dialogBackground;
+                color: @foreground;
+            }
+            QDialogButtonBox, QStackedWidget, QStatusBar, QToolBar {
+                background: transparent;
+            }
+            QWidget#AppRoot {
+                border: 1px solid @secondaryBorder;
+            }
+            QWidget#WindowTitleBar {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 @titlePrimary,
+                    stop:0.58 @titleMiddle,
+                    stop:1 @titleSecondary);
+                border-bottom: 1px solid @secondaryBorder;
+            }
+            QWidget#MenuRow {
+                background: @menuRowBackground;
+                border-bottom: 1px solid @primaryMenuBorder;
+            }
+            QWidget#SidePanel {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 @panelPrimary,
+                    stop:0.55 @panelMiddle,
+                    stop:1 @panelSecondary);
+                border: 1px solid @secondaryPanelBorder;
+            }
+            QTableWidget#ScoreTable {
+                background: @scoreTableBackground;
+                alternate-background-color: @tableAlternate;
+                gridline-color: @secondaryGrid;
+                selection-background-color: @secondarySelection;
+                border: 1px solid @primaryTableBorder;
+            }
+            QGroupBox {
+                background: @groupBackground;
+                border: 1px solid @secondaryPanelBorder;
+            }
+            QGroupBox::title {
+                color: @primaryText;
+            }
+            QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QComboBox {
+                background: @inputBackground;
+                color: @foreground;
+            }
+            QTextEdit, QListView, QTreeView, QDoubleSpinBox, QDateEdit,
+            QTimeEdit, QDateTimeEdit, QAbstractItemView {
+                background: @inputBackground;
+                color: @foreground;
+                selection-background-color: @selectionBackground;
+                selection-color: @selectionText;
+            }
+            QComboBox QAbstractItemView {
+                background: @popupListBackground;
+                color: @foreground;
+                border: 1px solid @secondaryMenuBorder;
+                outline: 0;
+            }
+            QTableWidget#CoreTasksTable,
+            QTableWidget#CoreTasksTable::item {
+                background: @inputBackground;
+                color: @foreground;
+            }
+            QTableWidget#CoreTasksTable::item:selected {
+                background: @selectionBackground;
+                color: @selectionText;
+            }
+            QTableWidget::item:selected {
+                background: @selectionBackground;
+                color: @selectionText;
+            }
+            QAbstractScrollArea::corner, QTableCornerButton::section {
+                background: @inputBackground;
+                border: 0;
+            }
+            QPlainTextEdit#LogPanel {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 @logBackgroundStart,
+                    stop:1 @logBackgroundEnd);
+            }
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 @buttonPrimary,
+                    stop:0.72 @buttonMiddle,
+                    stop:1 @buttonSecondary);
+                border-color: @primaryStrongBorder;
+                color: @foreground;
+            }
+            QPushButton:hover, QToolButton#WindowButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 @buttonHoverPrimary,
+                    stop:1 @buttonHoverSecondary);
+                border-color: @secondaryText;
+            }
+            QPushButton:pressed {
+                background: @pressedSecondary;
+                border-color: @secondaryLight;
+            }
+            QPushButton:disabled {
+                background: @disabledBackground;
+                color: @disabledText;
+                border-color: @disabledBorder;
+            }
+            QPushButton#StopButton, QPushButton#DangerButton {
+                background: @dangerBackground;
+                border-color: @secondaryStrongBorder;
+            }
+            QPushButton#StopButton:hover, QPushButton#DangerButton:hover,
+            QToolButton#WindowCloseButton:hover {
+                background: @dangerHover;
+                border-color: @secondaryLight;
+                color: @foreground;
+            }
+            QMenu {
+                background: @menuPopupBackground;
+                border: 1px solid @secondaryMenuBorder;
+                color: @foreground;
+            }
+            QMenu::item {
+                background: transparent;
+                color: @foreground;
+            }
+            QMenu::separator {
+                background: @secondaryBorder;
+                height: 1px;
+                margin: 4px 10px;
+            }
+            QMenuBar::item:selected, QMenu::item:selected {
+                background: @secondarySoft;
+                color: @secondaryText;
+                border-color: @secondaryBorder;
+            }
+            QHeaderView::section {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 @headerPrimary,
+                    stop:1 @headerSecondary);
+                color: @primaryText;
+                border-bottom-color: @secondaryStrongBorder;
+            }
+            QProgressBar {
+                background: @progressBackground;
+                border-color: @secondaryBorder;
+                color: @foreground;
+            }
+            QSlider::groove:horizontal {
+                background: @sliderGroove;
+                border-color: @secondaryBorder;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 @primary,
+                    stop:0.52 @primaryLight,
+                    stop:0.8 @secondaryLight,
+                    stop:1 @secondary);
+            }
+            QSlider::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 @primary, stop:1 @secondary);
+            }
+            QSlider::handle:horizontal {
+                background: @sliderHandle;
+                border-color: @secondary;
+            }
+            QSlider::handle:horizontal:hover {
+                border-color: @secondaryLight;
+            }
+            QCheckBox::indicator:hover {
+                border-color: @primaryLight;
+            }
+            QCheckBox::indicator {
+                background: @checkboxBackground;
+            }
+            QCheckBox::indicator:checked {
+                background: @secondary;
+                border: 2px solid @primaryLight;
+            }
+            QTabWidget::pane {
+                background: @tabPaneBackground;
+                border-color: @secondaryBorder;
+            }
+            QTabBar::tab {
+                background: @tabBackground;
+                color: @foreground;
+            }
+            QTabBar::tab:selected {
+                background: @secondarySoft;
+                color: @secondaryText;
+                border-color: @secondaryStrongBorder;
+            }
+            QScrollBar::handle {
+                background: @secondaryScroll;
+            }
+            QScrollBar::handle:hover {
+                background: @primaryScrollHover;
+            }
+            QScrollBar:vertical, QScrollBar:horizontal {
+                background: @scrollBackground;
+            }
+            QToolTip {
+                background: @menuPopupBackground;
+                color: @foreground;
+                border: 1px solid @secondaryMenuBorder;
+                padding: 5px;
+            }
+        )");
+        replace_token(cyber_accent, "@mutedForeground", muted_foreground);
+        replace_token(cyber_accent, "@foreground", foreground);
+        replace_token(cyber_accent, "@selectionText", foreground);
+        replace_token(cyber_accent, "@selectionBackground",
+                      rgba(mix_color(background, secondary, 0.34), 224));
+        replace_token(cyber_accent, "@dialogBackground", rgba(background_mid, 238));
+        replace_token(cyber_accent, "@titleMiddle", rgba(background_mid, 206));
+        replace_token(cyber_accent, "@menuRowBackground", rgba(background_mid, 168));
+        replace_token(cyber_accent, "@panelMiddle", rgba(background_mid, 150));
+        replace_token(cyber_accent, "@scoreTableBackground", rgba(background_mid, 154));
+        replace_token(cyber_accent, "@groupBackground", rgba(background_mid, 142));
+        replace_token(cyber_accent, "@inputBackground", rgba(background_mid, 172));
+        replace_token(cyber_accent, "@logBackgroundStart", rgba(background_mid, 160));
+        replace_token(
+            cyber_accent, "@logBackgroundEnd",
+            rgba(mix_color(background_deep, secondary_deep, 0.36), 156));
+        replace_token(cyber_accent, "@buttonMiddle", rgba(background_mid, 194));
+        replace_token(cyber_accent, "@menuPopupBackground", rgba(background_mid, 232));
+        replace_token(cyber_accent, "@popupListBackground", rgba(background_mid, 248));
+        replace_token(cyber_accent, "@progressBackground", rgba(background_mid, 184));
+        replace_token(cyber_accent, "@sliderGroove", rgba(background_mid, 210));
+        replace_token(cyber_accent, "@sliderHandle",
+                      mix_color(background, primary, 0.72));
+        replace_token(cyber_accent, "@scrollBackground", rgba(background_mid, 120));
+        replace_token(cyber_accent, "@checkboxBackground", rgba(background_mid, 190));
+        replace_token(cyber_accent, "@tabPaneBackground", rgba(background_mid, 152));
+        replace_token(cyber_accent, "@tabBackground", rgba(background_mid, 186));
+        replace_token(cyber_accent, "@primaryMenuBorder", rgba(primary_light, 76));
+        replace_token(cyber_accent, "@primaryTableBorder", rgba(primary_light, 66));
+        replace_token(cyber_accent, "@primaryStrongBorder", rgba(primary_light, 126));
+        replace_token(cyber_accent, "@primaryScrollHover", rgba(primary_light, 168));
+        replace_token(cyber_accent, "@primaryText", light_text);
+        replace_token(cyber_accent, "@primaryLight", primary_light);
+        replace_token(cyber_accent, "@secondaryPanelBorder", rgba(secondary_light, 70));
+        replace_token(cyber_accent, "@secondaryStrongBorder", rgba(secondary_light, 140));
+        replace_token(cyber_accent, "@secondaryMenuBorder", rgba(secondary_light, 88));
+        replace_token(cyber_accent, "@secondarySelection", rgba(secondary_dark, 184));
+        replace_token(cyber_accent, "@secondaryScroll", rgba(secondary_light, 104));
+        replace_token(cyber_accent, "@secondaryBorder", rgba(secondary_light, 70));
+        replace_token(cyber_accent, "@secondaryLight", secondary_light);
+        replace_token(cyber_accent, "@secondaryText", secondary_text);
+        replace_token(cyber_accent, "@disabledBackground",
+                      rgba(mix_color(background, primary, 0.08), 176));
+        replace_token(cyber_accent, "@disabledText",
+                      mix_color(foreground, background, 0.48));
+        replace_token(cyber_accent, "@disabledBorder",
+                      rgba(mix_color(background, secondary, 0.22), 92));
+        replace_token(cyber_accent, "@titlePrimary", rgba(background_dark, 218));
+        replace_token(cyber_accent, "@titleSecondary",
+                      rgba(mix_color(background_deep, secondary_deep, 0.58), 214));
+        replace_token(cyber_accent, "@panelPrimary",
+                      rgba(mix_color(background_dark, primary_deep, 0.18), 168));
+        replace_token(cyber_accent, "@panelSecondary",
+                      rgba(mix_color(background_deep, secondary_deep, 0.62), 158));
+        replace_token(cyber_accent, "@tableAlternate",
+                      rgba(mix_color(background_deep, secondary_deep, 0.35), 158));
+        replace_token(cyber_accent, "@secondaryGrid", rgba(secondary_light, 36));
+        replace_token(cyber_accent, "@buttonPrimary",
+                      rgba(mix_color(background_dark, primary_dark, 0.42), 198));
+        replace_token(cyber_accent, "@buttonSecondary",
+                      rgba(mix_color(background_deep, secondary_dark, 0.44), 198));
+        replace_token(cyber_accent, "@buttonHoverPrimary",
+                      rgba(mix_color(background_dark, primary_dark, 0.62), 224));
+        replace_token(cyber_accent, "@buttonHoverSecondary",
+                      rgba(mix_color(background_deep, secondary_dark, 0.62), 224));
+        replace_token(cyber_accent, "@pressedSecondary", rgba(secondary_deep, 232));
+        replace_token(cyber_accent, "@dangerBackground", rgba(secondary_dark, 212));
+        replace_token(cyber_accent, "@dangerHover", rgba(secondary, 230));
+        replace_token(cyber_accent, "@secondarySoft", rgba(secondary, 46));
+        replace_token(cyber_accent, "@headerPrimary", rgba(primary_dark, 218));
+        replace_token(cyber_accent, "@headerSecondary", rgba(secondary_dark, 218));
+        replace_token(cyber_accent, "@primary", primary);
+        replace_token(cyber_accent, "@secondary", secondary);
+        style_sheet += cyber_accent;
+
+        QPalette palette = system_palette;
+        const QColor surface = mix_color(background, mix_color(primary, secondary, 0.5),
+                                         light_background ? 0.05 : 0.12);
+        const QColor alternate_surface =
+            mix_color(background, secondary, light_background ? 0.10 : 0.20);
+        const QColor highlight =
+            mix_color(background, secondary, light_background ? 0.34 : 0.54);
+        palette.setColor(QPalette::Window, background);
+        palette.setColor(QPalette::WindowText, foreground);
+        palette.setColor(QPalette::Base, surface);
+        palette.setColor(QPalette::AlternateBase, alternate_surface);
+        palette.setColor(QPalette::ToolTipBase, surface);
+        palette.setColor(QPalette::ToolTipText, foreground);
+        palette.setColor(QPalette::Text, foreground);
+        palette.setColor(QPalette::Button, surface);
+        palette.setColor(QPalette::ButtonText, foreground);
+        palette.setColor(QPalette::BrightText, foreground);
+        palette.setColor(QPalette::Highlight, highlight);
+        palette.setColor(QPalette::HighlightedText, foreground);
+        palette.setColor(QPalette::PlaceholderText, muted_foreground);
+        palette.setColor(QPalette::Light, primary_light);
+        palette.setColor(QPalette::Midlight, surface);
+        palette.setColor(QPalette::Mid, alternate_surface);
+        palette.setColor(QPalette::Dark, alternate_surface);
+        palette.setColor(QPalette::Shadow, background);
+        qApp->setPalette(palette);
     }
 
     qApp->setStyleSheet(style_sheet);

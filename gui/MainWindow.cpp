@@ -18,6 +18,7 @@
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QColor>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -26,7 +27,6 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGraphicsDropShadowEffect>
-#include <QGuiApplication>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -40,8 +40,6 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
-#include <QMoveEvent>
-#include <QPainter>
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QProgressBar>
@@ -50,7 +48,6 @@
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
-#include <QScreen>
 #include <QSettings>
 #include <QShowEvent>
 #include <QSpinBox>
@@ -66,13 +63,6 @@
 #include <QVariant>
 #include <QVBoxLayout>
 #include <QWindow>
-
-#ifdef Q_OS_WIN
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -96,10 +86,37 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr int kBackgroundBlurVisualStrength = 72;
-constexpr int kBackdropRealignDelayMs = 100;
-constexpr int kDesktopBackdropScale = 2;
-constexpr int kDesktopBackdropBlurDownscale = 2;
-constexpr int kDesktopBackdropBlurPasses = 3;
+
+QColor blend_theme_colors(const QColor& background,
+                          const QColor& primary,
+                          const QColor& secondary,
+                          double primary_weight,
+                          double secondary_weight) {
+    const double primary_part = std::clamp(primary_weight, 0.0, 1.0);
+    const double secondary_part =
+        std::clamp(secondary_weight, 0.0, 1.0 - primary_part);
+    const double background_part = 1.0 - primary_part - secondary_part;
+    return QColor(
+        std::clamp(static_cast<int>(background.red() * background_part +
+                                    primary.red() * primary_part +
+                                    secondary.red() * secondary_part),
+                   0, 255),
+        std::clamp(static_cast<int>(background.green() * background_part +
+                                    primary.green() * primary_part +
+                                    secondary.green() * secondary_part),
+                   0, 255),
+        std::clamp(static_cast<int>(background.blue() * background_part +
+                                    primary.blue() * primary_part +
+                                    secondary.blue() * secondary_part),
+                   0, 255));
+}
+
+QColor readable_theme_text(const QColor& surface) {
+    const int luminance =
+        (surface.red() * 299 + surface.green() * 587 + surface.blue() * 114) /
+        1000;
+    return luminance > 150 ? QColor(18, 24, 32) : QColor(237, 243, 247);
+}
 
 struct CellScore {
     double earned = 0.0;
@@ -303,16 +320,6 @@ public:
         setCentralWidget(central);
         neothemis::gui::install_windows_resize_handles(this);
         side_panel_ = side;
-        backdrop_realign_timer_ = new QTimer(this);
-        backdrop_realign_timer_->setSingleShot(true);
-        QObject::connect(backdrop_realign_timer_, &QTimer::timeout, [this]() {
-            if (!background_layer_) {
-                return;
-            }
-            background_layer_->unfreeze_desktop_backdrop_alignment();
-            background_layer_->update();
-        });
-        refresh_windows_desktop_backdrop();
         apply_selected_theme();
 
         QObject::connect(judge_selected_button_, &QPushButton::clicked, [this]() { start_judge(true); });
@@ -343,6 +350,7 @@ public:
     }
 
     ~MainWindow() override {
+        neothemis::gui::release_windows_backdrop(this);
         stop_local_server(false);
         stop_active_judge();
         join_archive_thread();
@@ -366,9 +374,6 @@ protected:
             if (event->type() == QEvent::MouseButtonPress) {
                 auto* mouse = static_cast<QMouseEvent*>(event);
                 if (mouse->button() == Qt::LeftButton) {
-                    if (background_layer_ && background_blur_active()) {
-                        background_layer_->freeze_desktop_backdrop_alignment();
-                    }
                     if (QWindow* handle = windowHandle(); handle &&
                         handle->startSystemMove()) {
                         dragging_title_bar_ = false;
@@ -388,7 +393,6 @@ protected:
             }
             if (event->type() == QEvent::MouseButtonRelease) {
                 dragging_title_bar_ = false;
-                schedule_backdrop_realign(0);
             }
         }
         return QMainWindow::eventFilter(watched, event);
@@ -418,48 +422,23 @@ protected:
         schedule_backdrop_startup_passes();
     }
 
-    void moveEvent(QMoveEvent* event) override {
-        QMainWindow::moveEvent(event);
-        if (background_layer_ && background_blur_active()) {
-            background_layer_->freeze_desktop_backdrop_alignment();
-            schedule_backdrop_realign(kBackdropRealignDelayMs);
-        }
-    }
-
     bool nativeEvent(const QByteArray& event_type,
                      void* message,
                      qintptr* result) override {
 #ifdef Q_OS_WIN
-        if ((event_type == "windows_generic_MSG" ||
-             event_type == "windows_dispatcher_MSG") &&
-            message) {
-            const auto* native_message = static_cast<MSG*>(message);
-            if (native_message->message == WM_ENTERSIZEMOVE &&
-                background_layer_ && background_blur_active()) {
-                background_layer_->freeze_desktop_backdrop_alignment();
-            } else if (native_message->message == WM_EXITSIZEMOVE) {
-                schedule_backdrop_realign(0);
-            }
-        }
-#else
-        (void)event_type;
-        (void)message;
-        (void)result;
-#endif
-        return QMainWindow::nativeEvent(event_type, message, result);
-    }
-
-    void changeEvent(QEvent* event) override {
-        QMainWindow::changeEvent(event);
-#ifdef Q_OS_WIN
-        if (event->type() == QEvent::WindowStateChange && isMinimized()) {
-            QTimer::singleShot(150, this, [this]() {
-                if (isMinimized()) {
-                    refresh_windows_desktop_backdrop();
+        if (background_blur_active() &&
+            neothemis::gui::windows_backdrop_message_requires_refresh(message) &&
+            !backdrop_refresh_queued_) {
+            backdrop_refresh_queued_ = true;
+            QTimer::singleShot(0, this, [this]() {
+                backdrop_refresh_queued_ = false;
+                if (background_blur_active()) {
+                    apply_native_backdrop(true);
                 }
             });
         }
 #endif
+        return QMainWindow::nativeEvent(event_type, message, result);
     }
 
 private:
@@ -477,6 +456,17 @@ private:
                neothemis::gui::native_background_blur_supported();
     }
 
+    neothemis::gui::CyberThemeColors cyber_theme_colors() const {
+        return {cyber_background_color_, cyber_primary_color_,
+                cyber_secondary_color_};
+    }
+
+    static QColor color_setting_or_default(const QVariant& value,
+                                           const QColor& fallback) {
+        const QColor color(value.toString());
+        return color.isValid() ? color : fallback;
+    }
+
     void load_app_settings() {
         QSettings settings("NeoThemis", "NeoThemis");
         language_ = settings.value("language", "en").toString().toStdString();
@@ -490,6 +480,20 @@ private:
         if (theme_ != "cyber") {
             theme_ = "dark";
         }
+        const neothemis::gui::CyberThemeColors default_cyber_colors =
+            neothemis::gui::default_cyber_theme_colors();
+        cyber_background_color_ = color_setting_or_default(
+            settings.value("cyber_background_color",
+                           default_cyber_colors.background.name(QColor::HexRgb)),
+            default_cyber_colors.background);
+        cyber_primary_color_ = color_setting_or_default(
+            settings.value("cyber_primary_color",
+                           default_cyber_colors.primary.name(QColor::HexRgb)),
+            default_cyber_colors.primary);
+        cyber_secondary_color_ = color_setting_or_default(
+            settings.value("cyber_secondary_color",
+                           default_cyber_colors.secondary.name(QColor::HexRgb)),
+            default_cyber_colors.secondary);
         transparent_background_ = settings.value("transparent_background", false).toBool();
         background_transparency_ =
             std::clamp(settings.value("background_transparency", 20).toInt(), 0, 95);
@@ -516,6 +520,12 @@ private:
         QSettings settings("NeoThemis", "NeoThemis");
         settings.setValue("language", QString::fromStdString(language_));
         settings.setValue("theme", QString::fromStdString(theme_));
+        settings.setValue("cyber_background_color",
+                          cyber_background_color_.name(QColor::HexRgb));
+        settings.setValue("cyber_primary_color",
+                          cyber_primary_color_.name(QColor::HexRgb));
+        settings.setValue("cyber_secondary_color",
+                          cyber_secondary_color_.name(QColor::HexRgb));
         settings.setValue("transparent_background", transparent_background_);
         settings.setValue("background_transparency", background_transparency_);
         settings.setValue("blur_background", blur_background_);
@@ -650,6 +660,7 @@ private:
                             export_menu, converter_menu, settings_menu, help_menu}) {
             menu->setAttribute(Qt::WA_TranslucentBackground);
             menu->setWindowFlag(Qt::NoDropShadowWindowHint, true);
+            menu->setWindowFlag(Qt::FramelessWindowHint, true);
         }
     }
 
@@ -681,120 +692,75 @@ private:
         }
     }
 
-    void schedule_backdrop_realign(int delay_ms) {
-        if (!background_layer_ || !background_blur_active()) {
-            return;
-        }
-        if (!backdrop_realign_timer_) {
-            background_layer_->unfreeze_desktop_backdrop_alignment();
-            background_layer_->update();
-            return;
-        }
-        backdrop_realign_timer_->start(std::max(0, delay_ms));
-    }
-
-    void refresh_windows_desktop_backdrop() {
-#ifdef Q_OS_WIN
-        if (!background_layer_) {
-            return;
-        }
-        const QList<QScreen*> screens = QGuiApplication::screens();
-        if (screens.isEmpty()) {
-            return;
-        }
-
-        QRect virtual_geometry;
-        for (QScreen* screen : screens) {
-            virtual_geometry = virtual_geometry.united(screen->geometry());
-        }
-        if (virtual_geometry.isEmpty()) {
-            return;
-        }
-
-        const auto scaled_size = [=](const QSize& size) {
-            return QSize(
-                std::max(1, (size.width() + kDesktopBackdropScale - 1) /
-                                kDesktopBackdropScale),
-                std::max(1, (size.height() + kDesktopBackdropScale - 1) /
-                                kDesktopBackdropScale));
-        };
-        QPixmap desktop(scaled_size(virtual_geometry.size()));
-        desktop.fill(Qt::transparent);
-        QPainter painter(&desktop);
-        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
-        for (QScreen* screen : screens) {
-            const QPixmap capture = screen->grabWindow(0);
-            const QRect screen_geometry =
-                screen->geometry().translated(-virtual_geometry.topLeft());
-            const QRect target(
-                screen_geometry.x() / kDesktopBackdropScale,
-                screen_geometry.y() / kDesktopBackdropScale,
-                (screen_geometry.x() + screen_geometry.width() +
-                 kDesktopBackdropScale - 1) /
-                        kDesktopBackdropScale -
-                    screen_geometry.x() / kDesktopBackdropScale,
-                (screen_geometry.y() + screen_geometry.height() +
-                 kDesktopBackdropScale - 1) /
-                        kDesktopBackdropScale -
-                    screen_geometry.y() / kDesktopBackdropScale);
-            painter.drawPixmap(target, capture, capture.rect());
-        }
-        painter.end();
-
-        for (int pass = 0; pass < kDesktopBackdropBlurPasses; ++pass) {
-            const QSize softened_size(
-                std::max(1, desktop.width() / kDesktopBackdropBlurDownscale),
-                std::max(1, desktop.height() / kDesktopBackdropBlurDownscale));
-            QPixmap softened(softened_size);
-            softened.fill(Qt::transparent);
-
-            QPainter downsample(&softened);
-            downsample.setRenderHint(QPainter::SmoothPixmapTransform, true);
-            downsample.drawPixmap(softened.rect(), desktop, desktop.rect());
-            downsample.end();
-
-            desktop.fill(Qt::transparent);
-            QPainter upsample(&desktop);
-            upsample.setRenderHint(QPainter::SmoothPixmapTransform, true);
-            upsample.drawPixmap(desktop.rect(), softened, softened.rect());
-            upsample.end();
-        }
-
-        background_layer_->set_desktop_backdrop(
-            desktop, virtual_geometry.topLeft(), kDesktopBackdropScale);
-#endif
-    }
-
     void apply_selected_theme() {
         const bool cyber = theme_ == "cyber";
         const bool transparent = background_transparency_active();
-        const bool blurred = transparent && background_blur_active();
+        const neothemis::gui::CyberThemeColors cyber_colors =
+            cyber_theme_colors();
         apply_translucent_surface_attributes();
-        neothemis::gui::apply_application_theme(theme_);
-        apply_native_backdrop(false);
+        neothemis::gui::apply_application_theme(theme_, cyber_colors);
+        const bool native_blur_active = apply_native_backdrop(false);
         int opacity = transparent ? 255 * (100 - background_transparency_) / 100 : 255;
-        if (blurred) {
+        if (native_blur_active) {
             opacity = opacity *
                       (100 - std::min(55, kBackgroundBlurVisualStrength / 4)) / 100;
         }
         if (background_layer_) {
             background_layer_->set_appearance(theme_, opacity,
-                                              blurred ? kBackgroundBlurVisualStrength : 0);
+                                              native_blur_active
+                                                  ? kBackgroundBlurVisualStrength
+                                                  : 0,
+                                              cyber_colors);
         }
+        const bool light_cyber = cyber_colors.background.lightness() > 170;
+        QColor cyber_table_shadow =
+            light_cyber
+                ? blend_theme_colors(cyber_colors.background, cyber_colors.primary,
+                                     cyber_colors.secondary, 0.08, 0.18)
+                : cyber_colors.secondary.darker(260);
+        cyber_table_shadow.setAlpha(light_cyber ? 72 : 178);
+        QColor cyber_side_shadow =
+            light_cyber
+                ? blend_theme_colors(cyber_colors.background, cyber_colors.primary,
+                                     cyber_colors.secondary, 0.16, 0.10)
+                : cyber_colors.secondary.darker(230);
+        cyber_side_shadow.setAlpha(light_cyber ? 78 : 188);
         add_soft_shadow(table_, cyber ? 56 : 34,
-                        cyber ? QColor(55, 8, 32, 178) : QColor(0, 0, 0, 120));
+                        cyber ? cyber_table_shadow : QColor(0, 0, 0, 120));
         add_soft_shadow(side_panel_, cyber ? 60 : 36,
-                        cyber ? QColor(72, 10, 39, 188) : QColor(0, 0, 0, 135));
+                        cyber ? cyber_side_shadow : QColor(0, 0, 0, 135));
+        for (std::size_t row = 0; row < contestants_.size(); ++row) {
+            if (auto* name = table_->item(static_cast<int>(row), 0)) {
+                style_name_item(name);
+            }
+            for (std::size_t column = 0; column < problems_.size(); ++column) {
+                if (auto* item = table_->item(static_cast<int>(row),
+                                              static_cast<int>(column + 1))) {
+                    style_problem_item(contestants_[row], problems_[column], item);
+                }
+            }
+            if (auto* total = table_->item(static_cast<int>(row), total_column())) {
+                style_total_item(contestants_[row], total);
+            }
+        }
     }
 
-    void apply_native_backdrop(bool force_compositor_update) {
+    bool apply_native_backdrop(bool force_compositor_update) {
         const bool transparent = background_transparency_active();
         const bool blurred = transparent && background_blur_active();
-        neothemis::gui::apply_windows_backdrop(
-            this, transparent, blurred, force_compositor_update);
+        const int tint_opacity =
+            std::clamp(96 - background_transparency_, 20, 96);
+        return neothemis::gui::apply_windows_backdrop(
+            this, transparent, blurred, cyber_background_color_, tint_opacity,
+            force_compositor_update);
     }
 
     void schedule_backdrop_startup_passes() {
+#ifdef Q_OS_WIN
+        // DWM owns the Windows backdrop and tracks movement without app-side
+        // polling or repaint passes. showEvent already applied it once.
+        return;
+#else
         // Native compositors register a newly shown window asynchronously.
         // Reassert the current state after registration and window-rule handling.
         for (int delay_ms : {0, 75, 250, 700}) {
@@ -808,6 +774,7 @@ private:
                 }
             });
         }
+#endif
     }
 
     QString generated_server_secret(int chars) const {
@@ -1622,15 +1589,6 @@ private:
         QPushButton* close_anyway_button =
             box.addButton(text("close_anyway"), QMessageBox::DestructiveRole);
         close_anyway_button->setObjectName("DangerButton");
-        close_anyway_button->setStyleSheet(
-            "QPushButton#DangerButton {"
-            "background: rgba(138, 35, 55, 220);"
-            "border: 1px solid rgba(255, 121, 145, 180);"
-            "color: white; border-radius: 8px; padding: 8px 12px; font-weight: 700;"
-            "}"
-            "QPushButton#DangerButton:hover {"
-            "background: rgba(180, 47, 72, 235); border-color: #ff9aae;"
-            "}");
         box.setDefaultButton(save_button);
         box.exec();
 
@@ -2563,6 +2521,14 @@ private:
         if (!item) {
             return;
         }
+        if (theme_ == "cyber") {
+            const QColor surface = blend_theme_colors(
+                cyber_background_color_, cyber_primary_color_,
+                cyber_secondary_color_, 0.08, 0.0);
+            item->setForeground(readable_theme_text(surface));
+            item->setBackground(surface);
+            return;
+        }
         item->setForeground(QColor("#e7fbff"));
         item->setBackground(QColor("#151b23"));
     }
@@ -2575,7 +2541,19 @@ private:
         }
         std::string key = cell_key(contestant, problem);
         QString terminal_status = terminal_status_for_cell(contestant, problem);
+        auto apply_cyber_surface = [this, item](double primary_weight,
+                                               double secondary_weight) {
+            const QColor surface = blend_theme_colors(
+                cyber_background_color_, cyber_primary_color_,
+                cyber_secondary_color_, primary_weight, secondary_weight);
+            item->setForeground(readable_theme_text(surface));
+            item->setBackground(surface);
+        };
         if (!terminal_status.isEmpty()) {
+            if (theme_ == "cyber") {
+                apply_cyber_surface(0.0, 0.22);
+                return;
+            }
             item->setForeground(QColor("#ff8fab"));
             item->setBackground(QColor("#30151f"));
             return;
@@ -2589,15 +2567,31 @@ private:
                 expected = expected_it->second;
             }
             if (score.completed < expected) {
+                if (theme_ == "cyber") {
+                    apply_cyber_surface(0.18, 0.0);
+                    return;
+                }
                 item->setForeground(QColor("#7df9ff"));
                 item->setBackground(QColor("#122631"));
             } else if (score.max > 0.0 && score.earned + 1e-9 >= score.max) {
+                if (theme_ == "cyber") {
+                    apply_cyber_surface(0.24, 0.0);
+                    return;
+                }
                 item->setForeground(QColor("#99ffcc"));
                 item->setBackground(QColor("#123028"));
             } else if (score.earned > 0.0) {
+                if (theme_ == "cyber") {
+                    apply_cyber_surface(0.10, 0.10);
+                    return;
+                }
                 item->setForeground(QColor("#ffe680"));
                 item->setBackground(QColor("#302512"));
             } else {
+                if (theme_ == "cyber") {
+                    apply_cyber_surface(0.0, 0.18);
+                    return;
+                }
                 item->setForeground(QColor("#ff8fab"));
                 item->setBackground(QColor("#30151f"));
             }
@@ -2606,15 +2600,27 @@ private:
 
         QString text = item->text().toLower();
         if (text.contains(this->text("queued").toLower()) || text.contains("queued")) {
+            if (theme_ == "cyber") {
+                apply_cyber_surface(0.10, 0.10);
+                return;
+            }
             item->setForeground(QColor("#ffe680"));
             item->setBackground(QColor("#2a2412"));
             return;
         }
         auto source_it = source_ready_.find(key);
         if (source_it != source_ready_.end() && source_it->second) {
+            if (theme_ == "cyber") {
+                apply_cyber_surface(0.16, 0.0);
+                return;
+            }
             item->setForeground(QColor("#7df9ff"));
             item->setBackground(QColor("#122631"));
         } else {
+            if (theme_ == "cyber") {
+                apply_cyber_surface(0.0, 0.16);
+                return;
+            }
             item->setForeground(QColor("#ff8fab"));
             item->setBackground(QColor("#281821"));
         }
@@ -2626,13 +2632,33 @@ private:
         }
         double earned = total_earned_for(contestant);
         double max = total_max_for(contestant);
+        auto apply_cyber_surface = [this, item](double primary_weight,
+                                               double secondary_weight) {
+            const QColor surface = blend_theme_colors(
+                cyber_background_color_, cyber_primary_color_,
+                cyber_secondary_color_, primary_weight, secondary_weight);
+            item->setForeground(readable_theme_text(surface));
+            item->setBackground(surface);
+        };
         if (max > 0.0 && earned + 1e-9 >= max) {
+            if (theme_ == "cyber") {
+                apply_cyber_surface(0.24, 0.0);
+                return;
+            }
             item->setForeground(QColor("#99ffcc"));
             item->setBackground(QColor("#102a24"));
         } else if (earned > 0.0) {
+            if (theme_ == "cyber") {
+                apply_cyber_surface(0.10, 0.10);
+                return;
+            }
             item->setForeground(QColor("#ffe680"));
             item->setBackground(QColor("#2c2312"));
         } else {
+            if (theme_ == "cyber") {
+                apply_cyber_surface(0.14, 0.0);
+                return;
+            }
             item->setForeground(QColor("#7df9ff"));
             item->setBackground(QColor("#121f2a"));
         }
@@ -2807,6 +2833,9 @@ private:
         }
         std::string problem = problems_[static_cast<std::size_t>(section - 1)];
         QMenu menu(this);
+        menu.setAttribute(Qt::WA_TranslucentBackground);
+        menu.setWindowFlag(Qt::NoDropShadowWindowHint, true);
+        menu.setWindowFlag(Qt::FramelessWindowHint, true);
         menu.addAction("Judge this problem for selected contestants",
                        [this, problem]() { start_judge(true, problem); });
         menu.addAction("Judge this problem for all contestants",
@@ -3134,6 +3163,61 @@ private:
         if (theme_index >= 0) {
             theme->setCurrentIndex(theme_index);
         }
+        auto* cyber_colors_label = new QLabel(text("cyber_colors"), tab);
+        auto* cyber_colors_widget = new QWidget(tab);
+        cyber_colors_widget->setObjectName("InlineControl");
+        auto* cyber_colors_layout = new QHBoxLayout(cyber_colors_widget);
+        cyber_colors_layout->setContentsMargins(0, 0, 0, 0);
+        cyber_colors_layout->setSpacing(10);
+        auto* cyber_background = new QPushButton(cyber_colors_widget);
+        auto* cyber_primary = new QPushButton(cyber_colors_widget);
+        auto* cyber_secondary = new QPushButton(cyber_colors_widget);
+        auto* reset_cyber_colors = new QPushButton(text("reset_cyber_colors"),
+                                                   cyber_colors_widget);
+        cyber_colors_layout->addWidget(cyber_background);
+        cyber_colors_layout->addWidget(cyber_primary);
+        cyber_colors_layout->addWidget(cyber_secondary);
+        cyber_colors_layout->addWidget(reset_cyber_colors);
+        cyber_colors_layout->addStretch(1);
+        auto color_text = [](const QColor& background) {
+            const int luminance =
+                (background.red() * 299 + background.green() * 587 +
+                 background.blue() * 114) /
+                1000;
+            return luminance > 150 ? QColor(12, 17, 26) : QColor(244, 255, 252);
+        };
+        auto set_color_button = [color_text](QPushButton* button,
+                                             const QString& label,
+                                             const QColor& color) {
+            button->setProperty("selectedColor", color);
+            button->setText(label + ": " + color.name(QColor::HexRgb).toUpper());
+            button->setMinimumWidth(150);
+            button->setStyleSheet(
+                QString("QPushButton {"
+                        "background: %1;"
+                        "color: %2;"
+                        "border: 1px solid rgba(255, 255, 255, 96);"
+                        "border-radius: 8px;"
+                        "padding: 8px 12px;"
+                        "font-weight: 800;"
+                        "}"
+                        "QPushButton:hover {"
+                        "border: 1px solid rgba(255, 255, 255, 190);"
+                        "}")
+                    .arg(color.name(QColor::HexRgb),
+                         color_text(color).name(QColor::HexRgb)));
+        };
+        auto selected_color = [](const QPushButton* button) {
+            const QVariant value = button->property("selectedColor");
+            const QColor color = value.value<QColor>();
+            return color.isValid() ? color : QColor();
+        };
+        set_color_button(cyber_background, text("cyber_background_color"),
+                         cyber_background_color_);
+        set_color_button(cyber_primary, text("cyber_primary_color"),
+                         cyber_primary_color_);
+        set_color_button(cyber_secondary, text("cyber_secondary_color"),
+                         cyber_secondary_color_);
         auto* transparent_background = new QCheckBox(tab);
         transparent_background->setChecked(transparent_background_);
         auto* transparency_widget = new QWidget(tab);
@@ -3160,6 +3244,7 @@ private:
         blur_background->setChecked(
             blur_supported && transparency_active && blur_background_);
         blur_background->setEnabled(blur_supported && transparency_active);
+        blur_background->setVisible(blur_supported);
 
         auto* language = new QComboBox(tab);
         language->addItem(text("english"), "en");
@@ -3186,6 +3271,7 @@ private:
         association->setEnabled(!association_registered);
 
         form->addRow(text("theme"), theme);
+        form->addRow(cyber_colors_label, cyber_colors_widget);
         form->addRow(text("transparent_background"), transparent_background);
         form->addRow(text("background_transparency"), transparency_widget);
         if (blur_supported) {
@@ -3205,16 +3291,92 @@ private:
         });
 
         auto apply_visual_preview = [this, theme, transparent_background,
-                                     transparency, blur_background]() {
+                                     transparency, blur_background,
+                                     cyber_background, cyber_primary,
+                                     cyber_secondary, selected_color]() {
             theme_ = theme->currentData().toString().toStdString();
+            const QColor background = selected_color(cyber_background);
+            const QColor primary = selected_color(cyber_primary);
+            const QColor secondary = selected_color(cyber_secondary);
+            if (background.isValid()) {
+                cyber_background_color_ = background;
+            }
+            if (primary.isValid()) {
+                cyber_primary_color_ = primary;
+            }
+            if (secondary.isValid()) {
+                cyber_secondary_color_ = secondary;
+            }
             transparent_background_ = transparent_background->isChecked();
             background_transparency_ = transparency->value();
             blur_background_ = blur_background->isChecked();
             apply_selected_theme();
         };
+        auto update_cyber_color_visibility =
+            [theme, cyber_colors_label, cyber_colors_widget]() {
+                const bool visible =
+                    theme->currentData().toString().toStdString() == "cyber";
+                cyber_colors_label->setVisible(visible);
+                cyber_colors_widget->setVisible(visible);
+            };
+        update_cyber_color_visibility();
 
         QObject::connect(theme, &QComboBox::currentTextChanged,
-                         [apply_visual_preview](const QString&) { apply_visual_preview(); });
+                         [apply_visual_preview,
+                          update_cyber_color_visibility](const QString&) {
+                             update_cyber_color_visibility();
+                             apply_visual_preview();
+                         });
+        auto pick_cyber_color = [this, set_color_button, apply_visual_preview](
+                                    QPushButton* button,
+                                    const QString& label,
+                                    const char* title_key) {
+            const QColor current =
+                button->property("selectedColor").value<QColor>();
+            const QColor chosen = QColorDialog::getColor(
+                current.isValid() ? current : QColor(255, 255, 255),
+                this, text(title_key), QColorDialog::DontUseNativeDialog);
+            if (!chosen.isValid()) {
+                return;
+            }
+            set_color_button(button, label, chosen);
+            apply_visual_preview();
+        };
+        QObject::connect(cyber_background, &QPushButton::clicked,
+                         [pick_cyber_color, cyber_background, this]() {
+                             pick_cyber_color(cyber_background,
+                                              text("cyber_background_color"),
+                                              "cyber_background_color");
+                         });
+        QObject::connect(cyber_primary, &QPushButton::clicked,
+                         [pick_cyber_color, cyber_primary, this]() {
+                             pick_cyber_color(cyber_primary,
+                                              text("cyber_primary_color"),
+                                              "cyber_primary_color");
+                         });
+        QObject::connect(cyber_secondary, &QPushButton::clicked,
+                         [pick_cyber_color, cyber_secondary, this]() {
+                             pick_cyber_color(cyber_secondary,
+                                              text("cyber_secondary_color"),
+                                              "cyber_secondary_color");
+                         });
+        QObject::connect(reset_cyber_colors, &QPushButton::clicked,
+                         [this, set_color_button, cyber_background,
+                          cyber_primary, cyber_secondary,
+                          apply_visual_preview]() {
+                             const neothemis::gui::CyberThemeColors defaults =
+                                 neothemis::gui::default_cyber_theme_colors();
+                             set_color_button(cyber_background,
+                                              text("cyber_background_color"),
+                                              defaults.background);
+                             set_color_button(cyber_primary,
+                                              text("cyber_primary_color"),
+                                              defaults.primary);
+                             set_color_button(cyber_secondary,
+                                              text("cyber_secondary_color"),
+                                              defaults.secondary);
+                             apply_visual_preview();
+                         });
         QObject::connect(transparent_background, &QCheckBox::toggled,
                          [transparency, blur_background, blur_supported,
                           apply_visual_preview](bool enabled) {
@@ -3247,9 +3409,23 @@ private:
                          });
 
         auto persist = [this, theme, transparent_background, transparency,
-                        blur_background, language, temp_dir](bool notify) {
+                        blur_background, language, temp_dir, cyber_background,
+                        cyber_primary, cyber_secondary,
+                        selected_color](bool notify) {
             try {
                 theme_ = theme->currentData().toString().toStdString();
+                const QColor background = selected_color(cyber_background);
+                const QColor primary = selected_color(cyber_primary);
+                const QColor secondary = selected_color(cyber_secondary);
+                if (background.isValid()) {
+                    cyber_background_color_ = background;
+                }
+                if (primary.isValid()) {
+                    cyber_primary_color_ = primary;
+                }
+                if (secondary.isValid()) {
+                    cyber_secondary_color_ = secondary;
+                }
                 transparent_background_ = transparent_background->isChecked();
                 background_transparency_ = transparency->value();
                 blur_background_ = blur_background->isChecked();
@@ -3924,9 +4100,16 @@ private:
     std::string tests_dir_ = "tests";
     std::string language_ = "en";
     std::string theme_ = "dark";
+    QColor cyber_background_color_ =
+        neothemis::gui::default_cyber_theme_colors().background;
+    QColor cyber_primary_color_ =
+        neothemis::gui::default_cyber_theme_colors().primary;
+    QColor cyber_secondary_color_ =
+        neothemis::gui::default_cyber_theme_colors().secondary;
     bool transparent_background_ = false;
     int background_transparency_ = 20;
     bool blur_background_ = false;
+    bool backdrop_refresh_queued_ = false;
     fs::path temporary_dir_;
     int server_port_ = 8080;
     bool server_allow_lan_ = false;
@@ -3973,7 +4156,6 @@ private:
     QProgressBar* progress_ = nullptr;
     QLabel* judge_elapsed_label_ = nullptr;
     QTimer* judge_elapsed_update_timer_ = nullptr;
-    QTimer* backdrop_realign_timer_ = nullptr;
     QElapsedTimer judge_elapsed_clock_;
     qint64 last_judge_elapsed_ms_ = 0;
     QPlainTextEdit* log_ = nullptr;
