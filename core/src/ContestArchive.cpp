@@ -1,4 +1,5 @@
 #include "neothemis/ContestArchive.hpp"
+#include "neothemis/Config.hpp"
 
 #include <algorithm>
 #include <array>
@@ -96,27 +97,8 @@ std::string lower_ascii(std::string value) {
     return value;
 }
 
-std::string normalized_number(std::string value) {
-    std::size_t first_non_zero = value.find_first_not_of('0');
-    if (first_non_zero == std::string::npos) {
-        return "0";
-    }
-    return value.substr(first_non_zero);
-}
-
 std::string point_key_for_test_name(const std::string& test_name) {
-    std::string digits;
-    for (auto it = test_name.rbegin(); it != test_name.rend(); ++it) {
-        if (!std::isdigit(static_cast<unsigned char>(*it))) {
-            break;
-        }
-        digits.push_back(*it);
-    }
-    if (digits.empty()) {
-        return test_name;
-    }
-    std::reverse(digits.begin(), digits.end());
-    return normalized_number(digits);
+    return test_point_keys(test_name).back();
 }
 
 bool points_equal(double a, double b) {
@@ -699,7 +681,12 @@ void write_zip_archive(const fs::path& path,
 
 bool should_skip_contest_archive_path(const fs::path& path) {
     for (const auto& part : path) {
-        if (part == ".neothemis-work") {
+        const std::string name = part.string();
+        if (part == ".neothemis-work" ||
+            (name.size() >= std::string(".neothemis-lock").size() &&
+             name.compare(name.size() - std::string(".neothemis-lock").size(),
+                          std::string(".neothemis-lock").size(),
+                          ".neothemis-lock") == 0)) {
             return true;
         }
     }
@@ -1100,32 +1087,6 @@ fs::path detect_old_contest_root(const fs::path& root) {
     throw std::runtime_error("old Themis contest root not found: " + root.string());
 }
 
-void write_default_neothemis_config(const fs::path& new_root) {
-    std::ofstream out(new_root / "neothemis.conf");
-    if (!out) {
-        throw std::runtime_error("failed to write " + (new_root / "neothemis.conf").string());
-    }
-    out << "core=builtin\n"
-        << "contestants_dir=contestants\n"
-        << "tests_dir=tests\n"
-        << "output_csv=results.csv\n"
-        << "scoreboard_csv=scoreboard.csv\n"
-        << "keep_workdir=false\n"
-        << "server_ranking_enabled=false\n"
-        << "server_contestant_details_enabled=false\n"
-        << "compiler=g++\n"
-        << "compile_flags=-std=c++14 -O2 -pipe\n"
-        << "stack_limit_mb=64\n"
-        << "parallel_jobs=0\n"
-        << "forbidden_pattern=system(\n"
-        << "forbidden_pattern=popen(\n"
-        << "forbidden_pattern=fork(\n"
-        << "forbidden_pattern=exec(\n"
-        << "forbidden_pattern=#include <unistd.h>\n"
-        << "forbidden_pattern=#include <sys/\n"
-        << "forbidden_pattern=#include <windows.h>\n";
-}
-
 void copy_old_contestants(const fs::path& old_root,
                           const fs::path& new_root,
                           const ArchiveProgress& progress) {
@@ -1272,10 +1233,6 @@ void write_problem_config(const fs::path& path,
                           const std::vector<fs::path>& tests,
                           const std::string& checker_setting) {
     double default_points = settings.mark > 0.0 ? settings.mark : 1.0;
-    std::ofstream out(path);
-    if (!out) {
-        throw std::runtime_error("failed to write " + path.string());
-    }
     std::uint64_t time_limit_ms =
         settings.time_limit_seconds > 0.0
             ? static_cast<std::uint64_t>(settings.time_limit_seconds * 1000.0 + 0.5)
@@ -1285,10 +1242,12 @@ void write_problem_config(const fs::path& path,
             ? static_cast<std::uint64_t>(settings.memory_limit_mb + 0.5)
             : 256;
 
-    out << "time_limit_ms=" << time_limit_ms << '\n'
-        << "memory_limit_mb=" << memory_limit_mb << '\n'
-        << "default_points=" << format_number(default_points) << '\n'
-        << "checker=" << checker_setting << '\n';
+    ConfigEntries entries{
+        {"time_limit_ms", std::to_string(time_limit_ms), 0},
+        {"memory_limit_mb", std::to_string(memory_limit_mb), 0},
+        {"default_points", format_number(default_points), 0},
+        {"checker", checker_setting, 0}
+    };
 
     auto marks = test_marks_by_name(settings);
     for (const auto& test : tests) {
@@ -1303,9 +1262,10 @@ void write_problem_config(const fs::path& path,
         if (settings.mark > 0.0 && points_equal(by_name->second, default_points)) {
             continue;
         }
-        out << "test_points." << point_key_for_test_name(test_name) << '='
-            << format_number(by_name->second) << '\n';
+        entries.push_back({"test_points." + point_key_for_test_name(test_name),
+                           format_number(by_name->second), 0});
     }
+    write_config_entries(path, entries);
 }
 
 void copy_old_tasks(const fs::path& old_root,
@@ -1584,7 +1544,8 @@ void convert_old_themis_contest(const fs::path& old_contest,
     fs::create_directories(new_root / "contestants");
     fs::create_directories(new_root / "tests");
 
-    write_default_neothemis_config(new_root);
+    write_default_contest_config(new_root / kContestConfigFilename,
+                                 ConfigTemplateStyle::Compact);
     copy_old_contestants(old_root, new_root, progress);
     copy_old_tasks(old_root, new_root, progress);
 

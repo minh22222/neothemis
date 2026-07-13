@@ -25,13 +25,16 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes ninja-build qt6-base-dev zlib1g-dev
+          sudo apt-get install --yes bubblewrap libseccomp-dev libqt6sql6-sqlite ninja-build pkg-config qt6-base-dev util-linux zlib1g-dev
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 
       - name: Build
         run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 90
 
       - name: Smoke test CLI
         run: ./build/neothemis-cli --help
@@ -68,10 +71,13 @@ jobs:
           cache: true
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++.exe
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_CXX_COMPILER=g++.exe
 
       - name: Build
         run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 90
 
       - name: Smoke test CLI
         run: .\build\neothemis-cli.exe --help

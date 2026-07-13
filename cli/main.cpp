@@ -1,5 +1,8 @@
 #include "neothemis/JudgeCore.hpp"
 #include "neothemis/ContestArchive.hpp"
+#include "neothemis/Config.hpp"
+#include "neothemis/Csv.hpp"
+#include "neothemis/Spreadsheet.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -27,12 +30,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr const char* kSettingsFilename = "neothemis.conf";
+constexpr const char* kSettingsFilename = neothemis::kContestConfigFilename;
 
 void print_usage(std::ostream& out) {
     out << "Usage:\n"
-        << "  neothemis-cli judge <contest-folder-or-file.ncontest> [--problem <name>] [--contestant <name>]\n"
-        << "  neothemis-cli rejudge <contest-folder-or-file.ncontest> [--problem <name>] [--contestant <name>]\n"
+        << "  neothemis-cli judge <contest-folder-or-file.ncontest> [--problem <name>] [--contestant <name>] [--unsafe-no-sandbox]\n"
+        << "  neothemis-cli rejudge <contest-folder-or-file.ncontest> [--problem <name>] [--contestant <name>] [--unsafe-no-sandbox]\n"
         << "  neothemis-cli config <contest-folder-or-file.ncontest> list\n"
         << "  neothemis-cli config <contest-folder-or-file.ncontest> available\n"
         << "  neothemis-cli config <contest-folder-or-file.ncontest> set <key> <value>\n"
@@ -48,6 +51,7 @@ void print_usage(std::ostream& out) {
         << "\n"
         << "Filters can be repeated. Quote contestant names that contain spaces.\n"
         << "Example: neothemis-cli rejudge contest --problem VENUE --contestant \"Tran Minh Duy\"\n"
+        << "--unsafe-no-sandbox explicitly permits unsandboxed execution when a secure sandbox is unavailable.\n"
         << "\n"
         << "Test ranges are supported, for example: points 2 1-10 or points default 1 5 3 12.\n"
         << "Settings are loaded from <contest-folder>/" << kSettingsFilename << ".\n"
@@ -109,7 +113,11 @@ void print_problem_config_reference(std::ostream& out) {
         << "      Compile checker.cpp in this problem folder.\n"
         << "      If it includes testlib.h, put testlib.h in this problem folder.\n"
         << "  checker=custom:<path>\n"
-        << "      Compile checker source relative to this problem folder.\n"
+        << "      Compile checker source relative to this problem folder; exit-7 scores are absolute points.\n"
+        << "  checker=testlib\n"
+        << "      Compile checker.cpp and interpret testlib quitp values as percentages.\n"
+        << "  checker=testlib:<path>\n"
+        << "      Compile a relative checker source with the same percentage protocol.\n"
         << "  test_points.<test>=<points>\n"
         << "      Override points for one test folder. test01 also matches test_points.1.\n"
         << "\n"
@@ -259,126 +267,9 @@ neothemis::ArchiveProgress archive_progress_callback(ProgressRenderer& progress)
     };
 }
 
-bool parse_bool(const std::string& value, const std::string& key) {
-    if (value == "true" || value == "1" || value == "yes" || value == "on") {
-        return true;
-    }
-    if (value == "false" || value == "0" || value == "no" || value == "off") {
-        return false;
-    }
-    throw std::runtime_error("invalid boolean for " + key + ": " + value);
-}
-
-std::vector<std::string> default_forbidden_patterns() {
-    return {
-        "system(",
-        "popen(",
-        "fork(",
-        "exec(",
-        "#include <unistd.h>",
-        "#include <sys/",
-        "#include <windows.h>"
-    };
-}
-
-void write_default_settings(const fs::path& settings_path) {
-    std::ofstream out(settings_path);
-    if (!out) {
-        throw std::runtime_error("failed to create settings file: " + settings_path.string());
-    }
-    out << "# NeoThemis contest settings\n"
-        << "core=builtin\n"
-        << "contestants_dir=contestants\n"
-        << "tests_dir=tests\n"
-        << "output_csv=results.csv\n"
-        << "scoreboard_csv=scoreboard.csv\n"
-        << "keep_workdir=false\n"
-        << "server_ranking_enabled=false\n"
-        << "server_contestant_details_enabled=false\n"
-        << "compiler=g++\n"
-        << "compile_flags=-std=c++14 -O2 -pipe\n"
-        << "stack_limit_mb=64\n"
-        << "# 0 prefers performance cores. Manual values above physical cores are capped.\n"
-        << "parallel_jobs=0\n"
-        << "\n"
-        << "# Submissions containing these text patterns are rejected with SV.\n";
-    for (const auto& pattern : default_forbidden_patterns()) {
-        out << "forbidden_pattern=" << pattern << '\n';
-    }
-}
-
-void apply_setting(neothemis::JudgeOptions& options,
-                   const std::string& key,
-                   const std::string& value) {
-    if (key == "core") {
-        options.core_name = value;
-    } else if (key == "contestants_dir") {
-        options.contestants_dir = value;
-    } else if (key == "tests_dir") {
-        options.tests_dir = value;
-    } else if (key == "output_csv") {
-        options.output_csv = value;
-    } else if (key == "scoreboard_csv") {
-        options.scoreboard_csv = value;
-    } else if (key == "keep_workdir") {
-        options.keep_workdir = parse_bool(value, key);
-    } else if (key == "server_ranking_enabled" ||
-               key == "server_contestant_details_enabled") {
-        (void)parse_bool(value, key);
-        // Server visibility settings do not affect local CLI judging.
-    } else if (key == "compiler") {
-        options.compiler = value;
-    } else if (key == "compile_flags") {
-        options.compile_flags = value;
-    } else if (key == "testlib_dir") {
-        (void)value;
-        // Legacy setting kept harmless while global testlib support is removed.
-    } else if (key == "stack_limit_mb") {
-        options.stack_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
-    } else if (key == "parallel_jobs") {
-        options.parallel_jobs = static_cast<unsigned int>(std::stoul(value));
-    } else if (key == "forbidden_pattern") {
-        options.forbidden_patterns.push_back(value);
-    } else {
-        throw std::runtime_error("unknown setting in " + std::string(kSettingsFilename) + ": " + key);
-    }
-}
-
 void load_or_create_settings(neothemis::JudgeOptions& options) {
-    fs::path settings_path = options.contest_root / kSettingsFilename;
-    if (!fs::exists(settings_path)) {
-        write_default_settings(settings_path);
-    }
-
-    options.forbidden_patterns.clear();
-    std::ifstream in(settings_path);
-    if (!in) {
-        throw std::runtime_error("failed to open settings file: " + settings_path.string());
-    }
-
-    std::string line;
-    std::size_t line_number = 0;
-    while (std::getline(in, line)) {
-        ++line_number;
-        std::string stripped = trim(line);
-        if (stripped.empty() || stripped[0] == '#') {
-            continue;
-        }
-
-        std::size_t equal = stripped.find('=');
-        if (equal == std::string::npos) {
-            throw std::runtime_error(settings_path.string() + ":" +
-                                     std::to_string(line_number) + ": expected key=value");
-        }
-
-        std::string key = trim(stripped.substr(0, equal));
-        std::string value = trim(stripped.substr(equal + 1));
-        if (key.empty()) {
-            throw std::runtime_error(settings_path.string() + ":" +
-                                     std::to_string(line_number) + ": empty setting key");
-        }
-        apply_setting(options, key, value);
-    }
+    neothemis::apply_contest_config(
+        neothemis::load_or_create_contest_config(options.contest_root), options);
 }
 
 fs::path detect_extracted_contest_root(const fs::path& root) {
@@ -476,232 +367,8 @@ bool config_command_changes_files(int argc, char** argv) {
     return false;
 }
 
-struct ScopedDirectory {
-    fs::path path;
-
-    explicit ScopedDirectory(fs::path value) : path(std::move(value)) {}
-    ScopedDirectory(const ScopedDirectory&) = delete;
-    ScopedDirectory& operator=(const ScopedDirectory&) = delete;
-
-    ~ScopedDirectory() {
-        if (!path.empty()) {
-            std::error_code ec;
-            fs::remove_all(path, ec);
-        }
-    }
-};
-
-std::map<std::string, std::vector<std::string>> read_settings_file(const fs::path& path) {
-    std::map<std::string, std::vector<std::string>> settings;
-    std::ifstream in(path);
-    if (!in) {
-        throw std::runtime_error("failed to open settings file: " + path.string());
-    }
-
-    std::string line;
-    std::size_t line_number = 0;
-    while (std::getline(in, line)) {
-        ++line_number;
-        std::string stripped = trim(line);
-        if (stripped.empty() || stripped[0] == '#') {
-            continue;
-        }
-        std::size_t equal = stripped.find('=');
-        if (equal == std::string::npos) {
-            throw std::runtime_error(path.string() + ":" +
-                                     std::to_string(line_number) + ": expected key=value");
-        }
-        std::string key = trim(stripped.substr(0, equal));
-        std::string value = trim(stripped.substr(equal + 1));
-        if (key.empty()) {
-            throw std::runtime_error(path.string() + ":" +
-                                     std::to_string(line_number) + ": empty setting key");
-        }
-        settings[key].push_back(value);
-    }
-    return settings;
-}
-
-void write_settings_file(const fs::path& path,
-                         const std::vector<std::pair<std::string, std::string>>& settings) {
-    std::ofstream out(path);
-    if (!out) {
-        throw std::runtime_error("failed to write settings file: " + path.string());
-    }
-    for (const auto& item : settings) {
-        out << item.first << '=' << item.second << '\n';
-    }
-}
-
-void write_text_file(const fs::path& path, const std::string& text) {
-    fs::create_directories(path.parent_path());
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-        throw std::runtime_error("failed to write " + path.string());
-    }
-    out << text;
-}
-
-fs::path ensure_xlsx_extension(fs::path path) {
-    std::string extension = path.extension().string();
-    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    if (extension != ".xlsx") {
-        path += ".xlsx";
-    }
-    return path;
-}
-
-std::string xml_escape(const std::string& value) {
-    std::string escaped;
-    escaped.reserve(value.size());
-    for (char ch : value) {
-        switch (ch) {
-        case '&':
-            escaped += "&amp;";
-            break;
-        case '<':
-            escaped += "&lt;";
-            break;
-        case '>':
-            escaped += "&gt;";
-            break;
-        case '"':
-            escaped += "&quot;";
-            break;
-        case '\'':
-            escaped += "&apos;";
-            break;
-        default:
-            escaped.push_back(ch);
-            break;
-        }
-    }
-    return escaped;
-}
-
-std::string xlsx_column_name(std::size_t index) {
-    std::string name;
-    ++index;
-    while (index > 0) {
-        std::size_t remainder = (index - 1) % 26;
-        name.push_back(static_cast<char>('A' + remainder));
-        index = (index - 1) / 26;
-    }
-    std::reverse(name.begin(), name.end());
-    return name;
-}
-
-std::vector<std::vector<std::string>> parse_csv_records(const std::string& text) {
-    std::vector<std::vector<std::string>> rows;
-    std::vector<std::string> row;
-    std::string cell;
-    bool quoted = false;
-    bool have_data = false;
-    for (std::size_t i = 0; i < text.size(); ++i) {
-        char ch = text[i];
-        have_data = true;
-        if (quoted) {
-            if (ch == '"') {
-                if (i + 1 < text.size() && text[i + 1] == '"') {
-                    cell.push_back('"');
-                    ++i;
-                } else {
-                    quoted = false;
-                }
-            } else {
-                cell.push_back(ch);
-            }
-            continue;
-        }
-        if (ch == '"') {
-            quoted = true;
-        } else if (ch == ',') {
-            row.push_back(cell);
-            cell.clear();
-        } else if (ch == '\n') {
-            row.push_back(cell);
-            cell.clear();
-            rows.push_back(row);
-            row.clear();
-            have_data = false;
-        } else if (ch != '\r') {
-            cell.push_back(ch);
-        }
-    }
-    if (have_data || !cell.empty() || !row.empty()) {
-        row.push_back(cell);
-        rows.push_back(row);
-    }
-    return rows;
-}
-
-std::vector<std::vector<std::string>> read_csv_rows(const fs::path& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) {
-        throw std::runtime_error("failed to read CSV file: " + path.string());
-    }
-    std::ostringstream contents;
-    contents << in.rdbuf();
-    return parse_csv_records(contents.str());
-}
-
-std::string xlsx_sheet_xml(const std::vector<std::vector<std::string>>& rows) {
-    std::ostringstream out;
-    out << R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
-        << R"(<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">)"
-        << R"(<sheetData>)";
-    for (std::size_t r = 0; r < rows.size(); ++r) {
-        out << R"(<row r=")" << (r + 1) << R"(">)";
-        for (std::size_t c = 0; c < rows[r].size(); ++c) {
-            std::string ref = xlsx_column_name(c) + std::to_string(r + 1);
-            out << R"(<c r=")" << ref << R"(" t="inlineStr"><is><t>)"
-                << xml_escape(rows[r][c])
-                << R"(</t></is></c>)";
-        }
-        out << "</row>";
-    }
-    out << "</sheetData></worksheet>";
-    return out.str();
-}
-
-void write_xlsx_file(const fs::path& output_path,
-                     const std::string& sheet_name,
-                     const std::vector<std::vector<std::string>>& rows,
-                     const neothemis::ArchiveProgress& progress) {
-    fs::path temp = neothemis::make_temp_directory("neothemis-xlsx");
-    ScopedDirectory cleanup(temp);
-    write_text_file(temp / "[Content_Types].xml",
-        R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
-        R"(<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">)"
-        R"(<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>)"
-        R"(<Default Extension="xml" ContentType="application/xml"/>)"
-        R"(<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>)"
-        R"(<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>)"
-        R"(</Types>)");
-    write_text_file(temp / "_rels" / ".rels",
-        R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
-        R"(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">)"
-        R"(<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>)"
-        R"(</Relationships>)");
-    write_text_file(temp / "xl" / "workbook.xml",
-        std::string(R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)") +
-        R"(<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" )"
-        R"(xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">)"
-        R"(<sheets><sheet name=")" + xml_escape(sheet_name) +
-        R"(" sheetId="1" r:id="rId1"/></sheets></workbook>)");
-    write_text_file(temp / "xl" / "_rels" / "workbook.xml.rels",
-        R"(<?xml version="1.0" encoding="UTF-8" standalone="yes"?>)"
-        R"(<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">)"
-        R"(<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>)"
-        R"(</Relationships>)");
-    write_text_file(temp / "xl" / "worksheets" / "sheet1.xml", xlsx_sheet_xml(rows));
-    neothemis::write_zip_archive_from_directory(output_path, temp, progress);
-}
-
 void print_settings_file(const fs::path& path, std::ostream& out) {
-    auto parsed = read_settings_file(path);
+    auto parsed = neothemis::read_config_values(path);
     out << path.string() << ":\n";
     for (const auto& entry : parsed) {
         for (const auto& value : entry.second) {
@@ -711,20 +378,13 @@ void print_settings_file(const fs::path& path, std::ostream& out) {
 }
 
 void set_single_setting(const fs::path& path, const std::string& key, const std::string& value) {
-    auto parsed = read_settings_file(path);
+    auto parsed = neothemis::read_config_values(path);
     parsed[key] = {value};
-
-    std::vector<std::pair<std::string, std::string>> flattened;
-    for (const auto& entry : parsed) {
-        for (const auto& entry_value : entry.second) {
-            flattened.push_back({entry.first, entry_value});
-        }
-    }
-    write_settings_file(path, flattened);
+    neothemis::write_config_values(path, parsed);
 }
 
 void set_problem_setting(const fs::path& path, const std::string& key, const std::string& value) {
-    auto parsed = read_settings_file(path);
+    auto parsed = neothemis::read_config_values(path);
     std::string old_default = "1";
     auto old_default_entry = parsed.find("default_points");
     if (old_default_entry != parsed.end() && !old_default_entry->second.empty()) {
@@ -744,13 +404,7 @@ void set_problem_setting(const fs::path& path, const std::string& key, const std
         }
     }
 
-    std::vector<std::pair<std::string, std::string>> flattened;
-    for (const auto& entry : parsed) {
-        for (const auto& entry_value : entry.second) {
-            flattened.push_back({entry.first, entry_value});
-        }
-    }
-    write_settings_file(path, flattened);
+    neothemis::write_config_values(path, parsed);
 }
 
 std::set<std::string> expand_tests(int first_index, int argc, char** argv) {
@@ -775,37 +429,29 @@ std::set<std::string> expand_tests(int first_index, int argc, char** argv) {
     return tests;
 }
 
-std::vector<std::string> point_setting_keys_for_test(const std::string& test) {
-    std::vector<std::string> keys{test};
-    std::string digits;
-    for (auto it = test.rbegin(); it != test.rend(); ++it) {
-        if (!std::isdigit(static_cast<unsigned char>(*it))) {
-            break;
-        }
-        digits.push_back(*it);
+void validate_path_component(const std::string& value, const char* name) {
+    const fs::path component(value);
+    if (value.empty() || value == "." || value == ".." ||
+        value.find('/') != std::string::npos || value.find('\\') != std::string::npos ||
+        component.is_absolute() || component.has_parent_path()) {
+        throw std::runtime_error(std::string(name) + " must be one path component");
     }
-    if (!digits.empty()) {
-        std::reverse(digits.begin(), digits.end());
-        keys.push_back(digits);
-        std::size_t first_non_zero = digits.find_first_not_of('0');
-        keys.push_back(first_non_zero == std::string::npos ? "0" : digits.substr(first_non_zero));
-    }
-
-    std::vector<std::string> unique;
-    for (const auto& key : keys) {
-        if (std::find(unique.begin(), unique.end(), key) == unique.end()) {
-            unique.push_back(key);
-        }
-    }
-    return unique;
 }
 
 fs::path problem_settings_path(const fs::path& contest_root, const std::string& problem) {
-    neothemis::JudgeOptions options;
-    options.contest_root = contest_root;
-    options.forbidden_patterns = default_forbidden_patterns();
-    load_or_create_settings(options);
-    return contest_root / options.tests_dir / problem / "problem.conf";
+    validate_path_component(problem, "problem name");
+
+    neothemis::JudgeOptions loaded;
+    loaded.contest_root = contest_root;
+    load_or_create_settings(loaded);
+
+    // This command only touches tests_dir. Keep the other configured paths out
+    // of this check so an independently broken setting can be repaired later.
+    neothemis::JudgeOptions checked;
+    checked.contest_root = contest_root;
+    checked.tests_dir = loaded.tests_dir;
+    neothemis::validate_judge_paths(checked);
+    return contest_root / loaded.tests_dir / problem / neothemis::kProblemConfigFilename;
 }
 
 int handle_config(int argc, char** argv, const fs::path& contest_root) {
@@ -815,7 +461,7 @@ int handle_config(int argc, char** argv, const fs::path& contest_root) {
 
     fs::path contest_settings = contest_root / kSettingsFilename;
     if (!fs::exists(contest_settings)) {
-        write_default_settings(contest_settings);
+        neothemis::write_default_contest_config(contest_settings);
     }
 
     std::string scope = argv[3];
@@ -839,6 +485,23 @@ int handle_config(int argc, char** argv, const fs::path& contest_root) {
         if (argc != 6) {
             throw std::runtime_error("usage: neothemis-cli config <contest> set <key> <value>");
         }
+        const std::string key = argv[4];
+        const fs::path value = argv[5];
+        neothemis::JudgeOptions proposed;
+        proposed.contest_root = contest_root;
+        if (key == "contestants_dir") {
+            proposed.contestants_dir = value;
+        } else if (key == "tests_dir") {
+            proposed.tests_dir = value;
+        } else if (key == "output_csv") {
+            proposed.output_csv = value;
+        } else if (key == "scoreboard_csv") {
+            proposed.scoreboard_csv = value;
+        }
+        if (key == "contestants_dir" || key == "tests_dir" || key == "output_csv" ||
+            key == "scoreboard_csv") {
+            neothemis::validate_judge_paths(proposed);
+        }
         set_single_setting(contest_settings, argv[4], argv[5]);
         std::cout << "Updated " << contest_settings.string() << '\n';
         return 0;
@@ -850,33 +513,33 @@ int handle_config(int argc, char** argv, const fs::path& contest_root) {
 
     std::string problem = argv[4];
     std::string action = argv[5];
-    fs::path settings_path = problem_settings_path(contest_root, problem);
-    if (!fs::exists(settings_path)) {
-        fs::create_directories(settings_path.parent_path());
-        std::ofstream out(settings_path);
-        if (!out) {
-            throw std::runtime_error("failed to create " + settings_path.string());
-        }
-        out << "time_limit_ms=1000\n"
-            << "memory_limit_mb=256\n"
-            << "default_points=1\n"
-            << "checker=token\n";
-    }
-
     if (action == "available" || action == "help") {
         if (argc != 6) {
             throw std::runtime_error("usage: neothemis-cli config <contest> problem <problem> available");
         }
+        validate_path_component(problem, "problem name");
         print_problem_config_reference(std::cout);
         return 0;
     }
+
+    fs::path settings_path = problem_settings_path(contest_root, problem);
 
     if (action == "list") {
         if (argc != 6) {
             throw std::runtime_error("usage: neothemis-cli config <contest> problem <problem> list");
         }
+        if (!fs::exists(settings_path)) {
+            throw std::runtime_error("problem settings file not found: " +
+                                     settings_path.string());
+        }
         print_settings_file(settings_path, std::cout);
         return 0;
+    }
+
+    if (!fs::exists(settings_path)) {
+        fs::create_directories(settings_path.parent_path());
+        neothemis::write_default_problem_config(
+            settings_path, neothemis::ConfigTemplateStyle::Compact);
     }
 
     if (action == "set") {
@@ -897,28 +560,22 @@ int handle_config(int argc, char** argv, const fs::path& contest_root) {
                               points == "default" ||
                               points == "blank" ||
                               points == "-";
-        auto parsed = read_settings_file(settings_path);
+        auto parsed = neothemis::read_config_values(settings_path);
         for (const auto& test : expand_tests(7, argc, argv)) {
+            const auto keys = neothemis::test_point_keys(test);
             if (clear_override) {
-                for (const auto& key : point_setting_keys_for_test(test)) {
+                for (const auto& key : keys) {
                     auto found = parsed.find("test_points." + key);
                     if (found != parsed.end()) {
                         found->second = {""};
                     }
                 }
-                parsed["test_points." + point_setting_keys_for_test(test).back()] = {""};
+                parsed["test_points." + keys.back()] = {""};
             } else {
                 parsed["test_points." + test] = {points};
             }
         }
-
-        std::vector<std::pair<std::string, std::string>> flattened;
-        for (const auto& entry : parsed) {
-            for (const auto& value : entry.second) {
-                flattened.push_back({entry.first, value});
-            }
-        }
-        write_settings_file(settings_path, flattened);
+        neothemis::write_config_values(settings_path, parsed);
         std::cout << "Updated " << settings_path.string() << '\n';
         return 0;
     }
@@ -937,7 +594,6 @@ neothemis::JudgeOptions parse_judge_args(int argc, char** argv, const fs::path& 
 
     neothemis::JudgeOptions options;
     options.contest_root = contest_root;
-    options.forbidden_patterns = default_forbidden_patterns();
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -954,6 +610,8 @@ neothemis::JudgeOptions parse_judge_args(int argc, char** argv, const fs::path& 
                 throw std::runtime_error(arg + " requires a contestant name");
             }
             options.selected_contestants.push_back(argv[++i]);
+        } else if (arg == "--unsafe-no-sandbox") {
+            options.execution_security = neothemis::ExecutionSecurity::ExplicitlyUnsafe;
         } else {
             throw std::runtime_error("unknown judge option: " + arg);
         }
@@ -1017,8 +675,8 @@ int handle_export_xlsx(int argc,
         open_contest_for_cli(argv[2], false, archive_progress_callback(progress));
     neothemis::JudgeOptions options;
     options.contest_root = contest.root;
-    options.forbidden_patterns = default_forbidden_patterns();
     load_or_create_settings(options);
+    neothemis::validate_judge_paths(options);
 
     fs::path csv_path = scoreboard ? options.scoreboard_csv : options.output_csv;
     if (csv_path.is_relative()) {
@@ -1028,9 +686,23 @@ int handle_export_xlsx(int argc,
         throw std::runtime_error("CSV file not found; run judge first: " + csv_path.string());
     }
 
-    fs::path output = ensure_xlsx_extension(argv[3]);
-    write_xlsx_file(output, scoreboard ? "Scoreboard" : "Data",
-                    read_csv_rows(csv_path), archive_progress_callback(progress));
+    neothemis::XlsxSheet sheet;
+    sheet.name = scoreboard ? "Scoreboard" : "Data";
+    sheet.freeze_first_row = false;
+    sheet.bold_first_row = false;
+    const auto csv_rows = neothemis::read_csv_file_locked(csv_path);
+    sheet.rows.reserve(csv_rows.size());
+    for (const auto& csv_row : csv_rows) {
+        neothemis::XlsxRow row;
+        row.reserve(csv_row.size());
+        for (const auto& value : csv_row) {
+            row.push_back(neothemis::xlsx_text(value));
+        }
+        sheet.rows.push_back(std::move(row));
+    }
+
+    fs::path output = neothemis::ensure_xlsx_extension(argv[3]);
+    neothemis::write_xlsx_file(output, sheet, archive_progress_callback(progress));
     progress.finish();
     std::cout << "Exported " << (scoreboard ? "scoreboard" : "data")
               << " to " << output.string() << '\n';
@@ -1087,32 +759,31 @@ int main(int argc, char** argv) {
         options.progress = [&](const std::string& line) {
             progress.update(line);
         };
+        const neothemis::ContestOverview judged_scope = neothemis::inspect_contest(options);
         auto core = neothemis::make_judge_core(options.core_name);
         auto results = core->judge(options);
 
-        fs::create_directories(options.output_csv.parent_path());
-        std::ofstream output(options.output_csv);
-        if (!output) {
-            throw std::runtime_error("failed to open CSV output: " + options.output_csv.string());
-        }
+        std::ostringstream output;
         neothemis::write_csv(output, results);
-        output.close();
-        if (!output) {
-            throw std::runtime_error("failed to write CSV output: " + options.output_csv.string());
+        neothemis::CsvTable result_rows = neothemis::parse_csv(output.str());
+        if (result_rows.empty()) {
+            throw std::runtime_error("judge produced an invalid empty CSV document");
         }
-
-        fs::create_directories(options.scoreboard_csv.parent_path());
-        std::ofstream scoreboard(options.scoreboard_csv);
-        if (!scoreboard) {
-            throw std::runtime_error("failed to open scoreboard CSV output: " +
-                                     options.scoreboard_csv.string());
+        const neothemis::CsvRow header = result_rows.front();
+        result_rows.erase(result_rows.begin());
+        std::set<neothemis::CsvKey> replaced_pairs;
+        for (const std::string& contestant : judged_scope.contestants) {
+            for (const std::string& problem : judged_scope.problems) {
+                replaced_pairs.insert({contestant, problem});
+            }
         }
-        neothemis::write_scoreboard_csv(scoreboard, results);
-        scoreboard.close();
-        if (!scoreboard) {
-            throw std::runtime_error("failed to write scoreboard CSV output: " +
-                                     options.scoreboard_csv.string());
-        }
+        neothemis::replace_csv_rows_by_key_atomic(
+            options.output_csv, header, result_rows, replaced_pairs,
+            [&](const neothemis::CsvTable& merged_rows) {
+                std::ostringstream scoreboard;
+                neothemis::write_scoreboard_csv_from_results(scoreboard, merged_rows);
+                neothemis::write_text_file_atomic(options.scoreboard_csv, scoreboard.str());
+            });
         contest.save(archive_progress_callback(progress));
         progress.finish();
 

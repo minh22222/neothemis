@@ -7,8 +7,6 @@ if (NOT Qt6_FOUND)
     message(STATUS "Qt6 Widgets/Sql not found; neothemis-gui target disabled")
     return()
 endif()
-find_package(ZLIB QUIET)
-find_package(Qt6ZlibPrivate QUIET)
 if (UNIX AND NOT APPLE)
     find_package(KF6WindowSystem QUIET)
 endif()
@@ -17,6 +15,12 @@ add_executable(neothemis-gui
     main.cpp
     MainWindow.cpp
     MainWindow.hpp
+    MainWindowPrivate.hpp
+    MainWindowShell.cpp
+    MainWindowAppearance.cpp
+    MainWindowContest.cpp
+    MainWindowJudge.cpp
+    MainWindowServer.cpp
     FileFormats.cpp
     FileFormats.hpp
     FileAssociation.cpp
@@ -58,17 +62,15 @@ qt_add_resources(neothemis-gui neothemis_gui_resources
         ${CMAKE_SOURCE_DIR}/materials/spin-down-dark.xpm
 )
 
-target_link_libraries(neothemis-gui PRIVATE neothemis_core Qt6::Widgets Qt6::Sql)
+target_link_libraries(neothemis-gui PRIVATE
+    neothemis_core
+    neothemis_server_database
+    Qt6::Widgets
+    Qt6::Sql
+)
 if (TARGET KF6::WindowSystem)
     target_link_libraries(neothemis-gui PRIVATE KF6::WindowSystem)
     target_compile_definitions(neothemis-gui PRIVATE NEOTHEMIS_HAS_KWINDOWSYSTEM=1)
-endif()
-if (TARGET Qt6::ZlibPrivate)
-    target_link_libraries(neothemis-gui PRIVATE Qt6::ZlibPrivate)
-    target_compile_definitions(neothemis-gui PRIVATE NEOTHEMIS_HAS_ZLIB=1)
-elseif (ZLIB_FOUND)
-    target_link_libraries(neothemis-gui PRIVATE ZLIB::ZLIB)
-    target_compile_definitions(neothemis-gui PRIVATE NEOTHEMIS_HAS_ZLIB=1)
 endif()
 target_compile_definitions(neothemis-gui PRIVATE QT_NO_KEYWORDS)
 set_target_properties(neothemis-gui PROPERTIES

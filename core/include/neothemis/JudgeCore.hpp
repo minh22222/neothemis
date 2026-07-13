@@ -1,5 +1,7 @@
 #pragma once
 
+#include "neothemis/Csv.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -12,6 +14,7 @@ namespace neothemis {
 
 enum class Verdict {
     Accepted,
+    Partial,
     WrongAnswer,
     CompileError,
     RuntimeError,
@@ -20,6 +23,11 @@ enum class Verdict {
     MissingSource,
     SecurityViolation,
     InternalError
+};
+
+enum class ExecutionSecurity {
+    Required,
+    ExplicitlyUnsafe
 };
 
 struct TestResult;
@@ -41,6 +49,7 @@ struct JudgeOptions {
     std::function<void(const std::string&)> progress;
     std::function<void(const TestResult&)> result;
     std::function<bool()> should_cancel;
+    ExecutionSecurity execution_security = ExecutionSecurity::Required;
     bool keep_workdir = false;
 };
 
@@ -69,9 +78,13 @@ public:
 };
 
 std::string to_string(Verdict verdict);
+Verdict verdict_from_string(const std::string& value);
 std::unique_ptr<JudgeCore> make_judge_core(const std::string& name);
+bool secure_sandbox_available(std::string* reason = nullptr);
+void validate_judge_paths(const JudgeOptions& options);
 ContestOverview inspect_contest(const JudgeOptions& options);
 void write_csv(std::ostream& output, const std::vector<TestResult>& results);
 void write_scoreboard_csv(std::ostream& output, const std::vector<TestResult>& results);
+void write_scoreboard_csv_from_results(std::ostream& output, const CsvTable& rows);
 
 } // namespace neothemis
