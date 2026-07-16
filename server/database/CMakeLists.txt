@@ -18,5 +18,5 @@ if (BUILD_TESTING)
         neothemis_server_database
     )
     add_test(NAME server.database COMMAND neothemis-server-database-tests)
-    set_tests_properties(server.database PROPERTIES TIMEOUT 90)
+    set_tests_properties(server.database PROPERTIES TIMEOUT 30)
 endif()

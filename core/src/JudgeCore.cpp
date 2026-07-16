@@ -2375,6 +2375,20 @@ std::vector<std::string> stack_guard_compile_args(const std::string& compiler,
 
 std::vector<std::string> compiler_base_args(const JudgeOptions& options) {
     std::vector<std::string> args = configured_compiler_args(options.compiler);
+#ifndef _WIN32
+    if (options.execution_security == ExecutionSecurity::Required && !args.empty() &&
+        !args.front().empty()) {
+        const fs::path resolved = resolve_posix_executable(args.front(), nullptr);
+        std::error_code canonical_error;
+        const fs::path canonical = fs::canonical(resolved, canonical_error);
+        if (!canonical_error) {
+            // Distribution compiler aliases commonly pass through
+            // /etc/alternatives, which is intentionally absent from the
+            // compiler sandbox. Execute the canonical binary inside /usr.
+            args.front() = canonical.string();
+        }
+    }
+#endif
     const std::string compiler = args.empty() ? std::string() : args.front();
     std::vector<std::string> flags =
         warning_tolerant_compile_flags(compiler, options.compile_flags);
@@ -2933,6 +2947,7 @@ fs::path compile_checker(const ProblemConfig& settings,
     fs::path compile_log = checker_build_dir / "checker-compile.err";
     ScopedPathCleanup compile_log_cleanup({compile_log}, !options.keep_workdir);
     std::vector<std::string> compile_args = compiler_context.base_args;
+    fs::path compile_working_directory;
     SandboxRunSpec sandbox_spec;
     const SandboxRunSpec* sandbox = nullptr;
     if (options.execution_security == ExecutionSecurity::Required) {
@@ -2950,12 +2965,29 @@ fs::path compile_checker(const ProblemConfig& settings,
                                     process_path_argument(checker_executable.filename()), false}};
         sandbox = &sandbox_spec;
     } else {
+#ifdef _WIN32
+        const fs::path staged_source = checker_build_dir / "checker-source.cpp";
+        fs::copy_file(checker_source, staged_source,
+                      fs::copy_options::overwrite_existing);
+        if (needs_testlib) {
+            fs::copy_file(local_testlib, checker_build_dir / "testlib.h",
+                          fs::copy_options::overwrite_existing);
+        }
+        compile_args.insert(compile_args.end(),
+                            {"-I", ".", process_path_argument(staged_source.filename()),
+                             "-o", process_path_argument(checker_executable.filename())});
+        compile_working_directory = checker_build_dir;
+#else
         compile_args.insert(compile_args.end(),
                             {"-I", process_path_argument(problem_dir),
                              process_path_argument(checker_source), "-o",
                              process_path_argument(checker_executable)});
+#endif
     }
-    ProcessResult compile = run_program(compile_args, nullptr, nullptr, &compile_log,
+    const fs::path* compile_working_directory_ptr =
+        compile_working_directory.empty() ? nullptr : &compile_working_directory;
+    ProcessResult compile = run_program(compile_args, compile_working_directory_ptr, nullptr,
+                                        &compile_log,
                                         30000, 1024, 256, 64,
                                         options.should_cancel, sandbox, false,
                                         &compiler_context.launch);
@@ -3061,6 +3093,7 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
     fs::path compile_log = build_dir / "compile.err";
     ScopedPathCleanup compile_log_cleanup({compile_log}, !options.keep_workdir);
     std::vector<std::string> compile_args = compiler_context.base_args;
+    fs::path compile_working_directory;
     SandboxRunSpec sandbox_spec;
     const SandboxRunSpec* sandbox = nullptr;
     if (options.execution_security == ExecutionSecurity::Required) {
@@ -3078,11 +3111,24 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
                                     process_path_argument(prepared.executable.filename()), false}};
         sandbox = &sandbox_spec;
     } else {
+#ifdef _WIN32
+        const fs::path staged_source =
+            build_dir / ("submission-source" + process_path_argument(source.extension()));
+        fs::copy_file(source, staged_source, fs::copy_options::overwrite_existing);
+        compile_args.insert(compile_args.end(),
+                            {process_path_argument(staged_source.filename()), "-o",
+                             process_path_argument(prepared.executable.filename())});
+        compile_working_directory = build_dir;
+#else
         compile_args.insert(compile_args.end(),
                             {process_path_argument(source), "-o",
                              process_path_argument(prepared.executable)});
+#endif
     }
-    ProcessResult compile = run_program(compile_args, nullptr, nullptr, &compile_log,
+    const fs::path* compile_working_directory_ptr =
+        compile_working_directory.empty() ? nullptr : &compile_working_directory;
+    ProcessResult compile = run_program(compile_args, compile_working_directory_ptr, nullptr,
+                                        &compile_log,
                                         30000, 1024, 256, 64,
                                         options.should_cancel, sandbox, false,
                                         &compiler_context.launch);

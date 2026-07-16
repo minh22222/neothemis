@@ -280,7 +280,9 @@ void test_user_management() {
 }
 
 void test_atomic_submission_admission() {
+    constexpr int concurrent_applicants = 12;
     {
+        std::cerr << "database tests: per-user admission race\n" << std::flush;
         QTemporaryDir temporary("neothemis-user-admission-tests-XXXXXX");
         require(temporary.isValid(), "failed to create per-user admission directory");
         const std::filesystem::path path =
@@ -294,17 +296,19 @@ void test_atomic_submission_admission() {
         limits.max_active_per_user = 2;
         limits.max_active_global = 50;
         limits.max_recent_per_user = 50;
-        std::vector<server::User> applicants(12, user);
+        std::vector<server::User> applicants(concurrent_applicants, user);
         const auto results = run_concurrent_admissions(path, applicants, limits);
         require(count_status(results, server::SubmissionAdmissionStatus::Accepted) == 2,
                 "concurrent per-user admission accepted more than the limit");
-        require(count_status(results, server::SubmissionAdmissionStatus::UserActiveLimit) == 10,
+        require(count_status(results, server::SubmissionAdmissionStatus::UserActiveLimit) ==
+                    concurrent_applicants - 2,
                 "concurrent per-user admission returned incorrect rejection reasons");
         require(database.submissions_for_user(user.id, false).size() == 2,
                 "per-user admission persisted the wrong number of rows");
     }
 
     {
+        std::cerr << "database tests: global admission race\n" << std::flush;
         QTemporaryDir temporary("neothemis-global-admission-tests-XXXXXX");
         require(temporary.isValid(), "failed to create global admission directory");
         const std::filesystem::path path =
@@ -312,7 +316,7 @@ void test_atomic_submission_admission() {
         server::Database database(path);
         database.migrate_schema();
         std::vector<server::User> applicants;
-        for (int i = 0; i < 12; ++i) {
+        for (int i = 0; i < concurrent_applicants; ++i) {
             const QString username = "global-" + QString::number(i);
             database.create_user(username, "password", "contestant");
             applicants.push_back(*database.authenticate(username, "password"));
@@ -325,13 +329,15 @@ void test_atomic_submission_admission() {
         const auto results = run_concurrent_admissions(path, applicants, limits);
         require(count_status(results, server::SubmissionAdmissionStatus::Accepted) == 3,
                 "concurrent global admission accepted more than the limit");
-        require(count_status(results, server::SubmissionAdmissionStatus::GlobalActiveLimit) == 9,
+        require(count_status(results, server::SubmissionAdmissionStatus::GlobalActiveLimit) ==
+                    concurrent_applicants - 3,
                 "concurrent global admission returned incorrect rejection reasons");
         require(database.submissions_for_user(0, true).size() == 3,
                 "global admission persisted the wrong number of rows");
     }
 
     {
+        std::cerr << "database tests: rate admission race\n" << std::flush;
         QTemporaryDir temporary("neothemis-rate-admission-tests-XXXXXX");
         require(temporary.isValid(), "failed to create rate admission directory");
         const std::filesystem::path path =
@@ -346,11 +352,12 @@ void test_atomic_submission_admission() {
         limits.max_active_global = 50;
         limits.max_recent_per_user = 2;
         limits.recent_window_seconds = 60;
-        std::vector<server::User> applicants(12, user);
+        std::vector<server::User> applicants(concurrent_applicants, user);
         const auto results = run_concurrent_admissions(path, applicants, limits);
         require(count_status(results, server::SubmissionAdmissionStatus::Accepted) == 2,
                 "concurrent rate admission accepted more than the limit");
-        require(count_status(results, server::SubmissionAdmissionStatus::RateLimit) == 10,
+        require(count_status(results, server::SubmissionAdmissionStatus::RateLimit) ==
+                    concurrent_applicants - 2,
                 "concurrent rate admission returned incorrect rejection reasons");
         require(database.submissions_for_user(user.id, false).size() == 2,
                 "rate admission persisted the wrong number of rows");

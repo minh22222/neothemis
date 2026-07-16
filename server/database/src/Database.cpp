@@ -22,8 +22,10 @@ constexpr std::int64_t kSessionLifetimeSeconds = 12 * 60 * 60;
 constexpr int kDatabaseBusyTimeoutMs = 5000;
 std::atomic<std::uint64_t> next_database_instance{1};
 std::atomic<std::uint64_t> next_database_thread{1};
+std::mutex sql_connection_registry_mutex;
 
 void remove_sql_connection(const QString& name) {
+    std::lock_guard<std::mutex> registry_lock(sql_connection_registry_mutex);
     if (!QSqlDatabase::contains(name)) {
         return;
     }
@@ -1034,8 +1036,14 @@ QSqlDatabase Database::connection() {
     const QString name = QString("neothemis_server_%1_%2")
                              .arg(instance_id_)
                              .arg(thread_connections.token);
-    if (QSqlDatabase::contains(name)) {
-        QSqlDatabase existing = QSqlDatabase::database(name, false);
+    QSqlDatabase existing;
+    {
+        std::lock_guard<std::mutex> registry_lock(sql_connection_registry_mutex);
+        if (QSqlDatabase::contains(name)) {
+            existing = QSqlDatabase::database(name, false);
+        }
+    }
+    if (existing.isValid()) {
         try {
             if (!existing.isOpen() && !existing.open()) {
                 throw std::runtime_error(existing.lastError().text().toStdString());
@@ -1053,7 +1061,14 @@ QSqlDatabase Database::connection() {
     if (!path_.parent_path().empty()) {
         fs::create_directories(path_.parent_path());
     }
-    QSqlDatabase database = QSqlDatabase::addDatabase("QSQLITE", name);
+    QSqlDatabase database;
+    {
+        // Qt documents the registry operations as thread-safe, but serializing
+        // driver creation/destruction also avoids a MinGW/Qt SQLite heap race
+        // when many short-lived worker connections finish simultaneously.
+        std::lock_guard<std::mutex> registry_lock(sql_connection_registry_mutex);
+        database = QSqlDatabase::addDatabase("QSQLITE", name);
+    }
     thread_connections.names.insert(name);
     database.setDatabaseName(database_path_string(path_));
     database.setConnectOptions(QString("QSQLITE_BUSY_TIMEOUT=%1").arg(kDatabaseBusyTimeoutMs));
