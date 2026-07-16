@@ -570,10 +570,15 @@ void test_connection_lifecycle_and_unicode_paths() {
 int main(int argc, char** argv) {
     QCoreApplication application(argc, argv);
     try {
+        std::cerr << "database tests: user management\n" << std::flush;
         test_user_management();
+        std::cerr << "database tests: atomic submission admission\n" << std::flush;
         test_atomic_submission_admission();
+        std::cerr << "database tests: terminal snapshot retention\n" << std::flush;
         test_terminal_snapshot_retention_queries();
+        std::cerr << "database tests: authoritative result snapshot\n" << std::flush;
         test_authoritative_result_pair_snapshot();
+        std::cerr << "database tests: connection lifecycle and Unicode paths\n" << std::flush;
         test_connection_lifecycle_and_unicode_paths();
         std::cout << "database tests passed\n";
         return 0;

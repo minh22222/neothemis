@@ -370,8 +370,11 @@ void test_judge_and_sandbox() {
     require(results.size() == 3, "expected three judge rows");
 #endif
     require(callbacks.size() == results.size(), "result callback count mismatch");
-    require(find_result(results, "Attacker", "SAFE").verdict == neothemis::Verdict::Accepted,
-            "sandboxed submission did not produce the expected isolation result");
+    const auto& safe = find_result(results, "Attacker", "SAFE");
+    require(safe.verdict == neothemis::Verdict::Accepted,
+            "sandboxed submission did not produce the expected isolation result: exit=" +
+                std::to_string(safe.exit_code) + " verdict=" +
+                neothemis::to_string(safe.verdict) + " message=" + safe.message);
 #ifdef __linux__
     const auto& leak = find_result(results, "Attacker", "LEAK");
     require(leak.verdict == neothemis::Verdict::CompileError,
@@ -873,7 +876,9 @@ void test_unicode_process_paths() {
             "Unicode-path contest returned the wrong number of judge rows");
     const auto& result = find_result(results, contestant_name, problem_name);
     require(result.test == "1" && result.verdict == neothemis::Verdict::Accepted,
-            "Unicode contest, contestant, problem, or process path was not preserved");
+            "Unicode contest, contestant, problem, or process path was not preserved: test=" +
+                result.test + " exit=" + std::to_string(result.exit_code) + " verdict=" +
+                neothemis::to_string(result.verdict) + " message=" + result.message);
 }
 
 void test_cpu_time_accounting() {
