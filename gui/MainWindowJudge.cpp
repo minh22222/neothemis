@@ -337,6 +337,11 @@ void MainWindow::populate_table() {
             new QTableWidgetItem(QString::fromStdString(problems_[col])));
     }
     table_->setHorizontalHeaderItem(total_column(), new QTableWidgetItem(text("total")));
+    for (int column = 0; column < table_->columnCount(); ++column) {
+        if (auto* header = table_->horizontalHeaderItem(column)) {
+            header->setTextAlignment(Qt::AlignCenter);
+        }
+    }
 
     for (std::size_t row = 0; row < contestants_.size(); ++row) {
         const std::string& contestant = contestants_[row];

@@ -26,6 +26,7 @@ ConfigValues config_values(const ConfigEntries& entries);
 ConfigValues read_config_values(const std::filesystem::path& path);
 void write_config_entries(const std::filesystem::path& path, const ConfigEntries& entries);
 void write_config_values(const std::filesystem::path& path, const ConfigValues& values);
+std::string format_config_number(double value);
 
 enum class ConfigTemplateStyle { Compact, Documented };
 

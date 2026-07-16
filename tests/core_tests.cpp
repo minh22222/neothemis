@@ -19,6 +19,7 @@
 #include <vector>
 
 #ifdef __linux__
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -385,6 +386,26 @@ void test_workdir_ownership_and_concurrency() {
             "an exceptional judge run left its invocation work directory behind");
     require(read_file(retained_runs.front() / "owner.marker") == "owned",
             "exception cleanup removed another invocation's retained work");
+
+    std::atomic<bool> cancellation_requested{false};
+    neothemis::JudgeOptions cancellation_options = judge_options(contest, security);
+    cancellation_options.result = [&](const neothemis::TestResult&) {
+        cancellation_requested.store(true);
+    };
+    cancellation_options.should_cancel = [&] {
+        return cancellation_requested.load();
+    };
+    bool cancellation_reported = false;
+    try {
+        (void)neothemis::make_judge_core("builtin")->judge(cancellation_options);
+    } catch (const std::runtime_error& ex) {
+        cancellation_reported =
+            std::string(ex.what()).find("judging cancelled") != std::string::npos;
+    }
+    require(cancellation_reported,
+            "a cancellation between test jobs returned placeholder result rows");
+    require(judge_run_directories(contest) == retained_runs,
+            "a cancelled judge run left its invocation work directory behind");
 
     auto first = std::async(std::launch::async, [=]() {
         return neothemis::make_judge_core("builtin")->judge(judge_options(contest, security));
@@ -782,6 +803,164 @@ void test_unicode_process_paths() {
             "Unicode contest, contestant, problem, or process path was not preserved");
 }
 
+void test_cpu_time_accounting() {
+    TemporaryDirectory temporary("neothemis-cpu-time-test");
+    const fs::path contest = temporary.path() / "contest";
+    constexpr std::uint64_t time_limit_ms = 200;
+
+    auto create_timed_problem = [&](const std::string& problem) {
+        create_problem(contest, problem, "ok\n");
+        write_file(contest / "tests" / problem / "problem.conf",
+                   "time_limit_ms=" + std::to_string(time_limit_ms) + "\n"
+                   "memory_limit_mb=256\n"
+                   "default_points=2\n"
+                   "checker=token\n");
+    };
+    create_timed_problem("SLEEP");
+    create_timed_problem("WORK");
+    create_timed_problem("BURN");
+
+    write_file(contest / "contestants" / "Timing" / "SLEEP.cpp",
+               "#include <chrono>\n"
+               "#include <fstream>\n"
+               "#include <thread>\n"
+               "int main(){"
+               "std::this_thread::sleep_for(std::chrono::milliseconds(1500));"
+               "std::ofstream(\"SLEEP.out\")<<\"ok\\n\";"
+               "}\n");
+    auto cpu_burn_source = [](const std::string& problem, std::uint64_t target_ms) {
+        return std::string(
+                   "#include <cstdint>\n"
+                   "#include <fstream>\n"
+                   "#ifdef _WIN32\n"
+                   "#include <windows.h>\n"
+                   "std::uint64_t cpu_ms(){"
+                   "FILETIME creation{},exit{},kernel{},user{};"
+                   "if(!GetProcessTimes(GetCurrentProcess(),&creation,&exit,&kernel,&user))return 0;"
+                   "const auto ticks=[](const FILETIME& value){"
+                   "return(static_cast<std::uint64_t>(value.dwHighDateTime)<<32)|"
+                   "value.dwLowDateTime;};"
+                   "return(ticks(kernel)+ticks(user))/10000ULL;"
+                   "}\n"
+                   "#else\n"
+                   "#include <ctime>\n"
+                   "std::uint64_t cpu_ms(){"
+                   "return static_cast<std::uint64_t>(std::clock())*1000ULL/CLOCKS_PER_SEC;"
+                   "}\n"
+                   "#endif\n"
+                   "int main(){"
+                   "volatile unsigned long long value=1;"
+                   "const std::uint64_t start=cpu_ms();"
+                   "while(cpu_ms()-start<") +
+               std::to_string(target_ms) +
+               "){value=value*1664525ULL+1013904223ULL;}"
+               "std::ofstream(\"" + problem + ".out\")<<\"ok\\n\";"
+               "(void)value;return 0;}\n";
+    };
+    write_file(contest / "contestants" / "Timing" / "WORK.cpp",
+               cpu_burn_source("WORK", 80));
+    write_file(contest / "contestants" / "Timing" / "BURN.cpp",
+               cpu_burn_source("BURN", 600));
+
+#ifdef __linux__
+    constexpr auto security = neothemis::ExecutionSecurity::Required;
+#else
+    constexpr auto security = neothemis::ExecutionSecurity::ExplicitlyUnsafe;
+#endif
+    neothemis::JudgeOptions options = judge_options(contest, security);
+    options.parallel_jobs = 1;
+#ifdef __linux__
+    int initial_subreaper_state = -1;
+    require(prctl(PR_GET_CHILD_SUBREAPER, &initial_subreaper_state) == 0,
+            "failed to read the application's initial child-subreaper state");
+#endif
+    const auto wall_started = std::chrono::steady_clock::now();
+    const auto results = neothemis::make_judge_core("builtin")->judge(options);
+    const auto wall_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - wall_started)
+                                     .count();
+
+#ifdef __linux__
+    int parent_is_subreaper = -1;
+    require(prctl(PR_GET_CHILD_SUBREAPER, &parent_is_subreaper) == 0 &&
+                parent_is_subreaper == initial_subreaper_state,
+            "sandbox accounting leaked child-subreaper state into the application");
+#endif
+
+    require(results.size() == 3, "CPU-time fixture returned the wrong row count");
+    const auto& sleeping = find_result(results, "Timing", "SLEEP");
+    require(sleeping.verdict == neothemis::Verdict::Accepted,
+            "a sleeping program was charged wall time instead of CPU time");
+    require(sleeping.time_ms < 150,
+            "reported test time included a sleeping program's wall time");
+    require(wall_elapsed_ms >= 1300,
+            "CPU-time fixture did not exercise a meaningful wall-time delay");
+
+    const auto& working = find_result(results, "Timing", "WORK");
+    require(working.verdict == neothemis::Verdict::Accepted,
+            "CPU work below the configured limit was not accepted");
+    require(working.time_ms >= 40 && working.time_ms <= time_limit_ms,
+            "a completed program's reported CPU time was not preserved");
+
+    const auto& burning = find_result(results, "Timing", "BURN");
+    require(burning.verdict == neothemis::Verdict::TimeLimitExceeded,
+            "a CPU-burning program did not exceed the CPU-time limit");
+    require(burning.time_ms >= time_limit_ms / 2,
+            "CPU-burning program reported implausibly little CPU time");
+
+#ifdef __linux__
+    const fs::path unsafe_contest = temporary.path() / "unsafe-contest";
+    create_problem(unsafe_contest, "ORPHAN", "ok\n");
+    write_file(unsafe_contest / "tests" / "ORPHAN" / "problem.conf",
+               "time_limit_ms=200\n"
+               "memory_limit_mb=256\n"
+               "default_points=1\n"
+               "checker=token\n");
+    write_file(unsafe_contest / "contestants" / "Timing" / "ORPHAN.cpp",
+               "#include <ctime>\n"
+               "#include <fstream>\n"
+               "#include <unistd.h>\n"
+               "int main(){pid_t child=fork();if(child<0)return 2;if(child==0){"
+               "volatile unsigned long long value=1;const auto start=std::clock();"
+               "while((std::clock()-start)*1000/CLOCKS_PER_SEC<80){"
+               "value=value*1664525ULL+1013904223ULL;}_exit(value==0);}"
+               "usleep(400000);std::ofstream(\"ORPHAN.out\")<<\"ok\\n\";return 0;}\n");
+    const fs::path escaped_marker = temporary.path() / "escaped-child.marker";
+    create_problem(unsafe_contest, "ESCAPE", "unused\n");
+    write_file(unsafe_contest / "tests" / "ESCAPE" / "problem.conf",
+               "time_limit_ms=100\n"
+               "memory_limit_mb=256\n"
+               "default_points=1\n"
+               "checker=token\n");
+    write_file(unsafe_contest / "contestants" / "Timing" / "ESCAPE.cpp",
+               "#include <ctime>\n"
+               "#include <fstream>\n"
+               "#include <unistd.h>\n"
+               "int main(){pid_t child=fork();if(child<0)return 2;if(child==0){setsid();"
+               "volatile unsigned long long value=1;const auto start=std::clock();"
+               "while((std::clock()-start)*1000/CLOCKS_PER_SEC<500){"
+               "value=value*1664525ULL+1013904223ULL;}std::ofstream(\"" +
+                   cpp_string(escaped_marker) +
+                   "\")<<value;_exit(0);}for(;;)pause();}\n");
+    neothemis::JudgeOptions unsafe_options = judge_options(
+        unsafe_contest, neothemis::ExecutionSecurity::ExplicitlyUnsafe);
+    unsafe_options.parallel_jobs = 1;
+    const auto unsafe_results =
+        neothemis::make_judge_core("builtin")->judge(unsafe_options);
+    const auto& orphan = find_result(unsafe_results, "Timing", "ORPHAN");
+    require(orphan.verdict == neothemis::Verdict::Accepted &&
+                orphan.time_ms >= 40,
+            "unsafe Linux accounting omitted an un-waited child process");
+    const auto& escaped = find_result(unsafe_results, "Timing", "ESCAPE");
+    require(escaped.verdict == neothemis::Verdict::TimeLimitExceeded &&
+                escaped.time_ms >= 50,
+            "an unsafe setsid descendant escaped CPU-time enforcement");
+    std::this_thread::sleep_for(std::chrono::milliseconds(650));
+    require(!fs::exists(escaped_marker),
+            "an unsafe setsid descendant survived the judged process tree");
+#endif
+}
+
 void test_windows_custom_compiler_runtime_path() {
 #ifdef _WIN32
     TemporaryDirectory temporary("neothemis-windows-compiler-path-test");
@@ -876,6 +1055,42 @@ void test_windows_descendant_cleanup() {
             "a descendant process outlived the judged Windows process tree");
     require(judge_run_directories(contest).empty(),
             "Windows descendant process prevented invocation work cleanup");
+#endif
+}
+
+void test_windows_descendant_cpu_accounting() {
+#ifdef _WIN32
+    TemporaryDirectory temporary("neothemis-windows-descendant-cpu-test");
+    const fs::path contest = temporary.path() / "contest";
+    create_problem(contest, "TREECPU", "1\n");
+    write_file(
+        contest / "contestants" / "Tree" / "TREECPU.cpp",
+        "#include <windows.h>\n"
+        "#include <cstdint>\n"
+        "#include <fstream>\n"
+        "#include <string>\n"
+        "std::uint64_t cpu_ms(){FILETIME c{},e{},k{},u{};"
+        "GetProcessTimes(GetCurrentProcess(),&c,&e,&k,&u);"
+        "auto ticks=[](const FILETIME& v){return(static_cast<std::uint64_t>(v.dwHighDateTime)"
+        "<<32)|v.dwLowDateTime;};return(ticks(k)+ticks(u))/10000ULL;}"
+        "int main(int argc,char**){if(argc>1){volatile unsigned long long value=1;"
+        "const auto start=cpu_ms();while(cpu_ms()-start<100){"
+        "value=value*1664525ULL+1013904223ULL;}return value==0;}"
+        "wchar_t exe[32768];DWORD n=GetModuleFileNameW(nullptr,exe,32768);"
+        "std::wstring command=L\"\\\"\"+std::wstring(exe,n)+L\"\\\" child\";"
+        "STARTUPINFOW startup{};startup.cb=sizeof(startup);PROCESS_INFORMATION process{};"
+        "if(!CreateProcessW(nullptr,&command[0],nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,"
+        "nullptr,&startup,&process))return 2;CloseHandle(process.hThread);"
+        "WaitForSingleObject(process.hProcess,INFINITE);CloseHandle(process.hProcess);"
+        "std::ofstream(\"TREECPU.out\")<<1;return 0;}\n");
+
+    neothemis::JudgeOptions options =
+        judge_options(contest, neothemis::ExecutionSecurity::ExplicitlyUnsafe);
+    options.parallel_jobs = 1;
+    const auto results = neothemis::make_judge_core("builtin")->judge(options);
+    const auto& result = find_result(results, "Tree", "TREECPU");
+    require(result.verdict == neothemis::Verdict::Accepted && result.time_ms >= 50,
+            "Windows job CPU accounting omitted a child process");
 #endif
 }
 
@@ -1059,14 +1274,14 @@ void test_config_and_csv_modules() {
                                                                  "stack_limit_mb=999\n"
                                                                  "default_points=1.5\n"
                                                                  "checker=custom:checker.cpp\n"
-                                                                 "test_points.1=4\n"
+                                                                 "test_points.1=1.87\n"
                                                                  "test_points.2=\n");
     const auto problem =
         neothemis::load_problem_config(problem_root / neothemis::kProblemConfigFilename);
     require(problem.time_limit_ms == 2500 && problem.memory_limit_mb == 128 &&
                 problem.checker == "custom:checker.cpp",
             "typed problem settings were not loaded");
-    require(neothemis::points_for_test(problem, "test001") == 4.0 &&
+    require(neothemis::points_for_test(problem, "test001") == 1.87 &&
                 neothemis::points_for_test(problem, "test002") == 1.5,
             "problem point aliases/defaults changed");
     require(neothemis::test_point_keys("test001") ==
@@ -1086,6 +1301,12 @@ void test_config_and_csv_modules() {
     require(neothemis::read_config_values(rewritten_problem_config).at("stack_limit_mb") ==
                 std::vector<std::string>({"999"}),
             "typed problem config writer discarded a harmless legacy setting");
+    const neothemis::ConfigValues rewritten_values =
+        neothemis::read_config_values(rewritten_problem_config);
+    require(rewritten_values.at("default_points") == std::vector<std::string>({"1.5"}) &&
+                rewritten_values.at("test_points.1") ==
+                    std::vector<std::string>({"1.87"}),
+            "problem point values were expanded into binary floating-point artifacts");
 
     const fs::path malformed = temporary.path() / "malformed.conf";
     write_file(malformed, "good=value\nnot-an-entry\n");
@@ -1249,6 +1470,11 @@ void test_spreadsheet_xlsx() {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--cpu-time-only") {
+            test_cpu_time_accounting();
+            std::cout << "CPU-time regression passed\n";
+            return 0;
+        }
 #ifdef _WIN32
         if (argc == 2 && std::string(argv[1]) == "--custom-compiler-runtime-only") {
             test_windows_custom_compiler_runtime_path();
@@ -1265,8 +1491,10 @@ int main(int argc, char** argv) {
         test_custom_checker_partial_points();
         test_symlinked_contest_entries_are_not_followed();
         test_unicode_process_paths();
+        test_cpu_time_accounting();
         test_windows_custom_compiler_runtime_path();
         test_windows_descendant_cleanup();
+        test_windows_descendant_cpu_accounting();
         test_archive_and_csv();
         test_config_and_csv_modules();
         test_spreadsheet_xlsx();

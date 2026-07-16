@@ -981,8 +981,8 @@ QWidget* MainWindow::build_problem_tab(QWidget* parent, SettingsDialog* settings
         *loaded_problem_config = config;
         time->setValue(static_cast<int>(config.time_limit_ms));
         memory->setValue(static_cast<int>(config.memory_limit_mb));
-        points->setText(
-            QString::number(config.default_points, 'g', std::numeric_limits<double>::max_digits10));
+        points->setText(QString::fromStdString(
+            neothemis::format_config_number(config.default_points)));
         checker->setCurrentText(QString::fromStdString(config.checker));
 
         std::vector<std::string> tests = test_names_for_problem(problem_root);
@@ -997,9 +997,7 @@ QWidget* MainWindow::build_problem_tab(QWidget* parent, SettingsDialog* settings
             for (const auto& key : neothemis::test_point_keys(test_name)) {
                 auto found = config.test_points.find(key);
                 if (found != config.test_points.end()) {
-                    override_points = QString::number(found->second, 'g',
-                                                      std::numeric_limits<double>::max_digits10)
-                                          .toStdString();
+                    override_points = neothemis::format_config_number(found->second);
                     break;
                 }
             }

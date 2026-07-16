@@ -295,56 +295,320 @@ fs::path create_new_snapshot_directory(const fs::path& submissions_root, int sub
     return directory;
 }
 
+QString status_badge(const QString& value, bool verdict = false) {
+    const QString normalized = value.trimmed().toLower();
+    QString tone = "badge-muted";
+    if (normalized == "done" || normalized == "accepted" || normalized == "ac") {
+        tone = "badge-ok";
+    } else if (normalized == "running" || normalized == "staging") {
+        tone = "badge-run";
+    } else if (normalized == "queued" || normalized == "partial" || normalized == "pc") {
+        tone = "badge-warn";
+    } else if (normalized == "failed" || normalized == "ignored" ||
+               normalized == "wa" || normalized == "ce" || normalized == "re" ||
+               normalized == "tle" || normalized == "mle" || normalized == "ie" ||
+               normalized == "sv" || normalized == "cancelled") {
+        tone = "badge-bad";
+    } else if (verdict && normalized.isEmpty()) {
+        return "<span class=\"badge badge-muted\">Pending</span>";
+    }
+    const QString label = value.trimmed().isEmpty() ? QString("Pending") : value;
+    return "<span class=\"badge " + tone + "\">" + html_escape(label) + "</span>";
+}
+
 QString page_shell(const QString& title,
                    const QString& body,
                    const std::optional<User>& user,
                    bool show_ranking) {
-    QString nav = "<nav><a class=\"brand\" href=\"/\"><img src=\"/assets/logo.png\" "
-                  "alt=\"\"><strong>NeoThemis</strong></a><div class=\"nav-links\">"
-                  "<a href=\"/\">Submit</a><a href=\"/submissions\">Submissions</a>";
+    auto nav_link = [&](const QString& label, const QString& href,
+                        const QStringList& active_titles = {}) {
+        const bool active = active_titles.contains(title);
+        return "<a class=\"nav-link" + QString(active ? " active" : "") +
+               "\" href=\"" + href + "\">" + label + "</a>";
+    };
+    QString nav =
+        "<nav><div class=\"nav-shell\"><a class=\"brand\" href=\"/\">"
+        "<span class=\"brand-mark\"><img src=\"/assets/logo.png\" alt=\"\"></span>"
+        "<span class=\"brand-copy\"><strong>NeoThemis</strong>"
+        "<small>Contest judge</small></span></a><div class=\"nav-links\">" +
+        nav_link("Submit", "/", {"Submit"}) +
+        nav_link("Submissions", "/submissions", {"Submissions", "Details"});
     if (show_ranking) {
-        nav += "<a href=\"/ranking\">Ranking</a>";
+        nav += nav_link("Ranking", "/ranking", {"Ranking"});
     }
     if (user && user->role == "admin") {
-        nav += "<a href=\"/admin\">Admin</a>";
+        nav += nav_link("Admin", "/admin", {"Admin"});
     }
     if (user) {
-        nav += "<span class=\"nav-user\">" + html_escape(user->username) +
-               "</span><a href=\"/logout\">Logout</a>";
+        nav += "<span class=\"nav-user\"><span class=\"nav-avatar\">" +
+               html_escape(user->username.left(1).toUpper()) + "</span><span>" +
+               html_escape(user->username) + "</span></span>"
+               "<a class=\"nav-link nav-logout\" href=\"/logout\">Logout</a>";
     } else {
-        nav += "<a href=\"/login\">Login</a><a href=\"/register\">Register</a>";
+        nav += nav_link("Login", "/login", {"Login"}) +
+               "<a class=\"nav-cta\" href=\"/register\">Register</a>";
     }
-    nav += "</div></nav>";
+    nav += "</div></div></nav>";
 
+    const QString styles = QString::fromUtf8(R"CSS(
+        :root {
+          color-scheme: dark;
+          font-family: Inter, "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+          --bg: #070b12;
+          --surface: rgba(14, 22, 32, .88);
+          --surface-strong: rgba(17, 27, 39, .96);
+          --surface-soft: rgba(255, 255, 255, .035);
+          --line: rgba(173, 205, 216, .13);
+          --line-strong: rgba(122, 227, 213, .30);
+          --text: #eaf1f6;
+          --muted: #91a3b0;
+          --primary: #5ed8c8;
+          --primary-strong: #2d8f85;
+          --secondary: #e47792;
+          --warning: #ffc76b;
+          --danger: #ff8ca4;
+          background: var(--bg);
+          color: var(--text);
+        }
+        * { box-sizing: border-box; }
+        html { min-height: 100%; background: var(--bg); }
+        body {
+          margin: 0;
+          min-height: 100vh;
+          background:
+            radial-gradient(circle at 10% -10%, rgba(64, 184, 176, .18), transparent 32rem),
+            radial-gradient(circle at 92% 105%, rgba(211, 76, 112, .15), transparent 36rem),
+            linear-gradient(145deg, #0a121b 0%, #080d15 48%, #100b14 100%);
+          background-attachment: fixed;
+          font-size: 14px;
+          line-height: 1.55;
+        }
+        body::before {
+          content: "";
+          position: fixed;
+          inset: 0;
+          z-index: 0;
+          pointer-events: none;
+          opacity: .18;
+          background-image:
+            linear-gradient(rgba(255,255,255,.026) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,.026) 1px, transparent 1px);
+          background-size: 48px 48px;
+          mask-image: linear-gradient(to bottom, black, transparent 78%);
+        }
+        a { color: var(--primary); }
+        nav {
+          position: sticky;
+          top: 0;
+          z-index: 20;
+          border-bottom: 1px solid rgba(255,255,255,.08);
+          background: rgba(7, 12, 19, .82);
+          backdrop-filter: blur(22px) saturate(140%);
+        }
+        .nav-shell {
+          width: min(1180px, calc(100% - 40px));
+          min-height: 70px;
+          margin: 0 auto;
+          display: flex;
+          align-items: center;
+          gap: 28px;
+        }
+        .brand {
+          display: flex;
+          align-items: center;
+          gap: 11px;
+          margin-right: auto;
+          color: var(--text);
+          text-decoration: none;
+          white-space: nowrap;
+        }
+        .brand-mark {
+          width: 38px;
+          height: 38px;
+          display: grid;
+          place-items: center;
+          border: 1px solid rgba(126, 236, 221, .24);
+          border-radius: 12px;
+          background: linear-gradient(145deg, rgba(94,216,200,.14), rgba(228,119,146,.10));
+          box-shadow: 0 8px 24px rgba(0,0,0,.22);
+        }
+        .brand img { width: 27px; height: 27px; object-fit: contain; }
+        .brand-copy { display: grid; line-height: 1.12; }
+        .brand-copy strong { font-size: 15px; letter-spacing: .01em; }
+        .brand-copy small { margin-top: 3px; color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+        .nav-links { display: flex; align-items: center; gap: 5px; }
+        .nav-link, .nav-cta {
+          color: #b9c7d0;
+          text-decoration: none;
+          font-size: 13px;
+          font-weight: 650;
+          white-space: nowrap;
+          padding: 8px 11px;
+          border: 1px solid transparent;
+          border-radius: 9px;
+          transition: color .16s ease, background .16s ease, border-color .16s ease;
+        }
+        .nav-link:hover { color: #ecfffb; background: rgba(255,255,255,.045); }
+        .nav-link.active { color: #b9fff5; background: rgba(94,216,200,.09); border-color: rgba(94,216,200,.16); }
+        .nav-cta { color: #fff; background: #287b74; border-color: rgba(142,247,227,.28); }
+        .nav-cta:hover { background: #329087; }
+        .nav-user {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-left: 9px;
+          padding-left: 14px;
+          border-left: 1px solid rgba(255,255,255,.10);
+          color: #c7d3da;
+          font-size: 13px;
+          white-space: nowrap;
+        }
+        .nav-avatar {
+          width: 28px;
+          height: 28px;
+          display: grid;
+          place-items: center;
+          border-radius: 9px;
+          color: #cafff7;
+          background: rgba(94,216,200,.12);
+          border: 1px solid rgba(94,216,200,.18);
+          font-size: 12px;
+          font-weight: 800;
+        }
+        .nav-logout { color: var(--muted); }
+        main {
+          position: relative;
+          z-index: 1;
+          width: min(1180px, calc(100% - 40px));
+          margin: 0 auto;
+          padding: 38px 0 64px;
+        }
+        h1 { margin: 0; font-size: clamp(24px, 3vw, 32px); line-height: 1.18; letter-spacing: -.025em; }
+        h2 { margin: 0 0 8px; font-size: 17px; }
+        p { margin: 10px 0; }
+        .page-heading { margin: 0 2px 24px; }
+        .eyebrow { margin-bottom: 7px; color: var(--primary); font-size: 11px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+        .page-subtitle { max-width: 680px; margin: 8px 0 0; color: var(--muted); }
+        .content-grid { display: grid; grid-template-columns: minmax(0, 1fr) 310px; gap: 18px; align-items: start; }
+        .content-grid > .panel { margin: 0; }
+        .panel {
+          overflow-x: auto;
+          margin: 18px 0;
+          padding: 26px;
+          border: 1px solid var(--line);
+          border-radius: 18px;
+          background: linear-gradient(145deg, rgba(18,29,41,.91), rgba(11,18,27,.88));
+          box-shadow: 0 24px 60px rgba(0,0,0,.24), inset 0 1px rgba(255,255,255,.025);
+          backdrop-filter: blur(18px);
+        }
+        .panel-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+        .panel-header p { margin: 5px 0 0; color: var(--muted); }
+        .notice { overflow: hidden; position: relative; padding: 22px; }
+        .notice::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: linear-gradient(var(--secondary), var(--warning)); }
+        .notice h2 { display: flex; align-items: center; gap: 9px; color: #ffe9ee; }
+        .notice h2::before { content: ""; width: 9px; height: 9px; border-radius: 99px; background: var(--secondary); box-shadow: 0 0 0 5px rgba(228,119,146,.11); }
+        .notice p { color: #b9aeb6; font-size: 13px; }
+        .warn { border-color: rgba(228,119,146,.25); background: linear-gradient(145deg, rgba(58,25,39,.70), rgba(25,18,28,.82)); }
+        form { margin: 0; }
+        label { display: block; margin: 0 0 7px; color: #cfdae1; font-size: 12px; font-weight: 750; letter-spacing: .015em; }
+        input, select, textarea {
+          width: 100%;
+          margin: 0 0 18px;
+          padding: 11px 13px;
+          border: 1px solid rgba(178,205,215,.18);
+          border-radius: 10px;
+          outline: none;
+          background: rgba(6,12,19,.74);
+          color: #f0f7f8;
+          font: inherit;
+          transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+        }
+        input:hover, select:hover, textarea:hover { border-color: rgba(122,227,213,.30); }
+        input:focus, select:focus, textarea:focus { border-color: rgba(122,227,213,.72); background: rgba(7,15,23,.92); box-shadow: 0 0 0 4px rgba(94,216,200,.09); }
+        textarea { min-height: 390px; font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; tab-size: 4; }
+        .field-help { margin: -10px 0 18px; color: var(--muted); font-size: 12px; }
+        .code-editor { position: relative; margin: 0 0 12px; overflow: hidden; border: 1px solid rgba(122,227,213,.22); border-radius: 13px; background: #071019; box-shadow: inset 0 1px 14px rgba(0,0,0,.22); }
+        .code-editor:focus-within { border-color: rgba(122,227,213,.68); box-shadow: 0 0 0 4px rgba(94,216,200,.08); }
+        .code-editor textarea, .code-editor pre { box-sizing: border-box; width: 100%; min-height: 390px; margin: 0; padding: 17px; font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; font-size: 13.5px; line-height: 1.55; tab-size: 4; white-space: pre-wrap; overflow: auto; }
+        .code-editor textarea { position: relative; z-index: 2; border: 0; resize: vertical; background: transparent; color: #effbfc; }
+        .code-editor pre { position: absolute; inset: 0; z-index: 1; pointer-events: none; color: #dcebed; }
+        .code-editor.highlighting textarea { color: transparent; caret-color: #effbfc; }
+        .tok-kw { color: #ff8fb3; font-weight: 700; }.tok-type { color: #8ef7e3; }.tok-lit { color: #ffd37a; }.tok-comment { color: #718893; font-style: italic; }.tok-pre { color: #c3a6ff; }
+        button {
+          min-height: 42px;
+          padding: 10px 17px;
+          border: 1px solid rgba(142,247,227,.28);
+          border-radius: 10px;
+          background: #287b74;
+          color: white;
+          font: inherit;
+          font-weight: 750;
+          cursor: pointer;
+          transition: transform .14s ease, background .14s ease, border-color .14s ease;
+        }
+        button:hover { transform: translateY(-1px); background: #329087; border-color: rgba(142,247,227,.62); }
+        button:active { transform: translateY(0); }
+        button.compact { min-height: 32px; padding: 6px 10px; border-color: rgba(255,140,164,.25); background: rgba(126,43,64,.48); font-size: 12px; }
+        button.compact:hover { background: rgba(154,50,76,.72); border-color: rgba(255,140,164,.52); }
+        .form-actions { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 6px; }
+        .inline-form { margin: 0; }
+        table { width: 100%; min-width: 660px; border-spacing: 0; border-collapse: separate; color: #dce6eb; }
+        th, td { padding: 13px 14px; text-align: left; vertical-align: middle; border-bottom: 1px solid rgba(255,255,255,.07); }
+        th { position: sticky; top: 0; z-index: 1; color: #9dfdec; background: rgba(18,31,41,.98); font-size: 11px; font-weight: 800; letter-spacing: .055em; text-transform: uppercase; }
+        th:first-child { border-top-left-radius: 11px; } th:last-child { border-top-right-radius: 11px; }
+        tbody tr { transition: background .12s ease; } tbody tr:hover { background: rgba(94,216,200,.045); }
+        tbody tr:last-child td { border-bottom: 0; }
+        td a { color: #9dfdec; font-weight: 700; text-decoration: none; } td a:hover { text-decoration: underline; }
+        .badge, .pill { display: inline-flex; align-items: center; gap: 6px; min-height: 25px; padding: 3px 9px; border: 1px solid rgba(255,255,255,.10); border-radius: 999px; background: rgba(255,255,255,.055); color: #c6d1d8; font-size: 11px; font-weight: 800; white-space: nowrap; text-transform: uppercase; letter-spacing: .035em; }
+        .badge::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; opacity: .82; }
+        .badge-ok { color: #8ff1c4; background: rgba(53,179,121,.10); border-color: rgba(80,218,151,.18); }
+        .badge-run { color: #89e9ff; background: rgba(60,166,209,.10); border-color: rgba(89,206,244,.18); }
+        .badge-warn { color: #ffd27d; background: rgba(213,156,53,.10); border-color: rgba(255,196,87,.18); }
+        .badge-bad { color: #ff9fb3; background: rgba(211,76,112,.11); border-color: rgba(255,126,157,.20); }
+        .badge-muted { color: #9baab4; }
+        .rank { display: inline-grid; width: 29px; height: 29px; place-items: center; border-radius: 9px; background: rgba(255,255,255,.05); color: #b8c7cf; font-size: 12px; font-weight: 800; }
+        .rank-top { color: #ffe59a; background: rgba(226,179,69,.12); border: 1px solid rgba(255,214,111,.16); }
+        .score-total { color: #c6fff7; font-size: 15px; }
+        .muted { color: var(--muted); }.err { color: var(--danger); }.ok { color: #8ff1c4; }
+        .alert { margin: 0 0 18px; padding: 11px 13px; border: 1px solid rgba(255,140,164,.22); border-radius: 10px; background: rgba(126,43,64,.16); color: #ffb6c5; }
+        .empty-state { padding: 38px 18px; text-align: center; color: var(--muted); }
+        .auth-main { max-width: 540px; padding-top: 64px; }
+        .auth-main .panel { margin: 0; }
+        @media (max-width: 900px) {
+          .nav-shell { width: min(100% - 24px, 1180px); gap: 12px; }
+          .brand-copy small { display: none; }
+          .nav-links { overflow-x: auto; padding: 8px 0; scrollbar-width: none; }
+          .nav-links::-webkit-scrollbar { display: none; }
+          .nav-user { display: none; }
+          main { width: min(100% - 24px, 1180px); padding-top: 26px; }
+          .content-grid { grid-template-columns: 1fr; }
+          .content-grid .notice { order: -1; }
+        }
+        @media (max-width: 620px) {
+          .nav-shell { align-items: flex-start; flex-wrap: wrap; padding: 10px 0 8px; }
+          .brand-mark { width: 34px; height: 34px; }.brand img { width: 24px; height: 24px; }
+          .nav-links { width: 100%; order: 2; }
+          .nav-link, .nav-cta { padding: 7px 9px; }
+          main { padding-bottom: 36px; }
+          .panel { margin: 12px 0; padding: 19px; border-radius: 15px; }
+          .page-heading { margin-bottom: 18px; }
+          .panel-header { display: block; margin-bottom: 18px; }
+          .form-actions { align-items: stretch; flex-direction: column; }
+          button { width: 100%; }
+          .code-editor textarea, .code-editor pre { min-height: 340px; padding: 13px; font-size: 12.5px; }
+        }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; } }
+    )CSS");
+    const QString main_class = !user && (title == "Login" || title == "Register")
+                                   ? " class=\"auth-main\""
+                                   : QString();
     return "<!doctype html><html><head><meta charset=\"utf-8\">"
            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+           "<meta name=\"theme-color\" content=\"#080d15\">"
            "<link rel=\"icon\" type=\"image/png\" href=\"/assets/logo.png\">"
-           "<title>" + html_escape(title) + "</title>"
-           "<style>"
-           ":root{color-scheme:dark;font-family:Inter,Segoe UI,Arial,sans-serif;background:#090d12;color:#edf3f7}"
-           "*{box-sizing:border-box}body{margin:0;min-height:100vh;background:linear-gradient(135deg,#0d2b34 0%,#0b1821 31%,#1b1420 65%,#2b1523 84%,#190d17 100%);background-attachment:fixed}"
-           "body:before{content:'';position:fixed;inset:0;pointer-events:none;background:linear-gradient(107deg,transparent 17%,rgba(83,220,203,.04) 17.2%,transparent 40%),linear-gradient(73deg,transparent 58%,rgba(211,76,112,.035) 58.2%,transparent 80%)}"
-           "main{position:relative;max-width:1120px;margin:0 auto;padding:28px 22px 52px}"
-           "nav{position:sticky;top:0;z-index:10;display:flex;align-items:center;gap:28px;min-height:62px;padding:9px max(22px,calc((100vw - 1120px)/2));background:rgba(15,22,29,.88);border-bottom:1px solid rgba(84,211,194,.25);backdrop-filter:blur(18px)}"
-           "nav a{color:#d9e6ec;text-decoration:none;font-weight:700;white-space:nowrap}nav a:hover{color:#9dfdec}"
-           ".brand{display:flex;align-items:center;gap:10px;margin-right:auto;color:#f8fafc!important;font-size:15px}.brand img{width:30px;height:30px;object-fit:contain}.nav-links{display:flex;align-items:center;gap:18px}.nav-user{padding-left:18px;margin-left:4px;border-left:1px solid rgba(255,255,255,.14);color:#b8c9cf;white-space:nowrap}"
-           "h1{margin:0 0 18px;font-size:24px;letter-spacing:0}p{line-height:1.55}label{display:block;color:#cfe0e5;font-weight:700;margin-top:3px}"
-           ".panel{overflow-x:auto;background:rgba(15,25,33,.82);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:22px;margin:18px 0;box-shadow:0 16px 38px rgba(0,0,0,.22);backdrop-filter:blur(16px)}"
-           "input,select,textarea{box-sizing:border-box;width:100%;background:rgba(7,16,23,.88);color:#effbfc;border:1px solid rgba(116,224,207,.42);border-radius:7px;padding:11px 12px;margin:7px 0 16px;outline:none}input:focus,select:focus,textarea:focus{border-color:#8ef7e3;box-shadow:0 0 0 3px rgba(97,215,199,.12)}"
-           "textarea{min-height:360px;font-family:Consolas,monospace;tab-size:4}"
-           ".code-editor{position:relative;margin:7px 0 14px;background:#071017;border:1px solid rgba(116,224,207,.42);border-radius:7px;overflow:hidden}"
-           ".code-editor textarea,.code-editor pre{box-sizing:border-box;width:100%;min-height:360px;margin:0;padding:10px;font-family:Consolas,monospace;font-size:14px;line-height:1.45;tab-size:4;white-space:pre-wrap;overflow:auto}"
-           ".code-editor textarea{position:relative;z-index:2;background:transparent;border:0;resize:vertical;color:#effbfc}"
-           ".code-editor pre{position:absolute;inset:0;z-index:1;pointer-events:none;color:#dcebed}"
-           ".code-editor.highlighting textarea{color:transparent;caret-color:#effbfc}"
-           ".tok-kw{color:#ff8fb3;font-weight:700}.tok-type{color:#8ef7e3}.tok-lit{color:#ffd37a}.tok-comment{color:#8398a0;font-style:italic}.tok-pre{color:#c3a6ff}"
-           "button{background:#236d68;color:white;border:1px solid rgba(142,247,227,.35);border-radius:7px;padding:10px 15px;font-weight:800;cursor:pointer}button:hover{background:#2c8179;border-color:#8ef7e3}"
-           "button.compact{padding:6px 10px;font-size:12px}.inline-form{margin:0}"
-           "table{width:100%;border-collapse:collapse;background:rgba(10,16,22,.54);min-width:620px}th{color:#9dfdec;background:rgba(19,31,39,.78);border-bottom:1px solid rgba(232,106,130,.45)}th,td{padding:10px;text-align:left;vertical-align:top}td{border-bottom:1px solid rgba(255,255,255,.09)}tbody tr:hover{background:rgba(84,211,194,.06)}td a{color:#8ef7e3}"
-           ".warn{border-color:rgba(255,112,137,.48);background:rgba(70,24,40,.56)}.muted{color:#a8bdc4}.err{color:#ff9aae}.ok{color:#8ef7e3}.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#35202b;color:#ffb3c4;font-weight:700}"
-           "@media(max-width:700px){nav{position:relative;align-items:flex-start;gap:10px;padding:10px 14px}.brand{padding-top:3px}.nav-links{justify-content:flex-end;gap:10px;flex-wrap:wrap;font-size:13px}.nav-user{width:100%;padding:0;border:0;text-align:right;order:-1}main{padding:14px 10px 36px}.panel{padding:16px;margin:12px 0}h1{font-size:21px}}"
-           "</style><script src=\"/assets/submit.js\" defer></script></head><body>" +
-           nav + "<main>" + body + "</main></body></html>";
+           "<title>" + html_escape(title) + " · NeoThemis</title><style>" + styles +
+           "</style><script src=\"/assets/submit.js\" defer></script></head><body>" + nav +
+           "<main" + main_class + ">" + body + "</main></body></html>";
 }
 
 QString syntax_highlight_script() {
@@ -615,14 +879,21 @@ private:
     }
 
     HttpResponse login_page(const QString& error, const std::optional<User>& user) {
-        QString body = "<section class=\"panel\"><h1>Login</h1>";
+        QString body =
+            "<div class=\"page-heading\"><div class=\"eyebrow\">Contest access</div>"
+            "<h1>Welcome back</h1><p class=\"page-subtitle\">Sign in to submit code and "
+            "follow your judge results.</p></div>"
+            "<section class=\"panel\"><div class=\"panel-header\"><div><h2>Sign in</h2>"
+            "<p>Use the account provided by your contest administrator.</p></div></div>";
         if (!error.isEmpty()) {
-            body += "<p class=\"err\">" + html_escape(error) + "</p>";
+            body += "<p class=\"alert\">" + html_escape(error) + "</p>";
         }
         body += "<form method=\"post\" action=\"/login\">"
                 "<label>Username</label><input name=\"username\" autocomplete=\"username\" required>"
                 "<label>Password</label><input name=\"password\" type=\"password\" autocomplete=\"current-password\" required>"
-                "<button type=\"submit\">Login</button></form></section>";
+                "<div class=\"form-actions\"><span class=\"muted\">New contestant? "
+                "<a href=\"/register\">Create an account</a></span>"
+                "<button type=\"submit\">Sign in</button></div></form></section>";
         return html_response(render_shell("Login", body, user));
     }
 
@@ -643,20 +914,27 @@ private:
 
     HttpResponse register_page(const QString& error, const std::optional<User>& user) {
         QString body =
-            "<section class=\"panel warn\"><h1>Security Notice</h1>"
+            "<div class=\"page-heading\"><div class=\"eyebrow\">Contest registration</div>"
+            "<h1>Create your contestant account</h1><p class=\"page-subtitle\">Join this "
+            "contest using the code shared by an administrator.</p></div>"
+            "<section class=\"panel notice warn\"><h2>Security notice</h2>"
             "<p>This server requires supported Linux kernel isolation before it starts. "
             "For untrusted contestants, a dedicated VM or isolated contest machine remains "
             "an additional defense-in-depth boundary.</p></section>"
-            "<section class=\"panel\"><h1>Contestant Registration</h1>";
+            "<section class=\"panel\"><div class=\"panel-header\"><div>"
+            "<h2>Account details</h2><p>Your username becomes your contestant ID.</p>"
+            "</div></div>";
         if (!error.isEmpty()) {
-            body += "<p class=\"err\">" + html_escape(error) + "</p>";
+            body += "<p class=\"alert\">" + html_escape(error) + "</p>";
         }
         body += "<form method=\"post\" action=\"/register\">"
                 "<label>Join code</label><input name=\"join_code\" required>"
                 "<label>Username</label><input name=\"username\" autocomplete=\"username\" required>"
-                "<p class=\"muted\">Use letters, digits, spaces, underscore, or dash. This becomes your contestant id.</p>"
+                "<p class=\"field-help\">Use letters, digits, spaces, underscore, or dash.</p>"
                 "<label>Password</label><input name=\"password\" type=\"password\" autocomplete=\"new-password\" required>"
-                "<button type=\"submit\">Create account</button></form></section>";
+                "<div class=\"form-actions\"><span class=\"muted\">Already registered? "
+                "<a href=\"/login\">Sign in</a></span>"
+                "<button type=\"submit\">Create account</button></div></form></section>";
         return html_response(render_shell("Register", body, user));
     }
 
@@ -686,13 +964,15 @@ private:
     HttpResponse submit_page(const QString& error, const User& user) {
         std::vector<QString> problems = list_problems(config_.contest_root, settings_);
         QString body =
-            "<section class=\"panel warn\"><h1>Local Judge Security</h1>"
-            "<p>Submissions run under mandatory Linux namespace, capability, resource, and "
-            "system-call isolation. A dedicated VM or isolated contest machine is still "
-            "recommended as an additional defense-in-depth boundary.</p></section>"
-            "<section class=\"panel\"><h1>Submit</h1>";
+            "<div class=\"page-heading\"><div class=\"eyebrow\">Submission workspace</div>"
+            "<h1>Submit C++ source</h1><p class=\"page-subtitle\">Choose a problem, paste "
+            "your solution, and follow its progress from the submissions page.</p></div>"
+            "<div class=\"content-grid\"><section class=\"panel\">"
+            "<div class=\"panel-header\"><div><h2>New submission</h2>"
+            "<p>Your latest accepted source is also saved to your contestant folder.</p></div>"
+            "</div>";
         if (!error.isEmpty()) {
-            body += "<p class=\"err\">" + html_escape(error) + "</p>";
+            body += "<p class=\"alert\">" + html_escape(error) + "</p>";
         }
         body += "<form method=\"post\" action=\"/submit\">"
                 "<input type=\"hidden\" name=\"_csrf\" value=\"" + html_escape(user.csrf) + "\">"
@@ -703,8 +983,15 @@ private:
         body += "</select><label>C++ source</label>"
                 "<div class=\"code-editor\"><pre aria-hidden=\"true\"><code id=\"source-highlight\"></code></pre>"
                 "<textarea id=\"source-editor\" name=\"source\" data-highlight=\"cpp\" spellcheck=\"false\" required></textarea></div>"
-                "<p class=\"muted\">Max source size: " + QString::number(kMaxSourceBytes / 1024) + " KiB.</p>"
-                "<button type=\"submit\">Submit</button></form></section>";
+                "<div class=\"form-actions\"><span class=\"muted\">Maximum source size: " +
+                QString::number(kMaxSourceBytes / 1024) + " KiB</span>"
+                "<button type=\"submit\">Submit solution</button></div></form></section>"
+                "<aside class=\"panel notice warn\"><h2>Local judge security</h2>"
+            "<p>Submissions run under mandatory Linux namespace, capability, resource, and "
+            "system-call isolation. A dedicated VM or isolated contest machine is still "
+            "recommended as an additional defense-in-depth boundary.</p>"
+            "<p class=\"muted\">Never submit secrets or credentials in source code.</p>"
+            "</aside></div>";
         return html_response(render_shell("Submit", body, user));
     }
 
@@ -798,8 +1085,14 @@ private:
 
     HttpResponse submissions_page(const User& user, bool admin) {
         auto submissions = db_.submissions_for_user(user.id, admin);
-        QString body = "<section class=\"panel\"><h1>" +
-                       QString(admin ? "All Submissions" : "My Submissions") + "</h1>"
+        const QString heading = admin ? "All submissions" : "My submissions";
+        QString body =
+            "<div class=\"page-heading\"><div class=\"eyebrow\">Judge history</div><h1>" +
+            heading + "</h1><p class=\"page-subtitle\">Review queue state, verdicts, scores, "
+            "and judge messages.</p></div>"
+            "<section class=\"panel\"><div class=\"panel-header\"><div><h2>Submission log</h2>"
+            "<p>Newest submissions appear first.</p></div><span class=\"pill\">" +
+            QString::number(submissions.size()) + " total</span></div>"
                        "<table><thead><tr><th>ID</th><th>User</th><th>Problem</th>"
                        "<th>Status</th><th>Verdict</th><th>Score</th><th>Submitted</th>"
                        "<th>Judged</th><th>Message</th>";
@@ -817,7 +1110,7 @@ private:
             QString status = row.ignored ? "ignored" : row.status;
             body += "<tr><td>" + id_cell + "</td><td>" + html_escape(row.username) +
                     "</td><td>" + html_escape(row.problem) + "</td><td>" +
-                    html_escape(status) + "</td><td>" + html_escape(row.verdict) +
+                    status_badge(status) + "</td><td>" + status_badge(row.verdict, true) +
                     "</td><td>" + QString::number(row.score, 'f', 2) + "</td><td>" +
                     now_string(row.submitted_at) + "</td><td>" + now_string(row.judged_at) +
                     "</td><td>" + html_escape(row.message.left(300)) + "</td>";
@@ -834,6 +1127,10 @@ private:
                 body += "</td>";
             }
             body += "</tr>";
+        }
+        if (submissions.empty()) {
+            body += "<tr><td colspan=\"" + QString::number(admin ? 10 : 9) +
+                    "\" class=\"empty-state\">No submissions yet.</td></tr>";
         }
         body += "</tbody></table></section>";
         return html_response(render_shell(admin ? "Admin" : "Submissions", body, user));
@@ -857,17 +1154,26 @@ private:
             }
         }
         auto rows = db_.test_results(id, user.id, user.role == "admin");
-        QString body = "<section class=\"panel\"><h1>Submission #" + QString::number(id) +
-                       "</h1><table><thead><tr><th>Test</th><th>Verdict</th><th>Time</th>"
+        QString body =
+            "<div class=\"page-heading\"><div class=\"eyebrow\">Judge details</div>"
+            "<h1>Submission #" + QString::number(id) +
+            "</h1><p class=\"page-subtitle\">Per-test timing, points, and checker messages.</p>"
+            "</div><section class=\"panel\"><div class=\"panel-header\"><div>"
+            "<h2>Test results</h2><p>CPU time is shown in milliseconds.</p></div>"
+            "<span class=\"pill\">" + QString::number(rows.size()) + " tests</span></div>"
+                       "<table><thead><tr><th>Test</th><th>Verdict</th><th>Time</th>"
                        "<th>Exit</th><th>Points</th><th>Message</th></tr></thead><tbody>";
         for (const auto& row : rows) {
             body += "<tr><td>" + html_escape(row.test) + "</td><td>" +
-                    html_escape(row.verdict) + "</td><td>" +
+                    status_badge(row.verdict, true) + "</td><td>" +
                     QString::number(row.time_ms) + " ms</td><td>" +
                     QString::number(row.exit_code) + "</td><td>" +
                     QString::number(row.earned_points, 'f', 2) + "/" +
                     QString::number(row.max_points, 'f', 2) + "</td><td>" +
                     html_escape(row.message) + "</td></tr>";
+        }
+        if (rows.empty()) {
+            body += "<tr><td colspan=\"6\" class=\"empty-state\">No test details are available.</td></tr>";
         }
         body += "</tbody></table></section>";
         return html_response(render_shell("Details", body, user));
@@ -942,15 +1248,18 @@ private:
         body += "<th>Total</th></tr></thead><tbody>";
         int rank = 1;
         for (const RankingRow& row : table.rows) {
-            body += "<tr><td>" + QString::number(rank++) + "</td><td>" +
-                    html_escape(row.username) + "</td>";
+            const int current_rank = rank++;
+            body += "<tr><td><span class=\"rank" +
+                    QString(current_rank <= 3 ? " rank-top" : "") + "\">" +
+                    QString::number(current_rank) + "</span></td><td><strong>" +
+                    html_escape(row.username) + "</strong></td>";
             for (const QString& problem : table.problems) {
                 auto score = row.problem_scores.find(problem);
                 body += "<td>" + QString::number(
                     score == row.problem_scores.end() ? 0.0 : score->second, 'f', 2) + "</td>";
             }
-            body += "<td><strong>" + QString::number(row.total, 'f', 2) +
-                    "</strong></td></tr>";
+            body += "<td><strong class=\"score-total\">" +
+                    QString::number(row.total, 'f', 2) + "</strong></td></tr>";
         }
         if (table.rows.empty()) {
             body += "<tr><td colspan=\"" + QString::number(table.problems.size() + 3) +
@@ -963,9 +1272,16 @@ private:
         if (!can_view_ranking(user)) {
             return error_response(403, "ranking is disabled");
         }
-        QString body = "<section class=\"panel\"><div id=\"ranking-table\">" +
+        QString body =
+                       "<div class=\"page-heading\"><div class=\"eyebrow\">Live standings</div>"
+                       "<h1>Contest ranking</h1><p class=\"page-subtitle\">Scores update "
+                       "automatically as judging completes.</p></div>"
+                       "<section class=\"panel\"><div class=\"panel-header\"><div>"
+                       "<h2>Scoreboard</h2><p>Higher total scores rank first.</p></div>"
+                       "<span class=\"badge badge-run\">Live</span></div>"
+                       "<div id=\"ranking-table\">" +
                        ranking_table_html() + "</div>"
-                       "<p class=\"muted\">This table updates automatically.</p></section>";
+                       "</section>";
         return html_response(render_shell("Ranking", body, user));
     }
 

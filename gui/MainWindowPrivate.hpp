@@ -30,6 +30,7 @@
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QGraphicsDropShadowEffect>
+#include <QGraphicsOpacityEffect>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -48,6 +49,7 @@
 #include <QProgressBar>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QPropertyAnimation>
 #include <QPushButton>
 #include <QRandomGenerator>
 #include <QRegularExpression>
@@ -56,11 +58,13 @@
 #include <QSpinBox>
 #include <QSlider>
 #include <QStackedLayout>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTimer>
 #include <QToolButton>
 #include <QVariant>
+#include <QVariantAnimation>
 #include <QVBoxLayout>
 #include <QWindow>
 
@@ -95,13 +99,46 @@ struct CellScore {
 
 using ServerUserSyncResult = neothemis::server::UserSyncResult;
 
+class AnimatedTabBar final : public QTabBar {
+public:
+    explicit AnimatedTabBar(QWidget* parent = nullptr);
+
+    void setAnimationsEnabled(bool enabled);
+
+    void slideToIndex(int index);
+
+    void setCenteredIcon(int index, const QIcon& icon);
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+
+private:
+    void stopIndicatorAnimation();
+
+    QRectF indicator_rect_;
+    std::vector<QIcon> centered_icons_;
+    QVariantAnimation* indicator_animation_ = nullptr;
+    bool animations_enabled_ = false;
+};
+
+class SettingsTabWidget final : public QTabWidget {
+public:
+    explicit SettingsTabWidget(QWidget* parent = nullptr);
+};
+
 class SettingsDialog final : public QDialog {
 public:
     explicit SettingsDialog(QWidget* parent) : QDialog(parent) {}
 
+    ~SettingsDialog() override;
+
     void add_close_handler(std::function<void()> handler) {
         close_handlers_.push_back(std::move(handler));
     }
+
+    void set_animated_tabs(QTabWidget* tabs);
+
+    void set_tab_animations_enabled(bool enabled);
 
 protected:
     void closeEvent(QCloseEvent* event) override {
@@ -113,7 +150,17 @@ protected:
     }
 
 private:
+    void stop_tab_animation();
+
+    void animate_tab(int index);
+
     std::vector<std::function<void()>> close_handlers_;
+    QTabWidget* animated_tabs_ = nullptr;
+    QMetaObject::Connection tab_change_connection_;
+    QPropertyAnimation* tab_animation_ = nullptr;
+    QGraphicsOpacityEffect* tab_opacity_effect_ = nullptr;
+    QWidget* animated_page_ = nullptr;
+    bool tab_animations_enabled_ = false;
 };
 
 class MainWindow : public QMainWindow {
@@ -424,6 +471,7 @@ private:
     bool transparent_background_ = false;
     int background_transparency_ = 20;
     bool blur_background_ = false;
+    bool animations_enabled_ = true;
     bool backdrop_refresh_queued_ = false;
     bool sandbox_enabled_ = true;
     fs::path temporary_dir_;

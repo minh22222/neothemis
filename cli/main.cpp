@@ -102,7 +102,9 @@ void print_contest_config_reference(std::ostream& out) {
 void print_problem_config_reference(std::ostream& out) {
     out << "Problem settings in tests/<problem>/problem.conf:\n"
         << "  time_limit_ms=1000\n"
-        << "      Per-test runtime limit in milliseconds. Custom checkers use this limit too.\n"
+        << "      User+kernel CPU-time limit for the full process tree, in milliseconds.\n"
+        << "      Reported test time uses this metric on Linux and Windows.\n"
+        << "      Custom checkers use it too; a separate wall guard stops sleepers.\n"
         << "  memory_limit_mb=256\n"
         << "      Per-test memory limit in megabytes. Use 0 for unlimited.\n"
         << "  default_points=1\n"

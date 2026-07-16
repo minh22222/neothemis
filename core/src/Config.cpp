@@ -3,13 +3,12 @@
 #include "neothemis/JudgeCore.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cctype>
 #include <fstream>
-#include <iomanip>
-#include <limits>
-#include <locale>
 #include <sstream>
 #include <stdexcept>
+#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -140,14 +139,17 @@ void write_template(const fs::path& path, const std::string& contents, const std
     output << contents;
 }
 
-std::string format_number(double value) {
-    std::ostringstream output;
-    output.imbue(std::locale::classic());
-    output << std::setprecision(std::numeric_limits<double>::max_digits10) << value;
-    return output.str();
-}
-
 } // namespace
+
+std::string format_config_number(double value) {
+    char buffer[64];
+    const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value,
+                                      std::chars_format::general);
+    if (result.ec != std::errc{}) {
+        throw std::runtime_error("failed to format numeric configuration value");
+    }
+    return std::string(buffer, result.ptr);
+}
 
 ConfigEntries read_config_entries(const fs::path& path) {
     return read_entries(path, "settings file");
@@ -338,11 +340,11 @@ void write_problem_config(const fs::path& path, const ProblemConfig& config) {
     ConfigEntries entries = {
         {"time_limit_ms", std::to_string(config.time_limit_ms), 0},
         {"memory_limit_mb", std::to_string(config.memory_limit_mb), 0},
-        {"default_points", format_number(config.default_points), 0},
+        {"default_points", format_config_number(config.default_points), 0},
         {"checker", config.checker, 0},
     };
     for (const auto& [test_name, points] : config.test_points) {
-        entries.push_back({"test_points." + test_name, format_number(points), 0});
+        entries.push_back({"test_points." + test_name, format_config_number(points), 0});
     }
     entries.insert(entries.end(), config.preserved_entries.begin(), config.preserved_entries.end());
     write_config_entries(path, entries);

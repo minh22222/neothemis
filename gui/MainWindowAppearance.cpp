@@ -2,6 +2,7 @@
 
 #include <QColorDialog>
 #include <QGridLayout>
+#include <QScrollArea>
 
 namespace {
 
@@ -59,7 +60,7 @@ void MainWindow::apply_language_to_main_window() {
     contest_title_->setText(text("no_contest_open"));
   }
   if (judge_group_) {
-    judge_group_->setTitle(text("judge"));
+    judge_group_->setTitle(QString());
   }
   if (judge_selected_button_) {
     judge_selected_button_->setText(text("judge_selected"));
@@ -212,13 +213,24 @@ void MainWindow::schedule_backdrop_startup_passes() {
 QWidget *MainWindow::build_visual_tab(QWidget *parent,
                                       SettingsDialog *settings_dialog) {
   auto *tab = new QWidget(parent);
-  auto *form = new QFormLayout(tab);
+  auto *tab_layout = new QVBoxLayout(tab);
+  tab_layout->setContentsMargins(0, 0, 0, 0);
+  auto *scroll = new QScrollArea(tab);
+  scroll->setObjectName("SettingsScrollArea");
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  auto *content = new QWidget(scroll);
+  content->setObjectName("SettingsContent");
+  auto *form = new QFormLayout(content);
   form->setContentsMargins(18, 18, 18, 18);
   form->setHorizontalSpacing(24);
   form->setVerticalSpacing(14);
   form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
   form->setFormAlignment(Qt::AlignTop);
   form->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+  scroll->setWidget(content);
+  tab_layout->addWidget(scroll);
   auto *theme = new QComboBox(tab);
   theme->addItem(text("dark"), "dark");
   theme->addItem(text("cyber"), "cyber");
@@ -226,12 +238,15 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
   if (theme_index >= 0) {
     theme->setCurrentIndex(theme_index);
   }
+  auto *animations = new QCheckBox(tab);
+  animations->setChecked(animations_enabled_);
   auto *cyber_colors_label = new QLabel(text("cyber_colors"), tab);
   auto *cyber_colors_widget = new QWidget(tab);
   cyber_colors_widget->setObjectName("InlineControl");
   auto *cyber_colors_layout = new QGridLayout(cyber_colors_widget);
   cyber_colors_layout->setContentsMargins(0, 0, 0, 0);
   cyber_colors_layout->setSpacing(10);
+  cyber_colors_widget->setMinimumHeight(92);
   auto *cyber_background = new QPushButton(cyber_colors_widget);
   auto *cyber_primary = new QPushButton(cyber_colors_widget);
   auto *cyber_secondary = new QPushButton(cyber_colors_widget);
@@ -247,6 +262,7 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
   auto *cyber_text_colors_layout = new QGridLayout(cyber_text_colors_widget);
   cyber_text_colors_layout->setContentsMargins(0, 0, 0, 0);
   cyber_text_colors_layout->setSpacing(10);
+  cyber_text_colors_widget->setMinimumHeight(92);
   auto *cyber_text = new QPushButton(cyber_text_colors_widget);
   auto *cyber_muted_text = new QPushButton(cyber_text_colors_widget);
   auto *cyber_primary_text = new QPushButton(cyber_text_colors_widget);
@@ -267,6 +283,7 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
     button->setProperty("selectedColor", color);
     button->setText(label + ": " + color.name(QColor::HexRgb).toUpper());
     button->setMinimumWidth(150);
+    button->setMinimumHeight(40);
     button->setStyleSheet(QString("QPushButton {"
                                   "background: %1;"
                                   "color: %2;"
@@ -355,6 +372,7 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
   association->setEnabled(!association_registered);
 
   form->addRow(text("theme"), theme);
+  form->addRow(text("animations_enabled"), animations);
   form->addRow(cyber_colors_label, cyber_colors_widget);
   form->addRow(cyber_text_colors_label, cyber_text_colors_widget);
   form->addRow(text("transparent_background"), transparent_background);
@@ -536,6 +554,11 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
                    });
   QObject::connect(blur_background, &QCheckBox::toggled,
                    [apply_visual_preview](bool) { apply_visual_preview(); });
+  QObject::connect(animations, &QCheckBox::toggled,
+                   [this, settings_dialog](bool enabled) {
+                     animations_enabled_ = enabled;
+                     settings_dialog->set_tab_animations_enabled(enabled);
+                   });
 
   QObject::connect(
       sandbox_enabled, &QCheckBox::toggled,
@@ -560,7 +583,7 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
       });
 
   auto persist = [this, theme, transparent_background, transparency,
-                  blur_background, language, temp_dir, sandbox_enabled,
+                  blur_background, animations, language, temp_dir, sandbox_enabled,
                   cyber_background, cyber_primary, cyber_secondary, cyber_text,
                   cyber_muted_text, cyber_primary_text, cyber_secondary_text,
                   selected_color](bool notify) {
@@ -597,6 +620,7 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
       transparent_background_ = transparent_background->isChecked();
       background_transparency_ = transparency->value();
       blur_background_ = blur_background->isChecked();
+      animations_enabled_ = animations->isChecked();
       language_ = language->currentData().toString().toStdString();
       sandbox_enabled_ = sandbox_enabled->isChecked();
       temporary_dir_ = temp_dir->text().toStdString();

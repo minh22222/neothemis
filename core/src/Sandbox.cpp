@@ -5,11 +5,14 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <system_error>
+#include <vector>
 
 #ifndef _WIN32
+#include <poll.h>
 #include <unistd.h>
 #endif
 
@@ -120,12 +123,13 @@ void make_clone3_fall_back_to_clone(scmp_filter_ctx context) {
     }
 }
 
-int create_seccomp_filter(SandboxProfile profile) {
+std::vector<unsigned char> compile_seccomp_filter(SandboxProfile profile) {
     scmp_filter_ctx context = seccomp_init(SCMP_ACT_ALLOW);
     if (!context) {
         throw std::runtime_error("failed to initialize seccomp filter");
     }
 
+    int fd = -1;
     try {
         const char* common_denied[] = {
             "socket", "socketpair", "connect", "bind", "listen", "accept", "accept4",
@@ -162,24 +166,111 @@ int create_seccomp_filter(SandboxProfile profile) {
             restrict_clone_to_threads(context);
         }
 
-        int fd = static_cast<int>(syscall(SYS_memfd_create, "neothemis-seccomp", 0));
+        fd = static_cast<int>(syscall(SYS_memfd_create, "neothemis-seccomp-build", 0));
         if (fd < 0) {
             throw std::runtime_error(std::string("failed to create seccomp memory file: ") +
                                      std::strerror(errno));
         }
-        if (seccomp_export_bpf(context, fd) < 0 || lseek(fd, 0, SEEK_SET) < 0) {
-            const int saved_errno = errno;
-            close(fd);
+        const int export_result = seccomp_export_bpf(context, fd);
+        if (export_result < 0) {
             throw std::runtime_error(std::string("failed to export seccomp filter: ") +
+                                     std::strerror(-export_result));
+        }
+
+        constexpr off_t maximum_filter_bytes = 1024 * 1024;
+        const off_t filter_size = lseek(fd, 0, SEEK_END);
+        if (filter_size < 0) {
+            const int saved_errno = errno;
+            throw std::runtime_error(std::string("failed to size seccomp filter: ") +
                                      std::strerror(saved_errno));
         }
-        fd = move_fd_above_standard_streams(fd);
+        if (filter_size == 0 || filter_size > maximum_filter_bytes) {
+            throw std::runtime_error("exported seccomp filter has an invalid size");
+        }
+        if (lseek(fd, 0, SEEK_SET) < 0) {
+            const int saved_errno = errno;
+            throw std::runtime_error(std::string("failed to rewind compiled seccomp filter: ") +
+                                     std::strerror(saved_errno));
+        }
+
+        std::vector<unsigned char> bytes(static_cast<std::size_t>(filter_size));
+        std::size_t offset = 0;
+        while (offset < bytes.size()) {
+            const ssize_t count = read(fd, bytes.data() + offset, bytes.size() - offset);
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count <= 0) {
+                const int saved_errno = count < 0 ? errno : EIO;
+                throw std::runtime_error(std::string("failed to read seccomp filter: ") +
+                                         std::strerror(saved_errno));
+            }
+            offset += static_cast<std::size_t>(count);
+        }
+
+        close(fd);
+        fd = -1;
         seccomp_release(context);
-        return fd;
+        return bytes;
     } catch (...) {
+        if (fd >= 0) {
+            close(fd);
+        }
         seccomp_release(context);
         throw;
     }
+}
+
+const std::vector<unsigned char>& cached_seccomp_filter(SandboxProfile profile) {
+    switch (profile) {
+        case SandboxProfile::Compiler: {
+            static const std::vector<unsigned char> filter =
+                compile_seccomp_filter(SandboxProfile::Compiler);
+            return filter;
+        }
+        case SandboxProfile::Submission: {
+            static const std::vector<unsigned char> filter =
+                compile_seccomp_filter(SandboxProfile::Submission);
+            return filter;
+        }
+        case SandboxProfile::Checker: {
+            static const std::vector<unsigned char> filter =
+                compile_seccomp_filter(SandboxProfile::Checker);
+            return filter;
+        }
+    }
+    throw std::runtime_error("unknown sandbox profile");
+}
+
+int create_seccomp_filter(SandboxProfile profile) {
+    const std::vector<unsigned char>& bytes = cached_seccomp_filter(profile);
+    int fd = static_cast<int>(syscall(SYS_memfd_create, "neothemis-seccomp", 0));
+    if (fd < 0) {
+        throw std::runtime_error(std::string("failed to create seccomp memory file: ") +
+                                 std::strerror(errno));
+    }
+
+    std::size_t offset = 0;
+    while (offset < bytes.size()) {
+        const ssize_t count = write(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            const int saved_errno = count < 0 ? errno : EIO;
+            close(fd);
+            throw std::runtime_error(std::string("failed to write seccomp filter: ") +
+                                     std::strerror(saved_errno));
+        }
+        offset += static_cast<std::size_t>(count);
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        const int saved_errno = errno;
+        close(fd);
+        throw std::runtime_error(std::string("failed to rewind seccomp filter: ") +
+                                 std::strerror(saved_errno));
+    }
+    return move_fd_above_standard_streams(fd);
 }
 
 bool safe_guest_path(const std::string& value) {
@@ -254,6 +345,82 @@ void close_fd(int& fd) {
 #endif
     fd = -1;
 }
+
+#ifndef _WIN32
+void parse_sandbox_child_pid(SandboxLaunch& launch) {
+    if (launch.child_pid > 0) {
+        return;
+    }
+    constexpr const char* key = "\"child-pid\"";
+    const std::size_t key_position = launch.status_buffer.find(key);
+    if (key_position == std::string::npos) {
+        return;
+    }
+    const std::size_t separator = launch.status_buffer.find(':', key_position);
+    if (separator == std::string::npos) {
+        return;
+    }
+    const std::size_t first = launch.status_buffer.find_first_of("0123456789", separator + 1);
+    if (first == std::string::npos) {
+        return;
+    }
+    const std::size_t last = launch.status_buffer.find_first_not_of("0123456789", first);
+    // The status pipe is incremental. Do not permanently accept a PID when a
+    // read happened to stop in the middle of its decimal representation.
+    if (last == std::string::npos) {
+        return;
+    }
+    try {
+        const unsigned long long value =
+            std::stoull(launch.status_buffer.substr(first, last - first));
+        if (value > 0 &&
+            value <= static_cast<unsigned long long>(
+                         std::numeric_limits<std::int64_t>::max())) {
+            launch.child_pid = static_cast<std::int64_t>(value);
+        }
+    } catch (const std::exception&) {
+    }
+}
+
+void read_sandbox_status(SandboxLaunch& launch, bool until_eof) {
+    constexpr std::size_t maximum_status_bytes = 64 * 1024;
+    while (launch.status_read_fd >= 0 && !launch.status_eof) {
+        if (!until_eof) {
+            pollfd descriptor{};
+            descriptor.fd = launch.status_read_fd;
+            descriptor.events = POLLIN | POLLHUP;
+            int ready = -1;
+            do {
+                ready = poll(&descriptor, 1, 0);
+            } while (ready < 0 && errno == EINTR);
+            if (ready <= 0 || (descriptor.revents & (POLLIN | POLLHUP)) == 0) {
+                return;
+            }
+        }
+
+        char buffer[1024];
+        const ssize_t count = read(launch.status_read_fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            const std::size_t incoming = static_cast<std::size_t>(count);
+            if (launch.status_buffer.size() < maximum_status_bytes) {
+                launch.status_buffer.append(
+                    buffer, std::min(incoming,
+                                     maximum_status_bytes - launch.status_buffer.size()));
+                parse_sandbox_child_pid(launch);
+            }
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !until_eof) {
+            return;
+        }
+        launch.status_eof = true;
+        close_fd(launch.status_read_fd);
+    }
+}
+#endif
 
 } // namespace
 
@@ -401,26 +568,20 @@ void close_sandbox_child_fds_before_exec(SandboxLaunch& launch) {
     close_fd(launch.status_read_fd);
 }
 
+std::int64_t sandbox_child_pid(SandboxLaunch& launch) {
+#ifndef _WIN32
+    read_sandbox_status(launch, false);
+    return launch.child_pid;
+#else
+    (void)launch;
+    return -1;
+#endif
+}
+
 bool sandbox_reported_child_start(SandboxLaunch& launch) {
 #ifndef _WIN32
-    if (launch.status_read_fd < 0) {
-        return false;
-    }
-    std::string status;
-    char buffer[1024];
-    while (true) {
-        const ssize_t count = read(launch.status_read_fd, buffer, sizeof(buffer));
-        if (count > 0) {
-            status.append(buffer, static_cast<std::size_t>(count));
-            continue;
-        }
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        break;
-    }
-    close_fd(launch.status_read_fd);
-    return status.find("\"child-pid\"") != std::string::npos;
+    read_sandbox_status(launch, true);
+    return launch.child_pid > 0;
 #else
     (void)launch;
     return false;

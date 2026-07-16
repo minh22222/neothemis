@@ -29,6 +29,9 @@ struct SandboxLaunch {
     int filter_fd = -1;
     int status_read_fd = -1;
     int status_write_fd = -1;
+    std::string status_buffer;
+    std::int64_t child_pid = -1;
+    bool status_eof = false;
 };
 
 bool sandbox_backend_configured(std::string& reason);
@@ -41,6 +44,7 @@ SandboxLaunch prepare_sandbox_launch(SandboxProfile profile,
 
 void close_sandbox_parent_fds_after_fork(SandboxLaunch& launch);
 void close_sandbox_child_fds_before_exec(SandboxLaunch& launch);
+std::int64_t sandbox_child_pid(SandboxLaunch& launch);
 bool sandbox_reported_child_start(SandboxLaunch& launch);
 void close_sandbox_launch(SandboxLaunch& launch);
 

@@ -251,19 +251,22 @@ Security model:
   and 4096 MiB of address space. Zero time or memory values become those finite
   ceilings, larger values are clamped, and an explicit stack limit is capped at
   4096 MiB.
-- Resource enforcement uses a parent-enforced wall-clock deadline plus Linux
+- Runtime limits and reported per-test times use user-plus-kernel CPU time for
+  the complete submitted process tree on both Linux and Windows. A separate,
+  more generous parent-enforced wall-clock guard prevents sleeping processes
+  from running forever and is never reported as the test time. Linux also uses
   process limits: `RLIMIT_AS` for virtual address space, `RLIMIT_STACK`,
   `RLIMIT_FSIZE`, a 64-descriptor `RLIMIT_NOFILE`, and disabled core dumps.
   Submission and checker file-size limits are 64 MiB and 16 MiB respectively;
-  compilation uses fixed 30-second, 1024 MiB address-space, 256 MiB stack, and
-  64 MiB file-size limits. Bubblewrap also caps the private `/tmp` at 256 MiB
-  and the writable `/work` tmpfs at 64 MiB for submissions or 16 MiB for
-  checkers. Every sandbox invocation is restricted to one allowed CPU. Inside
-  the sandbox user namespace, submissions and checkers are capped at 64 tasks
-  and compiler invocations at 128 tasks; these hard limits also bound thread
-  fan-out by their descendants. Runtime `MLE` attribution samples descendant
-  address-space use near the configured limit; an otherwise unexplained
-  `SIGKILL` remains `RE` instead of being guessed as a memory failure.
+  compilation uses fixed 30-second CPU-time, 1024 MiB address-space, 256 MiB
+  stack, and 64 MiB file-size limits. Bubblewrap also caps the private `/tmp`
+  at 256 MiB and the writable `/work` tmpfs at 64 MiB for submissions or
+  16 MiB for checkers. Every sandbox invocation is restricted to one allowed
+  CPU. Inside the sandbox user namespace, submissions and checkers are capped
+  at 64 tasks and compiler invocations at 128 tasks; these hard limits also
+  bound thread fan-out by their descendants. Runtime `MLE` attribution samples
+  descendant address-space use near the configured limit; an otherwise
+  unexplained `SIGKILL` remains `RE` instead of being guessed as a memory failure.
 - The cgroup namespace isolates the sandbox's view of cgroups; NeoThemis does
   not create cgroups or use cgroup CPU/memory accounting. Address-space limits
   remain per process; CPU affinity and task limits bound fan-out, but they are
@@ -626,10 +629,13 @@ checker=token
 ```
 
 `time_limit_ms`
-: Per-test runtime limit, in milliseconds. Custom checkers use this limit too.
+: Per-test CPU-time limit, in milliseconds. CPU time is user plus kernel time
+across the complete process tree, on both Linux and Windows; `time_ms` in judge
+results reports the same value. A separate wall-clock safety guard stops
+sleeping or stuck processes without changing the reported time. Custom checkers
+use this limit too.
 In required secure mode, zero becomes 300000 ms and larger values are clamped
-to that 5-minute ceiling. The explicitly unsafe Windows runner measures CPU
-across the whole job and also applies a parent-enforced wall-clock guard.
+to that 5-minute ceiling.
 
 `memory_limit_mb`
 : Per-test memory limit, in megabytes. In required secure mode, zero becomes

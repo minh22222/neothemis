@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cwchar>
 #include <cwctype>
 #include <cstdlib>
@@ -34,8 +36,11 @@
 #include <csignal>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <time.h>
 #if defined(__linux__)
+#include <poll.h>
 #include <sched.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #endif
 #include <sys/wait.h>
@@ -57,8 +62,36 @@ struct ProcessResult {
     bool timed_out = false;
     bool memory_exceeded = false;
     bool sandbox_setup_failed = false;
-    std::uint64_t elapsed_ms = 0;
+    std::uint64_t cpu_time_ms = 0;
     std::string sandbox_error;
+};
+
+std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) {
+    return left > std::numeric_limits<std::uint64_t>::max() - right
+               ? std::numeric_limits<std::uint64_t>::max()
+               : left + right;
+}
+
+std::uint64_t wall_timeout_guard_ms(std::uint64_t timeout_ms) {
+    if (timeout_ms == 0) {
+        return 0;
+    }
+    const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
+    const std::uint64_t multiplied = timeout_ms > maximum / 4 ? maximum : timeout_ms * 4;
+    const std::uint64_t padded = timeout_ms > maximum - 5000 ? maximum : timeout_ms + 5000;
+    return std::max(multiplied, padded);
+}
+
+struct ProcessLaunchContext {
+    std::vector<fs::path> runtime_search_paths;
+#ifdef _WIN32
+    std::vector<wchar_t> environment;
+#endif
+};
+
+struct CompilerContext {
+    std::vector<std::string> base_args;
+    ProcessLaunchContext launch;
 };
 
 struct SandboxRunSpec {
@@ -74,9 +107,18 @@ enum class CheckerPointScale {
 };
 
 struct ProblemContext {
+    struct TestCase {
+        std::string name;
+        fs::path dir;
+        fs::path input;
+        fs::path expected;
+        std::set<std::string> input_aliases;
+        double max_points = 0.0;
+    };
+
     std::string name;
     fs::path dir;
-    std::vector<fs::directory_entry> tests;
+    std::vector<TestCase> tests;
     ProblemConfig settings;
     CheckerPointScale checker_point_scale = CheckerPointScale::Absolute;
     fs::path checker_executable;
@@ -105,7 +147,7 @@ struct PrepTask {
 struct TestJob {
     std::string contestant;
     const ProblemContext* problem = nullptr;
-    fs::directory_entry test;
+    const ProblemContext::TestCase* test = nullptr;
     fs::path executable;
 };
 
@@ -285,22 +327,45 @@ std::string resolve_posix_executable(const std::string& program,
     return program;
 }
 
-pid_t waitpid_retry(pid_t pid, int* status, int options) {
+pid_t wait4_retry(pid_t pid, int* status, int options, rusage* usage) {
     pid_t result = -1;
     do {
-        result = waitpid(pid, status, options);
+        result = wait4(pid, status, options, usage);
     } while (result < 0 && errno == EINTR);
     return result;
 }
 
-void kill_and_reap_process_group(pid_t pid) noexcept {
+std::uint64_t timeval_microseconds(const timeval& value) {
+    if (value.tv_sec < 0 || value.tv_usec < 0) {
+        return 0;
+    }
+    constexpr std::uint64_t microseconds_per_second = 1000000;
+    const auto seconds = static_cast<std::uint64_t>(value.tv_sec);
+    const auto microseconds = static_cast<std::uint64_t>(value.tv_usec);
+    if (seconds > std::numeric_limits<std::uint64_t>::max() /
+                      microseconds_per_second) {
+        return std::numeric_limits<std::uint64_t>::max();
+    }
+    return saturating_add(seconds * microseconds_per_second, microseconds);
+}
+
+std::uint64_t posix_cpu_time_ms(const rusage& usage) {
+    return saturating_add(timeval_microseconds(usage.ru_utime),
+                          timeval_microseconds(usage.ru_stime)) /
+           1000ULL;
+}
+
+void kill_and_reap_process_group(pid_t pid, int* status = nullptr,
+                                 rusage* usage = nullptr) noexcept {
     if (pid <= 0) {
         return;
     }
     kill(-pid, SIGKILL);
     kill(pid, SIGKILL);
     int ignored_status = 0;
-    (void)waitpid_retry(pid, &ignored_status, 0);
+    rusage ignored_usage{};
+    (void)wait4_retry(pid, status ? status : &ignored_status, 0,
+                      usage ? usage : &ignored_usage);
 }
 
 class ChildProcessGuard {
@@ -316,6 +381,32 @@ public:
 private:
     pid_t pid_ = -1;
     bool armed_ = true;
+};
+
+class PosixDescriptorGuard {
+public:
+    PosixDescriptorGuard() = default;
+    explicit PosixDescriptorGuard(int fd) : fd_(fd) {}
+    ~PosixDescriptorGuard() { reset(); }
+
+    PosixDescriptorGuard(const PosixDescriptorGuard&) = delete;
+    PosixDescriptorGuard& operator=(const PosixDescriptorGuard&) = delete;
+
+    int get() const noexcept { return fd_; }
+    int release() noexcept {
+        const int result = fd_;
+        fd_ = -1;
+        return result;
+    }
+    void reset(int fd = -1) noexcept {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+        fd_ = fd;
+    }
+
+private:
+    int fd_ = -1;
 };
 
 class SandboxLaunchGuard {
@@ -374,12 +465,272 @@ unsigned int linux_allowed_cpu_count() {
     return static_cast<unsigned int>(CPU_COUNT(&allowed));
 }
 
-bool process_tree_near_address_space_limit(pid_t root_pid,
-                                           std::uint64_t memory_limit_mb) {
-    if (root_pid <= 0 || memory_limit_mb == 0) {
-        return false;
+struct LinuxProcessTreeSample {
+    std::uint64_t cpu_time_ms = 0;
+    bool near_address_space_limit = false;
+};
+
+long linux_clock_ticks_per_second() {
+    static const long ticks = sysconf(_SC_CLK_TCK);
+    return ticks;
+}
+
+std::chrono::milliseconds linux_resource_sample_interval() {
+    static const std::chrono::milliseconds interval = [] {
+        const long ticks = linux_clock_ticks_per_second();
+        if (ticks <= 0) {
+            return std::chrono::milliseconds(10);
+        }
+        const auto ticks_per_second = static_cast<std::uint64_t>(ticks);
+        const std::uint64_t milliseconds =
+            std::max<std::uint64_t>(1, (1000ULL + ticks_per_second - 1) /
+                                           ticks_per_second);
+        return std::chrono::milliseconds(milliseconds);
+    }();
+    return interval;
+}
+
+constexpr std::uint32_t kLinuxSandboxAccountingMagic = 0x4e544143U;
+
+struct LinuxSandboxAccountingRecord {
+    std::uint32_t magic = kLinuxSandboxAccountingMagic;
+    std::int32_t launch_status = 127 << 8;
+    std::uint64_t direct_cpu_us = 0;
+    std::uint64_t adopted_cpu_us = 0;
+    std::uint32_t adopted_processes = 0;
+};
+
+std::uint64_t posix_cpu_time_us(const rusage& usage) {
+    return saturating_add(timeval_microseconds(usage.ru_utime),
+                          timeval_microseconds(usage.ru_stime));
+}
+
+void close_linux_supervisor_fds_except(int keep_fd) noexcept {
+#if defined(SYS_close_range)
+    bool closed = true;
+    if (keep_fd > 3 && syscall(SYS_close_range, 3U,
+                               static_cast<unsigned int>(keep_fd - 1), 0) != 0) {
+        closed = false;
+    }
+    if (keep_fd < std::numeric_limits<int>::max() &&
+        syscall(SYS_close_range, static_cast<unsigned int>(keep_fd + 1),
+                std::numeric_limits<unsigned int>::max(), 0) != 0) {
+        closed = false;
+    }
+    if (closed) {
+        return;
+    }
+#endif
+    // This path is only for kernels without close_range. The judge already
+    // keeps its descriptor budget small; avoid allocation or libc directory
+    // traversal in the post-fork supervisor.
+    for (int fd = 3; fd < 65536; ++fd) {
+        if (fd != keep_fd) {
+            close(fd);
+        }
+    }
+}
+
+void kill_linux_supervisor_children() noexcept {
+    const int children_fd = open("/proc/thread-self/children", O_RDONLY | O_CLOEXEC);
+    if (children_fd < 0) {
+        return;
+    }
+    char buffer[1024];
+    std::uint64_t parsed_pid = 0;
+    bool has_digits = false;
+    while (true) {
+        const ssize_t count = read(children_fd, buffer, sizeof(buffer));
+        if (count <= 0) {
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        for (ssize_t index = 0; index < count; ++index) {
+            const unsigned char ch = static_cast<unsigned char>(buffer[index]);
+            if (ch >= '0' && ch <= '9') {
+                has_digits = true;
+                const std::uint64_t digit = static_cast<std::uint64_t>(ch - '0');
+                parsed_pid = parsed_pid >
+                                     (std::numeric_limits<std::uint64_t>::max() - digit) / 10
+                                 ? std::numeric_limits<std::uint64_t>::max()
+                                 : parsed_pid * 10 + digit;
+                continue;
+            }
+            if (has_digits && parsed_pid > 0 &&
+                parsed_pid <= static_cast<std::uint64_t>(
+                                  std::numeric_limits<pid_t>::max())) {
+                kill(static_cast<pid_t>(parsed_pid), SIGKILL);
+            }
+            parsed_pid = 0;
+            has_digits = false;
+        }
+    }
+    if (has_digits && parsed_pid > 0 &&
+        parsed_pid <= static_cast<std::uint64_t>(
+                          std::numeric_limits<pid_t>::max())) {
+        kill(static_cast<pid_t>(parsed_pid), SIGKILL);
+    }
+    close(children_fd);
+}
+
+void add_linux_adopted_usage(LinuxSandboxAccountingRecord& record,
+                             const rusage& usage) noexcept {
+    record.adopted_cpu_us = saturating_add(
+        record.adopted_cpu_us, posix_cpu_time_us(usage));
+    if (record.adopted_processes < std::numeric_limits<std::uint32_t>::max()) {
+        ++record.adopted_processes;
+    }
+}
+
+[[noreturn]] void run_linux_process_supervisor(pid_t launch_pid,
+                                               int result_fd,
+                                               bool terminate_adopted) noexcept {
+    close_linux_supervisor_fds_except(result_fd);
+    LinuxSandboxAccountingRecord record;
+    rusage direct_usage{};
+    int launch_status = 127 << 8;
+    if (launch_pid > 0 &&
+        wait4_retry(launch_pid, &launch_status, 0, &direct_usage) == launch_pid) {
+        record.launch_status = launch_status;
+        record.direct_cpu_us = posix_cpu_time_us(direct_usage);
+
+        bool children_remain = true;
+        while (children_remain) {
+            if (terminate_adopted) {
+                kill_linux_supervisor_children();
+            }
+            int adopted_status = 0;
+            rusage adopted_usage{};
+            const pid_t adopted = wait4_retry(
+                -1, &adopted_status, terminate_adopted ? WNOHANG : 0,
+                &adopted_usage);
+            if (adopted > 0) {
+                add_linux_adopted_usage(record, adopted_usage);
+                continue;
+            }
+            if (adopted < 0 && errno == ECHILD) {
+                children_remain = false;
+                continue;
+            }
+            if (adopted < 0) {
+                children_remain = false;
+                continue;
+            }
+            timespec retry_delay{};
+            retry_delay.tv_nsec = 1000000;
+            nanosleep(&retry_delay, nullptr);
+        }
     }
 
+    const char* bytes = reinterpret_cast<const char*>(&record);
+    std::size_t written = 0;
+    while (written < sizeof(record)) {
+        const ssize_t count = write(result_fd, bytes + written,
+                                    sizeof(record) - written);
+        if (count > 0) {
+            written += static_cast<std::size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    close(result_fd);
+    _exit(0);
+}
+
+bool read_linux_sandbox_accounting(int fd,
+                                   LinuxSandboxAccountingRecord& record) noexcept {
+    char* bytes = reinterpret_cast<char*>(&record);
+    std::size_t received = 0;
+    while (received < sizeof(record)) {
+        const ssize_t count = read(fd, bytes + received, sizeof(record) - received);
+        if (count > 0) {
+            received += static_cast<std::size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        break;
+    }
+    return received == sizeof(record) &&
+           record.magic == kLinuxSandboxAccountingMagic;
+}
+
+std::vector<std::pair<pid_t, std::size_t>> linux_process_tree(
+    pid_t root_pid, bool traverse_nested_children = true) {
+    std::vector<std::pair<pid_t, std::size_t>> result;
+    std::vector<std::pair<pid_t, std::size_t>> pending{{root_pid, 0}};
+    std::set<pid_t> visited;
+    while (!pending.empty()) {
+        const auto current = pending.back();
+        pending.pop_back();
+        if (current.first <= 0 || !visited.insert(current.first).second) {
+            continue;
+        }
+        result.push_back(current);
+        if (!traverse_nested_children && current.second > 0) {
+            continue;
+        }
+
+        const fs::path task_root =
+            fs::path("/proc") / std::to_string(current.first) / "task";
+        std::error_code task_error;
+        fs::directory_iterator task(task_root, task_error);
+        while (!task_error && task != fs::directory_iterator()) {
+            std::ifstream children(task->path() / "children");
+            for (pid_t child = 0; children >> child;) {
+                pending.emplace_back(child, current.second + 1);
+            }
+            task.increment(task_error);
+        }
+    }
+    return result;
+}
+
+pid_t linux_direct_child(pid_t parent_pid) {
+    if (parent_pid <= 0) {
+        return -1;
+    }
+    const fs::path children_path = fs::path("/proc") /
+                                   std::to_string(parent_pid) / "task" /
+                                   std::to_string(parent_pid) / "children";
+    std::ifstream children(children_path);
+    pid_t child = -1;
+    return children >> child && child > 0 ? child : -1;
+}
+
+void kill_linux_process_tree(pid_t root_pid, bool include_root) noexcept {
+    try {
+        auto processes = linux_process_tree(root_pid);
+        std::sort(processes.begin(), processes.end(),
+                  [](const auto& left, const auto& right) {
+                      return left.second > right.second;
+                  });
+        for (const auto& process : processes) {
+            if (include_root || process.first != root_pid) {
+                (void)kill(process.first, SIGKILL);
+            }
+        }
+    } catch (...) {
+        if (include_root) {
+            (void)kill(root_pid, SIGKILL);
+        }
+    }
+}
+
+LinuxProcessTreeSample sample_linux_process_tree(pid_t root_pid,
+                                                 std::uint64_t memory_limit_mb,
+                                                 bool inspect_memory,
+                                                 bool traverse_nested_children) {
+    LinuxProcessTreeSample sample;
+    if (root_pid <= 0) {
+        return sample;
+    }
     constexpr std::uint64_t kilobytes_per_mb = 1024;
     const std::uint64_t limit_kb =
         memory_limit_mb > std::numeric_limits<std::uint64_t>::max() / kilobytes_per_mb
@@ -390,37 +741,83 @@ bool process_tree_near_address_space_limit(pid_t root_pid,
     // not lower the configured limit or kill the process.
     const std::uint64_t pressure_threshold_kb = limit_kb - limit_kb / 20;
 
-    std::vector<pid_t> pending{root_pid};
-    std::set<pid_t> visited;
-    while (!pending.empty()) {
-        const pid_t pid = pending.back();
-        pending.pop_back();
-        if (!visited.insert(pid).second) {
-            continue;
+    std::uint64_t cpu_ticks = 0;
+    for (const auto& process :
+         linux_process_tree(root_pid, traverse_nested_children)) {
+        const pid_t pid = process.first;
+        const std::string process_root = "/proc/" + std::to_string(pid);
+        std::ifstream stat(process_root + "/stat");
+        std::string stat_line;
+        if (std::getline(stat, stat_line)) {
+            const std::size_t command_end = stat_line.rfind(')');
+            if (command_end != std::string::npos && command_end + 2 < stat_line.size()) {
+                const char* cursor = stat_line.data() + command_end + 2;
+                const char* const end = stat_line.data() + stat_line.size();
+                auto next_field = [&](const char*& first, const char*& last) {
+                    while (cursor < end && *cursor == ' ') {
+                        ++cursor;
+                    }
+                    if (cursor == end) {
+                        return false;
+                    }
+                    first = cursor;
+                    while (cursor < end && *cursor != ' ') {
+                        ++cursor;
+                    }
+                    last = cursor;
+                    return true;
+                };
+                const char* first = nullptr;
+                const char* last = nullptr;
+                bool fields_available = true;
+                for (int field = 0; field < 11 && fields_available; ++field) {
+                    fields_available = next_field(first, last);
+                }
+                for (int field = 0; field < 4 && fields_available; ++field) {
+                    fields_available = next_field(first, last);
+                    long long ticks = 0;
+                    if (fields_available) {
+                        const auto parsed = std::from_chars(first, last, ticks);
+                        if (parsed.ec == std::errc{} && parsed.ptr == last && ticks > 0) {
+                            cpu_ticks = saturating_add(
+                                cpu_ticks, static_cast<std::uint64_t>(ticks));
+                        }
+                    }
+                }
+            }
         }
 
-        std::ifstream status("/proc/" + std::to_string(pid) + "/status");
-        std::string line;
-        while (std::getline(status, line)) {
-            if (line.rfind("VmSize:", 0) != 0) {
-                continue;
+        if (inspect_memory && memory_limit_mb > 0 &&
+            !sample.near_address_space_limit) {
+            std::ifstream status(process_root + "/status");
+            std::string line;
+            while (std::getline(status, line)) {
+                if (line.rfind("VmSize:", 0) != 0) {
+                    continue;
+                }
+                std::uint64_t virtual_kb = 0;
+                const std::size_t first_digit = line.find_first_of("0123456789");
+                if (first_digit != std::string::npos) {
+                    const auto parsed = std::from_chars(
+                        line.data() + first_digit, line.data() + line.size(), virtual_kb);
+                    if (parsed.ec == std::errc{} &&
+                        virtual_kb >= pressure_threshold_kb) {
+                        sample.near_address_space_limit = true;
+                    }
+                }
+                break;
             }
-            std::istringstream value(line.substr(std::string("VmSize:").size()));
-            std::uint64_t virtual_kb = 0;
-            if (value >> virtual_kb && virtual_kb >= pressure_threshold_kb) {
-                return true;
-            }
-            break;
-        }
-
-        std::ifstream children("/proc/" + std::to_string(pid) + "/task/" +
-                               std::to_string(pid) + "/children");
-        pid_t child = 0;
-        while (children >> child) {
-            pending.push_back(child);
         }
     }
-    return false;
+    const long ticks_per_second = linux_clock_ticks_per_second();
+    if (ticks_per_second > 0) {
+        const std::uint64_t divisor = static_cast<std::uint64_t>(ticks_per_second);
+        sample.cpu_time_ms =
+            cpu_ticks > std::numeric_limits<std::uint64_t>::max() / 1000ULL
+                ? std::numeric_limits<std::uint64_t>::max()
+                : cpu_ticks * 1000ULL / divisor;
+    }
+    return sample;
 }
 
 unsigned int linux_performance_core_count() {
@@ -1020,17 +1417,15 @@ JOBOBJECT_BASIC_ACCOUNTING_INFORMATION windows_job_accounting(HANDLE job) {
 
 std::uint64_t windows_job_cpu_time_ms(HANDLE job) {
     const auto accounting = windows_job_accounting(job);
-    const std::uint64_t kernel = accounting.TotalKernelTime.QuadPart > 0
-                                     ? static_cast<std::uint64_t>(
-                                           accounting.TotalKernelTime.QuadPart) / 10000ULL
-                                     : 0;
-    const std::uint64_t user = accounting.TotalUserTime.QuadPart > 0
-                                   ? static_cast<std::uint64_t>(
-                                         accounting.TotalUserTime.QuadPart) / 10000ULL
-                                   : 0;
-    return kernel > std::numeric_limits<std::uint64_t>::max() - user
-               ? std::numeric_limits<std::uint64_t>::max()
-               : kernel + user;
+    const std::uint64_t kernel_100ns = accounting.TotalKernelTime.QuadPart > 0
+                                           ? static_cast<std::uint64_t>(
+                                                 accounting.TotalKernelTime.QuadPart)
+                                           : 0;
+    const std::uint64_t user_100ns = accounting.TotalUserTime.QuadPart > 0
+                                         ? static_cast<std::uint64_t>(
+                                               accounting.TotalUserTime.QuadPart)
+                                         : 0;
+    return saturating_add(kernel_100ns, user_100ns) / 10000ULL;
 }
 
 void wait_for_windows_job_exit(HANDLE job, HANDLE completion_port,
@@ -1076,24 +1471,6 @@ SIZE_T windows_memory_limit_bytes(std::uint64_t memory_limit_mb) {
     return static_cast<SIZE_T>(memory_limit_mb * bytes_per_mb);
 }
 
-std::uint64_t wall_timeout_guard_ms(std::uint64_t timeout_ms) {
-    if (timeout_ms == 0) {
-        return 0;
-    }
-    const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
-    const std::uint64_t multiplied = timeout_ms > maximum / 4 ? maximum : timeout_ms * 4;
-    const std::uint64_t padded = timeout_ms > maximum - 5000 ? maximum : timeout_ms + 5000;
-    return std::max(multiplied, padded);
-}
-
-std::uint64_t windows_cpu_timeout_ms(std::uint64_t timeout_ms) {
-    if (timeout_ms == 0) {
-        return 0;
-    }
-    const std::uint64_t padding = std::max<std::uint64_t>(100, timeout_ms / 10);
-    const std::uint64_t maximum = std::numeric_limits<std::uint64_t>::max();
-    return timeout_ms > maximum - padding ? maximum : timeout_ms + padding;
-}
 #endif
 
 std::string process_path_argument(const fs::path& path) {
@@ -1115,7 +1492,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
                           const std::function<bool()>& should_cancel = {},
                           const SandboxRunSpec* sandbox = nullptr,
                           bool attribute_memory_limit = false,
-                          const std::vector<fs::path>& runtime_search_paths = {}) {
+                          const ProcessLaunchContext* launch_context = nullptr) {
     if (args.empty() || args.front().empty()) {
         throw std::runtime_error("empty program command");
     }
@@ -1124,11 +1501,11 @@ ProcessResult run_program(const std::vector<std::string>& args,
     // contest requests an unlimited or absurd resource value. Explicitly
     // unsafe local judging continues to honor the raw configuration.
     if (sandbox) {
-        constexpr std::uint64_t kMaximumSandboxWallTimeMs = 5ULL * 60ULL * 1000ULL;
+        constexpr std::uint64_t kMaximumSandboxCpuTimeMs = 5ULL * 60ULL * 1000ULL;
         constexpr std::uint64_t kMaximumSandboxMemoryMb = 4096;
         timeout_ms = timeout_ms == 0
-                         ? kMaximumSandboxWallTimeMs
-                         : std::min(timeout_ms, kMaximumSandboxWallTimeMs);
+                         ? kMaximumSandboxCpuTimeMs
+                         : std::min(timeout_ms, kMaximumSandboxCpuTimeMs);
         memory_limit_mb = memory_limit_mb == 0
                               ? kMaximumSandboxMemoryMb
                               : std::min(memory_limit_mb, kMaximumSandboxMemoryMb);
@@ -1154,7 +1531,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
     }
 
 #ifndef _WIN32
-    (void)runtime_search_paths;
+    (void)launch_context;
     fs::path absolute_working_dir;
     fs::path absolute_stdout;
     fs::path absolute_stderr;
@@ -1190,6 +1567,16 @@ ProcessResult run_program(const std::vector<std::string>& args,
                          child_keep_fds.end());
     SandboxLaunchGuard sandbox_guard(sandbox_launch);
 
+#if defined(__linux__)
+    PosixDescriptorGuard sandbox_accounting_read;
+    PosixDescriptorGuard sandbox_accounting_write;
+    int accounting_pipe[2] = {-1, -1};
+    if (pipe(accounting_pipe) != 0) {
+        throw std::runtime_error("failed to create Linux process accounting pipe");
+    }
+    sandbox_accounting_read.reset(accounting_pipe[0]);
+    sandbox_accounting_write.reset(accounting_pipe[1]);
+#endif
     auto begin = std::chrono::steady_clock::now();
     pid_t pid = fork();
     if (pid < 0) {
@@ -1197,8 +1584,31 @@ ProcessResult run_program(const std::vector<std::string>& args,
     }
 
     if (pid == 0) {
-        detail::close_sandbox_child_fds_before_exec(sandbox_launch);
+#if defined(__linux__)
+        close(sandbox_accounting_read.release());
+        const pid_t judge_parent = getppid();
+        if (setpgid(0, 0) != 0 ||
+            prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+            prctl(PR_SET_CHILD_SUBREAPER, 1) != 0 ||
+            getppid() != judge_parent) {
+            run_linux_process_supervisor(
+                -1, sandbox_accounting_write.release(), sandbox == nullptr);
+        }
+        const pid_t supervisor_pid = getpid();
+        const pid_t launch_pid = fork();
+        if (launch_pid != 0) {
+            run_linux_process_supervisor(
+                launch_pid, sandbox_accounting_write.release(), sandbox == nullptr);
+        }
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+            getppid() != supervisor_pid) {
+            _exit(125);
+        }
+        close(sandbox_accounting_write.release());
+#else
         setpgid(0, 0);
+#endif
+        detail::close_sandbox_child_fds_before_exec(sandbox_launch);
         if (working_dir && chdir(working_dir->c_str()) != 0) {
             _exit(125);
         }
@@ -1244,6 +1654,10 @@ ProcessResult run_program(const std::vector<std::string>& args,
         _exit(127);
     }
 
+#if defined(__linux__)
+    sandbox_accounting_write.reset();
+#endif
+
     // Establish the process group from both sides of the fork so every error
     // path can reliably terminate the whole sandbox tree.
     if (setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH) {
@@ -1252,54 +1666,183 @@ ProcessResult run_program(const std::vector<std::string>& args,
     }
     ChildProcessGuard child_guard(pid);
     detail::close_sandbox_parent_fds_after_fork(sandbox_launch);
+#if defined(__linux__) && defined(SYS_pidfd_open)
+    PosixDescriptorGuard process_pidfd(
+        static_cast<int>(syscall(SYS_pidfd_open, pid, 0)));
+#endif
 
     int status = 0;
+    rusage direct_usage{};
     bool timed_out = false;
+    bool cancelled = false;
     bool memory_pressure_observed = false;
+    bool termination_requested = false;
+    auto termination_deadline = begin;
+    std::uint64_t sampled_cpu_time_ms = 0;
+    const std::uint64_t wall_guard_ms = [&] {
+        std::uint64_t guard = wall_timeout_guard_ms(timeout_ms);
+        if (sandbox) {
+            constexpr std::uint64_t maximum_sandbox_wall_ms = 5ULL * 60ULL * 1000ULL;
+            guard = guard == 0 ? maximum_sandbox_wall_ms
+                               : std::min(guard, maximum_sandbox_wall_ms);
+        }
+        return guard;
+    }();
 #if defined(__linux__)
-    auto next_memory_sample = begin;
+    auto next_resource_sample = begin;
+    pid_t sandbox_child_pid = -1;
+    pid_t supervised_launch_pid = -1;
 #else
     (void)attribute_memory_limit;
 #endif
     while (true) {
-        const auto now = std::chrono::steady_clock::now();
-#if defined(__linux__)
-        if (attribute_memory_limit && !memory_pressure_observed &&
-            now >= next_memory_sample) {
-            memory_pressure_observed =
-                process_tree_near_address_space_limit(pid, memory_limit_mb);
-            next_memory_sample = now + std::chrono::milliseconds(5);
-        }
-#endif
-        pid_t done = waitpid_retry(pid, &status, WNOHANG);
+        rusage observed_usage{};
+        const pid_t done = wait4_retry(pid, &status, WNOHANG, &observed_usage);
         if (done == pid) {
+            direct_usage = observed_usage;
             child_guard.disarm();
             break;
         }
         if (done < 0) {
-            throw std::runtime_error("waitpid failed");
+            throw std::runtime_error("wait4 failed");
         }
 
-        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
-        if (should_cancel && should_cancel()) {
-            kill_and_reap_process_group(pid);
-            child_guard.disarm();
-            throw std::runtime_error("judging cancelled");
+        const auto now = std::chrono::steady_clock::now();
+#if defined(__linux__)
+        if (!sandbox) {
+            supervised_launch_pid = linux_direct_child(pid);
         }
-        if (timeout_ms > 0 && static_cast<std::uint64_t>(elapsed) > timeout_ms) {
-            timed_out = true;
-            kill_and_reap_process_group(pid);
+        if (sandbox && sandbox_child_pid <= 0) {
+            const std::int64_t reported_pid = detail::sandbox_child_pid(sandbox_launch);
+            if (reported_pid > 0 &&
+                reported_pid <= static_cast<std::int64_t>(
+                                    std::numeric_limits<pid_t>::max())) {
+                sandbox_child_pid = static_cast<pid_t>(reported_pid);
+            }
+        }
+        if (!termination_requested && now >= next_resource_sample &&
+            (timeout_ms > 0 || attribute_memory_limit)) {
+            const pid_t accounting_root = sandbox ? sandbox_child_pid
+                                                  : supervised_launch_pid;
+            // Submission/checker seccomp permits threads but denies child
+            // processes; /proc/<tgid>/stat already includes every thread.
+            // Compilers and explicitly unsafe launches can create processes
+            // and therefore require a full descendant walk.
+            const bool traverse_nested_children =
+                !sandbox || sandbox->profile == detail::SandboxProfile::Compiler;
+            if (accounting_root > 0) {
+                const LinuxProcessTreeSample sample = sample_linux_process_tree(
+                    accounting_root, memory_limit_mb, attribute_memory_limit,
+                    traverse_nested_children);
+                sampled_cpu_time_ms =
+                    std::max(sampled_cpu_time_ms, sample.cpu_time_ms);
+                memory_pressure_observed =
+                    memory_pressure_observed || sample.near_address_space_limit;
+            }
+            next_resource_sample = now + linux_resource_sample_interval();
+        }
+#endif
+
+        const auto wall_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
+        const bool cancel_now =
+            !termination_requested && should_cancel && should_cancel();
+        cancelled = cancelled || cancel_now;
+        const bool cpu_limit_exceeded =
+            !termination_requested && timeout_ms > 0 &&
+            sampled_cpu_time_ms > timeout_ms;
+        const bool wall_guard_exceeded =
+            !termination_requested && wall_guard_ms > 0 && wall_elapsed >= 0 &&
+            static_cast<std::uint64_t>(wall_elapsed) > wall_guard_ms;
+        if (cancel_now || cpu_limit_exceeded || wall_guard_exceeded) {
+            timed_out = !cancel_now;
+#if defined(__linux__)
+            if (!sandbox || sandbox_child_pid > 0) {
+                if (sandbox) {
+                    // Keep bubblewrap's PID-1 reaper so target signals retain
+                    // their normal meaning, and let it collect exact CPU use.
+                    kill_linux_process_tree(sandbox_child_pid, false);
+                } else {
+                    // Leave the per-run supervisor alive long enough to reap
+                    // and account every unsafe descendant it adopted.
+                    kill_linux_process_tree(pid, false);
+                }
+                termination_requested = true;
+                termination_deadline = now + std::chrono::seconds(2);
+            } else
+#endif
+            {
+                kill_and_reap_process_group(pid, &status, &direct_usage);
+                child_guard.disarm();
+                break;
+            }
+        }
+
+        if (termination_requested && now >= termination_deadline) {
+#if defined(__linux__)
+            if (sandbox_child_pid > 0) {
+                kill_linux_process_tree(sandbox_child_pid, true);
+            }
+            kill_linux_process_tree(pid, true);
+#endif
+            kill_and_reap_process_group(pid, &status, &direct_usage);
             child_guard.disarm();
             break;
         }
+#if defined(__linux__) && defined(SYS_pidfd_open)
+        const int poll_timeout_ms = static_cast<int>(
+            std::min<std::int64_t>(10, linux_resource_sample_interval().count()));
+        if (process_pidfd.get() >= 0) {
+            pollfd descriptor{};
+            descriptor.fd = process_pidfd.get();
+            descriptor.events = POLLIN;
+            int poll_result = -1;
+            do {
+                poll_result = poll(&descriptor, 1, poll_timeout_ms);
+            } while (poll_result < 0 && errno == EINTR);
+            if (poll_result < 0) {
+                process_pidfd.reset();
+                usleep(static_cast<useconds_t>(poll_timeout_ms * 1000));
+            }
+        } else {
+            usleep(static_cast<useconds_t>(poll_timeout_ms * 1000));
+        }
+#else
         usleep(1000);
+#endif
     }
 
-    auto end = std::chrono::steady_clock::now();
+    bool sandbox_started = true;
+    std::uint64_t cpu_time_ms = posix_cpu_time_ms(direct_usage);
+#if defined(__linux__)
+    LinuxSandboxAccountingRecord sandbox_accounting;
+    const bool has_sandbox_accounting =
+        sandbox_accounting_read.get() >= 0 &&
+        read_linux_sandbox_accounting(sandbox_accounting_read.get(),
+                                      sandbox_accounting);
+    sandbox_accounting_read.reset();
+    if (has_sandbox_accounting) {
+        status = sandbox_accounting.launch_status;
+        const std::uint64_t accounted_cpu_us = sandbox
+            ? (sandbox_accounting.adopted_processes > 0
+                   ? sandbox_accounting.adopted_cpu_us
+                   : sandbox_accounting.direct_cpu_us)
+            : saturating_add(sandbox_accounting.direct_cpu_us,
+                             sandbox_accounting.adopted_cpu_us);
+        cpu_time_ms = accounted_cpu_us / 1000ULL;
+    }
+#endif
+    if (sandbox) {
+        sandbox_started = detail::sandbox_reported_child_start(sandbox_launch);
+    }
+    cpu_time_ms = std::max(cpu_time_ms, sampled_cpu_time_ms);
+    if (!cancelled && timeout_ms > 0 && cpu_time_ms > timeout_ms) {
+        timed_out = true;
+    }
+
     ProcessResult result;
     result.timed_out = timed_out;
-    result.elapsed_ms = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count());
+    result.cpu_time_ms = cpu_time_ms;
     if (WIFEXITED(status)) {
         result.exit_code = WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
@@ -1308,11 +1851,14 @@ ProcessResult run_program(const std::vector<std::string>& args,
     }
     result.memory_exceeded = !timed_out && result.exit_code != 0 &&
                              memory_pressure_observed;
-    if (sandbox && !detail::sandbox_reported_child_start(sandbox_launch)) {
+    if (sandbox && !sandbox_started) {
         result.sandbox_setup_failed = true;
         result.sandbox_error = "bubblewrap failed before starting the isolated process";
     }
     detail::close_sandbox_launch(sandbox_launch);
+    if (cancelled) {
+        throw std::runtime_error("judging cancelled");
+    }
     return result;
 #else
     (void)stack_limit_mb;
@@ -1419,8 +1965,9 @@ ProcessResult run_program(const std::vector<std::string>& args,
 
     PROCESS_INFORMATION raw_process{};
     std::wstring command_line = windows_command_line(launch_arguments);
-    std::vector<wchar_t> child_environment =
-        windows_environment_with_search_paths(runtime_search_paths);
+    std::vector<wchar_t> empty_environment;
+    const std::vector<wchar_t>& child_environment =
+        launch_context ? launch_context->environment : empty_environment;
     const std::string application_name = launch_arguments.front();
     const std::wstring working_directory =
         working_dir ? working_dir->native() : std::wstring();
@@ -1428,7 +1975,9 @@ ProcessResult run_program(const std::vector<std::string>& args,
         nullptr, command_line.data(), nullptr, nullptr, TRUE,
         CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT |
             (child_environment.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT),
-        child_environment.empty() ? nullptr : child_environment.data(),
+        child_environment.empty()
+            ? nullptr
+            : const_cast<wchar_t*>(child_environment.data()),
         working_dir ? working_directory.c_str() : nullptr,
         &startup.StartupInfo, &raw_process);
     if (!ok) {
@@ -1455,7 +2004,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
     bool timed_out = false;
     std::uint64_t cpu_elapsed_ms = 0;
     const std::uint64_t wall_guard_ms = wall_timeout_guard_ms(timeout_ms);
-    const std::uint64_t cpu_timeout_ms = windows_cpu_timeout_ms(timeout_ms);
+    const std::uint64_t cpu_timeout_ms = timeout_ms;
     WindowsJobEvents job_events;
     while (true) {
         const DWORD wait_result = WaitForSingleObject(process.get(), 10);
@@ -1509,6 +2058,9 @@ ProcessResult run_program(const std::vector<std::string>& args,
     }
     drain_windows_job_events(completion_port.get(), job_events);
     cpu_elapsed_ms = windows_job_cpu_time_ms(job.get());
+    if (cpu_timeout_ms > 0 && cpu_elapsed_ms > cpu_timeout_ms) {
+        timed_out = true;
+    }
     child_guard.disarm();
 
     ProcessResult result;
@@ -1516,7 +2068,7 @@ ProcessResult run_program(const std::vector<std::string>& args,
     result.timed_out = timed_out;
     result.memory_exceeded = attribute_memory_limit && !timed_out &&
                              job_events.memory_limit_exceeded;
-    result.elapsed_ms = cpu_elapsed_ms;
+    result.cpu_time_ms = cpu_elapsed_ms;
     return result;
 #endif
 }
@@ -1848,10 +2400,21 @@ std::vector<fs::path> compiler_runtime_search_paths(const JudgeOptions& options)
     return {compiler_directory};
 }
 
+CompilerContext make_compiler_context(const JudgeOptions& options) {
+    CompilerContext context;
+    context.base_args = compiler_base_args(options);
+    context.launch.runtime_search_paths = compiler_runtime_search_paths(options);
+#ifdef _WIN32
+    context.launch.environment =
+        windows_environment_with_search_paths(context.launch.runtime_search_paths);
+#endif
+    return context;
+}
+
 class FastTokenReader {
 public:
-    explicit FastTokenReader(const fs::path& path)
-        : input_(path, std::ios::binary), buffer_(1024 * 1024) {}
+    FastTokenReader(const fs::path& path, std::vector<char>& buffer)
+        : input_(path, std::ios::binary), buffer_(buffer) {}
 
     bool ok() const {
         return static_cast<bool>(input_);
@@ -1888,14 +2451,16 @@ private:
     }
 
     std::ifstream input_;
-    std::vector<char> buffer_;
+    std::vector<char>& buffer_;
     std::size_t pos_ = 0;
     std::size_t limit_ = 0;
 };
 
 bool outputs_match(const fs::path& actual, const fs::path& expected) {
-    FastTokenReader actual_in(actual);
-    FastTokenReader expected_in(expected);
+    thread_local std::vector<char> actual_buffer(1024 * 1024);
+    thread_local std::vector<char> expected_buffer(1024 * 1024);
+    FastTokenReader actual_in(actual, actual_buffer);
+    FastTokenReader expected_in(expected, expected_buffer);
     if (!actual_in.ok() || !expected_in.ok()) {
         return false;
     }
@@ -1927,10 +2492,9 @@ void copy_file_alias(const fs::path& from, const fs::path& to) {
     }
 }
 
-void copy_input_aliases(const fs::path& input,
-                        const fs::path& run_dir,
-                        const std::string& problem,
-                        const std::string& test_name) {
+std::set<std::string> input_alias_names(const fs::path& input,
+                                        const std::string& problem,
+                                        const std::string& test_name) {
     std::set<std::string> names;
     std::set<std::string> seen_names;
     auto insert_name = [&](const std::string& name) {
@@ -1963,6 +2527,12 @@ void copy_input_aliases(const fs::path& input,
     add_name(problem);
     add_name(test_name);
     add_name(process_path_argument(input.stem()));
+    return names;
+}
+
+void copy_input_aliases(const fs::path& input,
+                        const fs::path& run_dir,
+                        const std::set<std::string>& names) {
     fs::path primary;
     for (const auto& name : names) {
         fs::path target = run_dir / fs::u8path(name);
@@ -2168,6 +2738,22 @@ std::vector<fs::directory_entry> sorted_directories(const fs::path& path) {
     return entries;
 }
 
+std::vector<ProblemContext::TestCase> discover_problem_tests(
+    const ProblemContext& problem) {
+    std::vector<ProblemContext::TestCase> tests;
+    for (const auto& entry : sorted_directories(problem.dir)) {
+        ProblemContext::TestCase test;
+        test.name = process_path_argument(entry.path().filename());
+        test.dir = entry.path();
+        test.input = find_test_file(test.dir, problem.name, ".inp");
+        test.expected = find_test_file(test.dir, problem.name, ".out");
+        test.input_aliases = input_alias_names(test.input, problem.name, test.name);
+        test.max_points = points_for_test(problem.settings, test.name);
+        tests.push_back(std::move(test));
+    }
+    return tests;
+}
+
 std::vector<fs::path> sorted_sources(const fs::path& contestant_dir) {
     static const std::vector<std::string> extensions{".cpp", ".cc", ".cxx"};
     std::vector<fs::path> files;
@@ -2324,6 +2910,7 @@ bool checker_source_includes_testlib(const fs::path& checker_source) {
 
 fs::path compile_checker(const ProblemConfig& settings,
                          const JudgeOptions& options,
+                         const CompilerContext& compiler_context,
                          const fs::path& problem_dir,
                          const fs::path& checker_build_dir) {
     fs::path checker_source = resolve_checker_source(settings, problem_dir);
@@ -2345,9 +2932,7 @@ fs::path compile_checker(const ProblemConfig& settings,
 #endif
     fs::path compile_log = checker_build_dir / "checker-compile.err";
     ScopedPathCleanup compile_log_cleanup({compile_log}, !options.keep_workdir);
-    std::vector<std::string> compile_args = compiler_base_args(options);
-    const std::vector<fs::path> compiler_search_paths =
-        compiler_runtime_search_paths(options);
+    std::vector<std::string> compile_args = compiler_context.base_args;
     SandboxRunSpec sandbox_spec;
     const SandboxRunSpec* sandbox = nullptr;
     if (options.execution_security == ExecutionSecurity::Required) {
@@ -2373,7 +2958,7 @@ fs::path compile_checker(const ProblemConfig& settings,
     ProcessResult compile = run_program(compile_args, nullptr, nullptr, &compile_log,
                                         30000, 1024, 256, 64,
                                         options.should_cancel, sandbox, false,
-                                        compiler_search_paths);
+                                        &compiler_context.launch);
     if (compile.sandbox_setup_failed) {
         throw std::runtime_error("checker sandbox setup failed: " + compile.sandbox_error);
     }
@@ -2419,15 +3004,15 @@ std::vector<TestResult> rows_for_problem_tests(const std::string& contestant,
                                                const std::string& message) {
     std::vector<TestResult> rows;
     for (const auto& test_entry : problem.tests) {
-        std::string test_name = process_path_argument(test_entry.path().filename());
-        rows.push_back(TestResult{contestant, problem.name, test_name, verdict, time_ms,
-                                  exit_code, points_for_test(problem.settings, test_name),
+        rows.push_back(TestResult{contestant, problem.name, test_entry.name, verdict, time_ms,
+                                  exit_code, test_entry.max_points,
                                   0.0, message});
     }
     return rows;
 }
 
 PreparedSubmission prepare_submission(const JudgeOptions& options,
+                                      const CompilerContext& compiler_context,
                                       const fs::path& work_root,
                                       const ContestantContext& contestant,
                                       const ProblemContext& problem) {
@@ -2475,9 +3060,7 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
 #endif
     fs::path compile_log = build_dir / "compile.err";
     ScopedPathCleanup compile_log_cleanup({compile_log}, !options.keep_workdir);
-    std::vector<std::string> compile_args = compiler_base_args(options);
-    const std::vector<fs::path> compiler_search_paths =
-        compiler_runtime_search_paths(options);
+    std::vector<std::string> compile_args = compiler_context.base_args;
     SandboxRunSpec sandbox_spec;
     const SandboxRunSpec* sandbox = nullptr;
     if (options.execution_security == ExecutionSecurity::Required) {
@@ -2502,7 +3085,7 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
     ProcessResult compile = run_program(compile_args, nullptr, nullptr, &compile_log,
                                         30000, 1024, 256, 64,
                                         options.should_cancel, sandbox, false,
-                                        compiler_search_paths);
+                                        &compiler_context.launch);
     if (compile.sandbox_setup_failed) {
         prepared.immediate_results =
             rows_for_problem_tests(prepared.contestant, problem, Verdict::InternalError,
@@ -2520,7 +3103,7 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
         }
         prepared.immediate_results =
             rows_for_problem_tests(prepared.contestant, problem, Verdict::CompileError,
-                                   compile.exit_code, compile.elapsed_ms,
+                                   compile.exit_code, compile.cpu_time_ms,
                                    message);
         return prepared;
     }
@@ -2529,11 +3112,13 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
     return prepared;
 }
 
-TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
+TestResult judge_test_job(const TestJob& job, const JudgeOptions& options,
+                          const CompilerContext& compiler_context) {
     const ProblemContext& problem = *job.problem;
-    std::string test_name = process_path_argument(job.test.path().filename());
-    fs::path input = find_test_file(job.test.path(), problem.name, ".inp");
-    fs::path expected = find_test_file(job.test.path(), problem.name, ".out");
+    const ProblemContext::TestCase& test = *job.test;
+    const std::string& test_name = test.name;
+    const fs::path& input = test.input;
+    const fs::path& expected = test.expected;
     const fs::path submission_dir = job.executable.parent_path().parent_path();
     const fs::path test_artifact_dir = submission_dir / "tests" / fs::u8path(test_name);
     fs::path run_dir = test_artifact_dir / "work";
@@ -2546,9 +3131,7 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
     row.contestant = job.contestant;
     row.problem = problem.name;
     row.test = test_name;
-    row.max_points = points_for_test(problem.settings, test_name);
-    const std::vector<fs::path> compiler_search_paths =
-        compiler_runtime_search_paths(options);
+    row.max_points = test.max_points;
 
     if (input.empty() || expected.empty()) {
         row.verdict = Verdict::InternalError;
@@ -2558,12 +3141,16 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
 
     fs::remove_all(run_dir);
     fs::create_directories(run_dir);
-    try {
-        copy_input_aliases(input, run_dir, problem.name, test_name);
-    } catch (const std::exception& ex) {
-        row.verdict = Verdict::InternalError;
-        row.message = ex.what();
-        return row;
+    const bool materialize_input_aliases =
+        options.execution_security != ExecutionSecurity::Required || options.keep_workdir;
+    if (materialize_input_aliases) {
+        try {
+            copy_input_aliases(input, run_dir, test.input_aliases);
+        } catch (const std::exception& ex) {
+            row.verdict = Verdict::InternalError;
+            row.message = ex.what();
+            return row;
+        }
     }
 
     fs::path executable_path = fs::absolute(job.executable);
@@ -2574,13 +3161,6 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
     SandboxRunSpec submission_sandbox;
     const SandboxRunSpec* submission_sandbox_ptr = nullptr;
     if (options.execution_security == ExecutionSecurity::Required) {
-        std::vector<fs::path> input_aliases;
-        for (const auto& entry : fs::directory_iterator(run_dir)) {
-            std::error_code ec;
-            if (entry.is_regular_file(ec) && !ec) {
-                input_aliases.push_back(entry.path());
-            }
-        }
         sandbox_output_sentinel = "NEOTHEMIS-UNWRITTEN-" +
                                   std::to_string(std::hash<std::string>{}(
                                       process_path_argument(run_dir))) +
@@ -2593,9 +3173,11 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
         submission_sandbox.guest_working_directory = "/work";
         submission_sandbox.temporary_filesystems = {{"/work", 64ULL * 1024ULL * 1024ULL}};
         submission_sandbox.mounts = {{executable_path, "/program", true}};
-        for (const fs::path& alias : input_aliases) {
+        for (const std::string& alias : test.input_aliases) {
+            const fs::path host_input =
+                materialize_input_aliases ? run_dir / fs::u8path(alias) : input;
             submission_sandbox.mounts.push_back(
-                {alias, "/work/" + process_path_argument(alias.filename()), true});
+                {host_input, "/work/" + alias, true});
         }
         for (const fs::path& alias : sandbox_outputs) {
             submission_sandbox.mounts.push_back(
@@ -2608,8 +3190,8 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
                                     problem.settings.memory_limit_mb,
                                     options.stack_limit_mb, 64,
                                     options.should_cancel, submission_sandbox_ptr, true,
-                                    compiler_search_paths);
-    row.time_ms = run.elapsed_ms;
+                                    &compiler_context.launch);
+    row.time_ms = run.cpu_time_ms;
     row.exit_code = run.exit_code;
     if (run.sandbox_setup_failed) {
         row.verdict = Verdict::InternalError;
@@ -2640,8 +3222,11 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
             }
         } else {
             fs::path checker_executable = fs::absolute(problem.checker_executable);
-            fs::path checker_input = find_case_insensitive_file(
-                run_dir, {process_path_argument(input.filename())});
+            fs::path checker_input =
+                options.execution_security == ExecutionSecurity::Required
+                    ? input
+                    : find_case_insensitive_file(
+                          run_dir, {process_path_argument(input.filename())});
             if (checker_input.empty()) {
                 checker_input = input;
             }
@@ -2671,7 +3256,7 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options) {
                 checker_arguments, &run_dir, &checker_stdout, &checker_stderr,
                 problem.settings.time_limit_ms, problem.settings.memory_limit_mb,
                 options.stack_limit_mb, 16, options.should_cancel, checker_sandbox_ptr, true,
-                compiler_search_paths);
+                &compiler_context.launch);
             row.exit_code = checker.exit_code;
             row.message = first_existing_file_text({checker_stdout, checker_stderr});
             if (checker.sandbox_setup_failed) {
@@ -2816,6 +3401,7 @@ public:
         fs::path contestants_root = options.contest_root / options.contestants_dir;
         fs::path tests_root = options.contest_root / options.tests_dir;
         fs::path work_root = work_root_for_contest(options);
+        const CompilerContext compiler_context = make_compiler_context(options);
 
         if (options.execution_security == ExecutionSecurity::Required) {
             std::string reason;
@@ -2841,7 +3427,9 @@ public:
         fs::create_directories(work_root);
         std::vector<TestResult> results;
         std::vector<ProblemContext> problems;
-        for (const auto& problem_entry : sorted_directories(tests_root)) {
+        const auto problem_entries = sorted_directories(tests_root);
+        problems.reserve(problem_entries.size());
+        for (const auto& problem_entry : problem_entries) {
             if (options.should_cancel && options.should_cancel()) {
                 throw std::runtime_error("judging cancelled");
             }
@@ -2851,7 +3439,6 @@ public:
                 continue;
             }
             problem.dir = problem_entry.path();
-            problem.tests = sorted_directories(problem.dir);
             const fs::path problem_config = problem.dir / kProblemConfigFilename;
             std::error_code problem_config_error;
             const fs::file_status problem_config_status =
@@ -2875,15 +3462,16 @@ public:
                 is_testlib_checker_setting(problem.settings.checker)
                     ? CheckerPointScale::Percentage
                     : CheckerPointScale::Absolute;
+            problem.tests = discover_problem_tests(problem);
             try {
                 problem.checker_executable = compile_checker(
-                    problem.settings, options, problem.dir,
+                    problem.settings, options, compiler_context, problem.dir,
                     work_root / "internal" / "checkers" /
                         fs::u8path(problem.name) / "build");
             } catch (const std::exception& ex) {
                 problem.checker_error = ex.what();
             }
-            problems.push_back(problem);
+            problems.push_back(std::move(problem));
         }
         auto contestants = build_contestant_contexts(contestants_root);
         contestants.erase(std::remove_if(contestants.begin(), contestants.end(),
@@ -2892,6 +3480,22 @@ public:
                                                                       contestant.name);
                                          }),
                           contestants.end());
+        std::size_t tests_per_contestant = 0;
+        for (const ProblemContext& problem : problems) {
+            if (problem.tests.size() >
+                std::numeric_limits<std::size_t>::max() - tests_per_contestant) {
+                tests_per_contestant = 0;
+                break;
+            }
+            tests_per_contestant += problem.tests.size();
+        }
+        std::size_t expected_result_count = 0;
+        if (tests_per_contestant > 0 &&
+            contestants.size() <= std::numeric_limits<std::size_t>::max() /
+                                        tests_per_contestant) {
+            expected_result_count = contestants.size() * tests_per_contestant;
+            results.reserve(expected_result_count);
+        }
         unsigned int base_worker_count = configured_worker_count(options);
 
         std::mutex results_mutex;
@@ -2913,14 +3517,8 @@ public:
             }
             std::sort(test_jobs.begin(), test_jobs.end(),
                       [](const TestJob& a, const TestJob& b) {
-                          return std::make_tuple(a.problem->name,
-                                                 process_path_argument(
-                                                     a.test.path().filename()),
-                                                 a.contestant) <
-                                 std::make_tuple(b.problem->name,
-                                                 process_path_argument(
-                                                     b.test.path().filename()),
-                                                 b.contestant);
+                          return std::tie(a.problem->name, a.test->name, a.contestant) <
+                                 std::tie(b.problem->name, b.test->name, b.contestant);
                       });
 
             unsigned int worker_count =
@@ -2933,41 +3531,48 @@ public:
             }
 
             std::atomic<std::size_t> next_job{0};
+            const std::size_t result_offset = results.size();
+            results.resize(result_offset + test_jobs.size());
             std::mutex worker_error_mutex;
             std::exception_ptr worker_error;
             std::atomic<bool> stop_workers{false};
+            std::atomic<bool> cancellation_observed{false};
             std::atomic<bool> progress_done{false};
+            std::mutex progress_wait_mutex;
+            std::condition_variable progress_wakeup;
             auto worker = [&](unsigned int worker_id) {
                 try {
                     while (true) {
-                        if (stop_workers.load() ||
-                            (options.should_cancel && options.should_cancel())) {
+                        const bool cancel_now =
+                            options.should_cancel && options.should_cancel();
+                        if (cancel_now) {
+                            cancellation_observed.store(true, std::memory_order_relaxed);
+                        }
+                        if (stop_workers.load() || cancel_now) {
                             std::lock_guard<std::mutex> progress_lock(progress_mutex);
                             progress_state.worker_labels[worker_id - 1] = "done";
                             return;
                         }
-                        std::size_t job_index = next_job.fetch_add(1);
+                        std::size_t job_index =
+                            next_job.fetch_add(1, std::memory_order_relaxed);
                         if (job_index >= test_jobs.size()) {
                             std::lock_guard<std::mutex> progress_lock(progress_mutex);
                             progress_state.worker_labels[worker_id - 1] = "done";
                             return;
                         }
-                        TestJob job = test_jobs[job_index];
+                        const TestJob& job = test_jobs[job_index];
 
                         std::string label = job.contestant + "/" + job.problem->name + "/" +
-                                            process_path_argument(
-                                                job.test.path().filename());
+                                            job.test->name;
                         {
                             std::lock_guard<std::mutex> lock(progress_mutex);
                             progress_state.worker_labels[worker_id - 1] = label;
                         }
 
-                        TestResult job_result = judge_test_job(job, options);
+                        TestResult job_result =
+                            judge_test_job(job, options, compiler_context);
                         publish_result(job_result);
-                        {
-                            std::lock_guard<std::mutex> lock(results_mutex);
-                            results.push_back(std::move(job_result));
-                        }
+                        results[result_offset + job_index] = std::move(job_result);
                         {
                             std::lock_guard<std::mutex> lock(progress_mutex);
                             ++progress_state.completed_jobs;
@@ -2985,12 +3590,17 @@ public:
             std::thread progress_monitor;
             if (options.progress && worker_count > 0) {
                 progress_monitor = std::thread([&]() {
-                    while (!progress_done.load()) {
+                    while (true) {
                         {
                             std::lock_guard<std::mutex> lock(progress_mutex);
                             emit_progress_summary(options, progress_state, "judge");
                         }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        std::unique_lock<std::mutex> wait_lock(progress_wait_mutex);
+                        if (progress_wakeup.wait_for(
+                                wait_lock, std::chrono::milliseconds(500),
+                                [&] { return progress_done.load(); })) {
+                            break;
+                        }
                     }
                     {
                         std::lock_guard<std::mutex> lock(progress_mutex);
@@ -3007,11 +3617,16 @@ public:
                 thread.join();
             }
             progress_done.store(true);
+            progress_wakeup.notify_all();
             if (progress_monitor.joinable()) {
                 progress_monitor.join();
             }
             if (worker_error) {
                 std::rethrow_exception(worker_error);
+            }
+            if (cancellation_observed.load(std::memory_order_relaxed) ||
+                (options.should_cancel && options.should_cancel())) {
+                throw std::runtime_error("judging cancelled");
             }
         };
 
@@ -3024,6 +3639,9 @@ public:
         }
 
         std::vector<TestJob> all_jobs;
+        if (expected_result_count > 0) {
+            all_jobs.reserve(expected_result_count);
+        }
         if (!prep_tasks.empty()) {
             unsigned int prepare_worker_count =
                 std::min<unsigned int>(base_worker_count,
@@ -3034,7 +3652,10 @@ public:
             }
             std::atomic<std::size_t> next_prep_task{0};
             std::atomic<bool> prepare_progress_done{false};
+            std::mutex prepare_progress_wait_mutex;
+            std::condition_variable prepare_progress_wakeup;
             std::atomic<bool> stop_prepare_workers{false};
+            std::atomic<bool> prepare_cancellation_observed{false};
             std::mutex all_jobs_mutex;
             std::mutex prepare_error_mutex;
             std::exception_ptr prepare_error;
@@ -3042,13 +3663,19 @@ public:
             auto prepare_worker = [&](unsigned int worker_id) {
                 try {
                     while (true) {
-                        if (stop_prepare_workers.load() ||
-                            (options.should_cancel && options.should_cancel())) {
+                        const bool cancel_now =
+                            options.should_cancel && options.should_cancel();
+                        if (cancel_now) {
+                            prepare_cancellation_observed.store(
+                                true, std::memory_order_relaxed);
+                        }
+                        if (stop_prepare_workers.load() || cancel_now) {
                             std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
                             prepare_state.worker_labels[worker_id - 1] = "done";
                             return;
                         }
-                        std::size_t index = next_prep_task.fetch_add(1);
+                        std::size_t index =
+                            next_prep_task.fetch_add(1, std::memory_order_relaxed);
                         if (index >= prep_tasks.size()) {
                             std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
                             prepare_state.worker_labels[worker_id - 1] = "done";
@@ -3063,7 +3690,8 @@ public:
                         }
 
                         PreparedSubmission prepared =
-                            prepare_submission(options, work_root, *task.contestant, *task.problem);
+                            prepare_submission(options, compiler_context, work_root,
+                                               *task.contestant, *task.problem);
                         for (const auto& result : prepared.immediate_results) {
                             publish_result(result);
                         }
@@ -3075,7 +3703,7 @@ public:
                         if (prepared.ready) {
                             std::lock_guard<std::mutex> lock(all_jobs_mutex);
                             for (const auto& test : task.problem->tests) {
-                                all_jobs.push_back(TestJob{prepared.contestant, task.problem, test,
+                                all_jobs.push_back(TestJob{prepared.contestant, task.problem, &test,
                                                            prepared.executable});
                             }
                         }
@@ -3096,12 +3724,18 @@ public:
             std::thread prepare_progress_monitor;
             if (options.progress && prepare_worker_count > 0) {
                 prepare_progress_monitor = std::thread([&]() {
-                    while (!prepare_progress_done.load()) {
+                    while (true) {
                         {
                             std::lock_guard<std::mutex> lock(prepare_progress_mutex);
                             emit_progress_summary(options, prepare_state, "prepare");
                         }
-                        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        std::unique_lock<std::mutex> wait_lock(
+                            prepare_progress_wait_mutex);
+                        if (prepare_progress_wakeup.wait_for(
+                                wait_lock, std::chrono::milliseconds(500),
+                                [&] { return prepare_progress_done.load(); })) {
+                            break;
+                        }
                     }
                     {
                         std::lock_guard<std::mutex> lock(prepare_progress_mutex);
@@ -3118,11 +3752,16 @@ public:
                 thread.join();
             }
             prepare_progress_done.store(true);
+            prepare_progress_wakeup.notify_all();
             if (prepare_progress_monitor.joinable()) {
                 prepare_progress_monitor.join();
             }
             if (prepare_error) {
                 std::rethrow_exception(prepare_error);
+            }
+            if (prepare_cancellation_observed.load(std::memory_order_relaxed) ||
+                (options.should_cancel && options.should_cancel())) {
+                throw std::runtime_error("judging cancelled");
             }
         }
 

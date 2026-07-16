@@ -1,6 +1,7 @@
 #include "Theme.hpp"
 
 #include <QApplication>
+#include <QFontDatabase>
 #include <QPalette>
 
 #include <algorithm>
@@ -122,6 +123,19 @@ void apply_application_theme(const std::string& theme,
                              const CyberThemeColors& cyber_colors) {
     static const QPalette system_palette = qApp->palette();
     qApp->setPalette(system_palette);
+    QFont interface_font = qApp->font();
+    const QStringList available_families = QFontDatabase::families();
+    for (const QString& family : {QStringLiteral("Inter"),
+                                  QStringLiteral("Segoe UI Variable Text"),
+                                  QStringLiteral("Segoe UI"),
+                                  QStringLiteral("Noto Sans")}) {
+        if (available_families.contains(family)) {
+            interface_font.setFamily(family);
+            break;
+        }
+    }
+    interface_font.setPointSizeF(10.0);
+    qApp->setFont(interface_font);
     const bool cyber = theme == "cyber" || theme == "glassy-dark";
     QApplication::setAttribute(Qt::AA_DontUseNativeDialogs, cyber);
     const CyberThemeColors defaults = default_cyber_theme_colors();
@@ -173,10 +187,26 @@ void apply_application_theme(const std::string& theme,
         selection_surface, 3.4);
     const QColor selection_text =
         ensure_contrast(foreground, selection_surface, 4.5);
+    QColor tab_indicator_fill = cyber
+                                    ? mix_color(background_mid, secondary, 0.20)
+                                    : QColor(28, 50, 55);
+    tab_indicator_fill.setAlpha(cyber ? 238 : 246);
+    QColor tab_indicator_border = cyber
+                                      ? mix_color(secondary, primary_light, 0.24)
+                                      : QColor(84, 211, 194);
+    tab_indicator_border.setAlpha(cyber ? 184 : 148);
+    QColor tab_rail_fill = cyber ? background_deep : QColor(6, 11, 17);
+    tab_rail_fill.setAlpha(cyber ? 178 : 196);
+    QColor tab_rail_border = tab_indicator_border;
+    tab_rail_border.setAlpha(cyber ? 58 : 42);
+    qApp->setProperty("neothemisTabIndicatorFill", tab_indicator_fill);
+    qApp->setProperty("neothemisTabIndicatorBorder", tab_indicator_border);
+    qApp->setProperty("neothemisTabRailFill", tab_rail_fill);
+    qApp->setProperty("neothemisTabRailBorder", tab_rail_border);
     QString style_sheet = QString::fromUtf8(R"(
         QWidget {
-            background: #090d12;
-            color: #edf3f7;
+            background: #0a0f17;
+            color: #e7eef5;
             font-size: 13px;
             selection-background-color: #2a6f72;
             selection-color: #ffffff;
@@ -185,7 +215,10 @@ void apply_application_theme(const std::string& theme,
             background: transparent;
         }
         QDialog {
-            background: rgba(10, 16, 23, 238);
+            background: rgba(10, 16, 24, 246);
+        }
+        QDialog#SettingsDialog {
+            background: rgba(10, 16, 24, 250);
         }
         QWidget#AppRoot {
             background: transparent;
@@ -195,22 +228,50 @@ void apply_application_theme(const std::string& theme,
             background: transparent;
             border: 0;
         }
-        QWidget#InlineControl, QSlider {
+        QWidget#InlineControl, QWidget#SettingsContent,
+        QScrollArea#SettingsScrollArea, QScrollArea#SettingsScrollArea > QWidget,
+        QSlider {
             background: transparent;
+            border: 0;
+        }
+        QWidget#WorkspacePanel, QWidget#SectionHeader {
+            background: transparent;
+            border: 0;
         }
         QWidget#WindowTitleBar {
-            background: rgba(18, 27, 34, 212);
-            border-bottom: 1px solid rgba(255, 255, 255, 34);
-            min-height: 38px;
+            background: rgba(13, 20, 29, 232);
+            border-bottom: 1px solid rgba(255, 255, 255, 24);
+            min-height: 44px;
         }
         QWidget#MenuRow {
-            background: rgba(15, 22, 29, 178);
-            border-bottom: 1px solid rgba(84, 211, 194, 50);
-            min-height: 34px;
+            background: rgba(11, 17, 25, 206);
+            border-bottom: 1px solid rgba(84, 211, 194, 38);
+            min-height: 38px;
         }
         QLabel#WindowAppName {
-            color: #f8fafc; font-size: 14px; font-weight: 800;
+            color: #f8fafc; font-size: 15px; font-weight: 750;
             padding-right: 10px;
+        }
+        QLabel#SectionTitle, QLabel#SidePanelTitle, QLabel#DialogTitle {
+            color: #f5f9fc;
+            font-size: 20px;
+            font-weight: 750;
+        }
+        QLabel#SidePanelTitle {
+            font-size: 18px;
+        }
+        QLabel#DialogTitle {
+            font-size: 22px;
+            padding: 0 2px 4px 2px;
+        }
+        QLabel#ActivityTitle {
+            color: #f0f6fa;
+            font-size: 14px;
+            font-weight: 700;
+        }
+        QLabel#SectionHint, QLabel#SidePanelHint {
+            color: #93a4b2;
+            font-size: 12px;
         }
         QLabel#AppLogo {
             min-width: 28px; min-height: 28px;
@@ -220,9 +281,9 @@ void apply_application_theme(const std::string& theme,
         }
         QMenuBar::item {
             background: transparent;
-            padding: 7px 13px;
+            padding: 7px 12px;
             border-radius: 8px;
-            margin: 2px 1px;
+            margin: 3px 1px;
         }
         QMenuBar::item:selected {
             background: rgba(84, 211, 194, 42);
@@ -234,7 +295,7 @@ void apply_application_theme(const std::string& theme,
             border: 0;
             color: #d9e6ec;
             min-width: 46px;
-            min-height: 38px;
+            min-height: 44px;
             border-radius: 0;
             font-weight: 700;
         }
@@ -250,16 +311,17 @@ void apply_application_theme(const std::string& theme,
             color: #ffffff;
         }
         QPushButton {
-            background: rgba(24, 35, 43, 206);
+            background: rgba(25, 36, 46, 224);
             color: #ecfffb;
-            border: 1px solid rgba(116, 224, 207, 120);
-            border-radius: 8px;
-            padding: 9px 12px;
-            font-weight: 700;
+            border: 1px solid rgba(137, 164, 176, 88);
+            border-radius: 9px;
+            padding: 10px 14px;
+            min-height: 20px;
+            font-weight: 650;
         }
         QPushButton:hover {
-            background: rgba(39, 65, 70, 230);
-            border-color: #8ef7e3;
+            background: rgba(38, 54, 66, 238);
+            border-color: rgba(142, 247, 227, 176);
             color: #ffffff;
         }
         QPushButton:pressed { background: rgba(13, 20, 24, 235); border-color: #e86a82; }
@@ -269,8 +331,8 @@ void apply_application_theme(const std::string& theme,
             border-color: rgba(255, 255, 255, 30);
         }
         QPushButton#StopButton {
-            background: rgba(76, 28, 42, 212);
-            border-color: rgba(255, 112, 137, 145);
+            background: rgba(90, 34, 49, 214);
+            border-color: rgba(255, 112, 137, 126);
         }
         QPushButton#StopButton:hover { background: rgba(111, 34, 54, 230); border-color: #ff8ba1; }
         QPushButton#DangerButton {
@@ -282,11 +344,34 @@ void apply_application_theme(const std::string& theme,
             background: rgba(180, 47, 72, 235);
             border-color: #ff9aae;
         }
+        QPushButton#PrimaryButton {
+            background: #267d76;
+            border-color: #4fc7b8;
+            color: #ffffff;
+        }
+        QPushButton#PrimaryButton:hover {
+            background: #31948a;
+            border-color: #8ef7e3;
+        }
+        QPushButton#SecondaryButton {
+            background: rgba(37, 51, 63, 224);
+            border-color: rgba(142, 247, 227, 92);
+        }
+        QPushButton#QuietButton {
+            background: transparent;
+            border-color: rgba(255, 255, 255, 46);
+            color: #b9c7d0;
+        }
+        QPushButton#QuietButton:hover {
+            background: rgba(255, 255, 255, 20);
+            border-color: rgba(142, 247, 227, 90);
+            color: #eef8f8;
+        }
         QMenu {
-            background: rgba(18, 25, 32, 238);
+            background: rgba(17, 24, 33, 248);
             border: 1px solid rgba(255, 255, 255, 44);
-            border-radius: 10px;
-            padding: 6px;
+            border-radius: 12px;
+            padding: 7px;
         }
         QMenu::item { padding: 8px 24px; border-radius: 7px; }
         QMenu::item:selected {
@@ -295,11 +380,19 @@ void apply_application_theme(const std::string& theme,
         }
         QTableWidget, QPlainTextEdit, QLineEdit, QSpinBox, QDoubleSpinBox,
         QComboBox {
-            background: rgba(17, 24, 31, 204);
-            border: 1px solid rgba(255, 255, 255, 36);
-            border-radius: 8px;
-            padding: 5px;
+            background: rgba(13, 20, 29, 226);
+            border: 1px solid rgba(255, 255, 255, 34);
+            border-radius: 9px;
+            padding: 7px;
             color: #edf3f7;
+        }
+        QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus,
+        QComboBox:focus, QPlainTextEdit:focus, QTextEdit:focus {
+            border-color: rgba(142, 247, 227, 168);
+        }
+        QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox,
+        QDateEdit, QTimeEdit, QDateTimeEdit {
+            padding-left: 8px;
         }
         QSpinBox, QDoubleSpinBox {
             padding: 5px 30px 5px 8px;
@@ -343,16 +436,32 @@ void apply_application_theme(const std::string& theme,
             height: 5px;
         }
         QWidget#SidePanel {
-            background: rgba(16, 23, 31, 174);
-            border: 1px solid rgba(255, 255, 255, 45);
-            border-radius: 14px;
+            background: rgba(14, 21, 30, 218);
+            border: 1px solid rgba(255, 255, 255, 38);
+            border-radius: 16px;
+        }
+        QAbstractItemView {
+            outline: 0;
+        }
+        QListView::item:focus, QTreeView::item:focus,
+        QTableView::item:focus, QTableWidget::item:focus {
+            border: 0;
+            outline: 0;
+        }
+        QAbstractItemView QLineEdit {
+            border: 0;
+            border-radius: 0;
+            margin: 0;
+            min-height: 0;
+            padding: 0 6px;
         }
         QTableWidget#ScoreTable {
-            background: rgba(10, 16, 22, 178);
-            alternate-background-color: rgba(21, 31, 38, 192);
-            gridline-color: rgba(99, 131, 141, 70);
+            background: rgba(11, 17, 25, 218);
+            alternate-background-color: rgba(17, 26, 36, 218);
+            gridline-color: transparent;
             selection-background-color: rgba(56, 112, 119, 160);
-            border-radius: 14px;
+            border: 1px solid rgba(255, 255, 255, 34);
+            border-radius: 16px;
             outline: 0;
         }
         QTableWidget#CoreTasksTable {
@@ -375,14 +484,17 @@ void apply_application_theme(const std::string& theme,
             outline: 0;
         }
         QPlainTextEdit#LogPanel {
-            background: rgba(7, 12, 17, 178);
+            background: rgba(7, 12, 18, 224);
+            border-radius: 12px;
+            padding: 9px;
+            font-family: "Cascadia Mono";
         }
         QTableWidget::item {
             border-bottom: 1px solid rgba(255, 255, 255, 22);
             padding: 6px;
         }
         QTableWidget#ScoreTable::item {
-            padding: 2px 6px;
+            padding: 5px 8px;
         }
         QTableWidget::item:selected {
             background: rgba(62, 118, 124, 174);
@@ -394,13 +506,13 @@ void apply_application_theme(const std::string& theme,
             outline: none;
         }
         QHeaderView::section {
-            background: rgba(19, 31, 39, 220);
+            background: rgba(18, 29, 39, 238);
             color: #9dfdec;
             border: 0;
             border-right: 1px solid rgba(255, 255, 255, 28);
             border-bottom: 1px solid rgba(232, 106, 130, 120);
-            padding: 8px;
-            font-weight: 700;
+            padding: 11px 10px;
+            font-weight: 650;
         }
         QGroupBox {
             border: 1px solid rgba(255, 255, 255, 42);
@@ -408,6 +520,13 @@ void apply_application_theme(const std::string& theme,
             margin-top: 10px;
             padding-top: 12px;
             background: rgba(22, 31, 39, 166);
+        }
+        QGroupBox#ActionCard {
+            margin-top: 0;
+            padding-top: 0;
+            background: rgba(8, 14, 21, 126);
+            border-color: rgba(255, 255, 255, 30);
+            border-radius: 13px;
         }
         QGroupBox::title {
             subcontrol-origin: margin;
@@ -418,15 +537,16 @@ void apply_application_theme(const std::string& theme,
         QProgressBar {
             background: rgba(7, 12, 17, 190);
             border: 1px solid rgba(255, 255, 255, 42);
-            border-radius: 8px;
-            min-height: 28px;
-            max-height: 28px;
+            border-radius: 16px;
+            min-height: 32px;
+            max-height: 32px;
             text-align: center;
+            color: transparent;
         }
         QProgressBar::chunk {
             background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                 stop:0 #61d7c7, stop:0.68 #8ef7e3, stop:1 #e86a82);
-            border-radius: 7px;
+            border-radius: 15px;
         }
         QLabel#JudgeElapsedLabel {
             color: #9fb3bd;
@@ -487,20 +607,40 @@ void apply_application_theme(const std::string& theme,
         QLabel#ContestTitle { color: #9db0b9; }
         QTabWidget::pane {
             border: 1px solid rgba(255, 255, 255, 42);
-            border-radius: 10px;
-            background: rgba(13, 19, 26, 164);
+            border-top: 0;
+            border-radius: 13px;
+            background: rgba(13, 19, 27, 196);
+            top: 0;
         }
-        QTabBar::tab {
-            background: rgba(24, 32, 39, 184);
-            padding: 8px 12px;
-            border-top-left-radius: 8px;
-            border-top-right-radius: 8px;
-            margin-right: 2px;
+        QTabBar#SettingsTabBar {
+            background: transparent;
+            border: 0;
+            padding: 2px;
         }
-        QTabBar::tab:selected {
-            background: rgba(84, 211, 194, 38);
+        QTabBar#SettingsTabBar::tab {
+            background: transparent;
+            color: #91a3af;
+            border: 0;
+            padding: 11px 16px;
+            min-width: 30px;
+            margin: 0;
+        }
+        QTabBar#SettingsTabBar::tab:selected {
+            background: transparent;
             color: #9dfdec;
-            border: 1px solid rgba(142, 247, 227, 82);
+            border: 0;
+        }
+        QTabBar#SettingsTabBar::tab:hover:!selected {
+            background: rgba(255, 255, 255, 14);
+            border-radius: 9px;
+            color: #dbe7ec;
+        }
+        QToolTip {
+            background: #17212c;
+            color: #eef7f8;
+            border: 1px solid rgba(142, 247, 227, 72);
+            border-radius: 7px;
+            padding: 6px 8px;
         }
         QScrollBar:vertical, QScrollBar:horizontal {
             background: rgba(7, 12, 17, 120);
@@ -603,9 +743,9 @@ void apply_application_theme(const std::string& theme,
             QHeaderView::section {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                     stop:0 rgba(20, 48, 53, 218),
-                    stop:1 rgba(52, 29, 43, 218));
+                    stop:1 rgba(18, 41, 47, 218));
                 color: #b8fff2;
-                border-bottom-color: rgba(255, 126, 156, 140);
+                border-bottom-color: rgba(128, 238, 220, 70);
             }
             QProgressBar {
                 background: rgba(6, 11, 18, 170);
@@ -647,12 +787,13 @@ void apply_application_theme(const std::string& theme,
             QTabWidget::pane {
                 background: rgba(12, 17, 26, 132);
                 border-color: rgba(255, 151, 176, 70);
+                border-top: 0;
                 border-radius: 8px;
             }
-            QTabBar::tab:selected {
-                background: rgba(178, 76, 106, 44);
+            QTabBar#SettingsTabBar::tab:selected {
+                background: transparent;
                 color: #ffdbe4;
-                border-color: rgba(255, 147, 174, 112);
+                border: 0;
             }
             QScrollBar::handle {
                 background: rgba(211, 132, 151, 104);
@@ -860,7 +1001,7 @@ void apply_application_theme(const std::string& theme,
                     stop:0 @headerPrimary,
                     stop:1 @headerSecondary);
                 color: @primaryText;
-                border-bottom-color: @secondaryStrongBorder;
+                border-bottom-color: @headerBorder;
             }
             QProgressBar {
                 background: @progressBackground;
@@ -902,15 +1043,16 @@ void apply_application_theme(const std::string& theme,
             QTabWidget::pane {
                 background: @tabPaneBackground;
                 border-color: @secondaryBorder;
+                border-top: 0;
             }
-            QTabBar::tab {
-                background: @tabBackground;
+            QTabBar#SettingsTabBar::tab {
+                background: transparent;
                 color: @foreground;
             }
-            QTabBar::tab:selected {
-                background: @secondarySoft;
+            QTabBar#SettingsTabBar::tab:selected {
+                background: transparent;
                 color: @secondaryText;
-                border-color: @secondaryStrongBorder;
+                border: 0;
             }
             QScrollBar::handle {
                 background: @secondaryScroll;
@@ -1012,8 +1154,11 @@ void apply_application_theme(const std::string& theme,
         replace_token(cyber_accent, "@dangerBackground", rgba(secondary_dark, 212));
         replace_token(cyber_accent, "@dangerHover", rgba(secondary, 230));
         replace_token(cyber_accent, "@secondarySoft", rgba(secondary, 46));
-        replace_token(cyber_accent, "@headerPrimary", rgba(primary_dark, 218));
-        replace_token(cyber_accent, "@headerSecondary", rgba(secondary_dark, 218));
+        replace_token(cyber_accent, "@headerPrimary",
+                      rgba(mix_color(background_dark, primary_dark, 0.34), 218));
+        replace_token(cyber_accent, "@headerSecondary",
+                      rgba(mix_color(background_dark, primary_dark, 0.24), 218));
+        replace_token(cyber_accent, "@headerBorder", rgba(primary_light, 70));
         replace_token(cyber_accent, "@primary", primary);
         replace_token(cyber_accent, "@secondary", secondary);
         style_sheet += cyber_accent;

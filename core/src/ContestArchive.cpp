@@ -15,7 +15,6 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
-#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -103,21 +102,6 @@ std::string point_key_for_test_name(const std::string& test_name) {
 
 bool points_equal(double a, double b) {
     return std::abs(a - b) < 0.0000001;
-}
-
-std::string format_number(double value) {
-    std::ostringstream out;
-    out << std::setprecision(12) << value;
-    std::string result = out.str();
-    if (result.find('.') != std::string::npos) {
-        while (!result.empty() && result.back() == '0') {
-            result.pop_back();
-        }
-        if (!result.empty() && result.back() == '.') {
-            result.pop_back();
-        }
-    }
-    return result.empty() ? "0" : result;
 }
 
 void report_progress(const ArchiveProgress& progress,
@@ -1245,7 +1229,7 @@ void write_problem_config(const fs::path& path,
     ConfigEntries entries{
         {"time_limit_ms", std::to_string(time_limit_ms), 0},
         {"memory_limit_mb", std::to_string(memory_limit_mb), 0},
-        {"default_points", format_number(default_points), 0},
+        {"default_points", format_config_number(default_points), 0},
         {"checker", checker_setting, 0}
     };
 
@@ -1263,7 +1247,7 @@ void write_problem_config(const fs::path& path,
             continue;
         }
         entries.push_back({"test_points." + point_key_for_test_name(test_name),
-                           format_number(by_name->second), 0});
+                           format_config_number(by_name->second), 0});
     }
     write_config_entries(path, entries);
 }
