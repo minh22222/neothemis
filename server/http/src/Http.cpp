@@ -104,6 +104,9 @@ public:
             socket_->deleteLater();
             deleteLater();
         });
+        QObject::connect(socket_, &QTcpSocket::bytesWritten, this, [this](qint64) {
+            close_if_response_written();
+        });
         read_timeout_.setSingleShot(true);
         QObject::connect(&read_timeout_, &QTimer::timeout, this, [this]() {
             finish(error_response(408, "request timeout"));
@@ -143,8 +146,21 @@ private:
     }
 
     void send_and_close(const HttpResponse& response) {
-        socket_->write(serialize_response(response));
-        socket_->disconnectFromHost();
+        const QByteArray wire_response = serialize_response(response);
+        response_pending_ = true;
+        if (socket_->write(wire_response) != wire_response.size()) {
+            response_pending_ = false;
+            socket_->abort();
+            return;
+        }
+        close_if_response_written();
+    }
+
+    void close_if_response_written() {
+        if (response_pending_ && socket_->bytesToWrite() == 0) {
+            response_pending_ = false;
+            socket_->disconnectFromHost();
+        }
     }
 
     QTcpSocket* socket_ = nullptr;
@@ -152,6 +168,7 @@ private:
     QByteArray buffer_;
     QTimer read_timeout_;
     bool finished_ = false;
+    bool response_pending_ = false;
 };
 
 } // namespace

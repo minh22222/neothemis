@@ -175,14 +175,22 @@ void test_connection_dispatches_once() {
     require(client.write(first_request) == first_request.size(),
             "failed to queue first HTTP request");
     client.flush();
-    require(wait_until([&]() { return client.state() == QAbstractSocket::UnconnectedState; }, 3000),
+    require(wait_until(
+                [&]() {
+                    response_bytes += client.readAll();
+                    return response_bytes.contains("\r\n\r\nok");
+                },
+                5000),
+            "single-dispatch test did not receive the successful response");
+    require(wait_until([&]() { return client.state() == QAbstractSocket::UnconnectedState; },
+                       5000),
             "HTTP test connection did not close");
     response_bytes += client.readAll();
 
     require(late_write_queued, "failed to queue late HTTP request");
     require(handler_calls == 1, "late bytes dispatched the HTTP handler more than once");
     require(response_bytes.startsWith("HTTP/1.1 200 OK\r\n"),
-            "single-dispatch test did not receive the successful response");
+            "single-dispatch test received an invalid successful response");
     require(response_bytes.count("HTTP/1.1 ") == 1,
             "late bytes caused more than one HTTP response");
 }

@@ -4,7 +4,6 @@ add_executable(neothemis-core-tests
 target_link_libraries(neothemis-core-tests PRIVATE neothemis_core)
 target_compile_definitions(neothemis-core-tests PRIVATE
     NEOTHEMIS_TEST_COMPILER="${CMAKE_CXX_COMPILER}"
-    NEOTHEMIS_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 )
 
 if (WIN32)

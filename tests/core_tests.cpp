@@ -58,6 +58,68 @@ void write_file(const fs::path& path, const std::string& contents) {
     require(static_cast<bool>(output), "failed to write " + path.string());
 }
 
+void write_testlib_protocol_fixture(const fs::path& path) {
+    write_file(path, R"TESTLIB(#pragma once
+
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+
+enum TResult { _ok = 0, _wa = 1 };
+
+class TestStream {
+public:
+    void open(const char* path) {
+        input_.open(path);
+        if (!input_) {
+            std::exit(3);
+        }
+    }
+
+    int readInt() {
+        int value = 0;
+        if (!(input_ >> value)) {
+            std::exit(3);
+        }
+        return value;
+    }
+
+    long long readLong(long long minimum, long long maximum, const char*) {
+        long long value = 0;
+        if (!(input_ >> value) || value < minimum || value > maximum) {
+            std::exit(3);
+        }
+        return value;
+    }
+
+private:
+    std::ifstream input_;
+};
+
+static TestStream inf;
+static TestStream ouf;
+static TestStream ans;
+
+inline void registerTestlibCmd(int argc, char** argv) {
+    if (argc != 4) {
+        std::exit(3);
+    }
+    inf.open(argv[1]);
+    ouf.open(argv[2]);
+    ans.open(argv[3]);
+}
+
+[[noreturn]] inline void quitf(TResult result, const char*) {
+    std::exit(static_cast<int>(result));
+}
+
+[[noreturn]] inline void quitp(int points, const char* message) {
+    std::cout << points << ' ' << message;
+    std::exit(7);
+}
+)TESTLIB");
+}
+
 std::string read_file(const fs::path& path) {
     std::ifstream input(path, std::ios::binary);
     require(static_cast<bool>(input), "failed to read " + path.string());
@@ -259,7 +321,8 @@ void test_judge_and_sandbox() {
 
 #ifdef __linux__
     std::string reason;
-    require(neothemis::secure_sandbox_available(&reason),
+    const bool sandbox_available = neothemis::secure_sandbox_available(&reason);
+    require(sandbox_available,
             "required Linux sandbox unavailable: " + reason);
     int probe_pipe[2] = {-1, -1};
     require(pipe(probe_pipe) == 0, "failed to create closed-stdio sandbox probe pipe");
@@ -541,8 +604,7 @@ void test_custom_checker_partial_points() {
                "#include \"testlib.h\"\n"
                "int main(int argc,char** argv){registerTestlibCmd(argc,argv);"
                "int percentage=ouf.readInt();quitp(percentage,\"percentage score\");}\n");
-    fs::copy_file(fs::path(NEOTHEMIS_TEST_SOURCE_DIR) / "examples" / "testlib.h",
-                  percent_problem / "testlib.h");
+    write_testlib_protocol_fixture(percent_problem / "testlib.h");
     for (const auto& [test, percentage] :
          std::vector<std::pair<std::string, int>>{{"zero", 0}, {"over", 150}}) {
         write_file(percent_problem / test / "PERCENT.inp",
@@ -556,10 +618,21 @@ void test_custom_checker_partial_points() {
                "memory_limit_mb=256\n"
                "default_points=8\n"
                "checker=testlib\n");
-    fs::copy_file(fs::path(NEOTHEMIS_TEST_SOURCE_DIR) / "examples" / "checker.cpp",
-                  example_problem / "checker.cpp");
-    fs::copy_file(fs::path(NEOTHEMIS_TEST_SOURCE_DIR) / "examples" / "testlib.h",
-                  example_problem / "testlib.h");
+    write_file(example_problem / "checker.cpp",
+               "#include \"testlib.h\"\n"
+               "int main(int argc,char** argv){registerTestlibCmd(argc,argv);"
+               "long long a=ouf.readLong(-1000000000000000000LL,"
+               "1000000000000000000LL,\"a\");"
+               "long long b=ouf.readLong(-1000000000000000000LL,"
+               "1000000000000000000LL,\"b\");"
+               "long long expected_a=ans.readLong(-1000000000000000000LL,"
+               "1000000000000000000LL,\"expected a\");"
+               "long long expected_b=ans.readLong(-1000000000000000000LL,"
+               "1000000000000000000LL,\"expected b\");"
+               "if(a!=expected_a)quitf(_wa,\"wrong first value\");"
+               "if(b!=expected_b)quitp(50,\"partial second value\");"
+               "quitf(_ok,\"correct\");}\n");
+    write_testlib_protocol_fixture(example_problem / "testlib.h");
     write_file(example_problem / "half" / "EXAMPLE.inp", "\n");
     write_file(example_problem / "half" / "EXAMPLE.out", "1 2\n");
 

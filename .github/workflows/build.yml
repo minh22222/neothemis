@@ -27,6 +27,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes bubblewrap libseccomp-dev libqt6sql6-sqlite ninja-build pkg-config qt6-base-dev util-linux zlib1g-dev
 
+      - name: Enable user namespaces for sandbox tests
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns > /dev/null
+          fi
+
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 
