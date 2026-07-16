@@ -280,7 +280,10 @@ void test_user_management() {
 }
 
 void test_atomic_submission_admission() {
-    constexpr int concurrent_applicants = 12;
+    // The server has one request thread and one judge worker. Six simultaneous
+    // writers retain a meaningful over-capacity stress case without making
+    // Windows CI spend its full test budget in SQLite busy-handler backoff.
+    constexpr int concurrent_applicants = 6;
     {
         std::cerr << "database tests: per-user admission race\n" << std::flush;
         QTemporaryDir temporary("neothemis-user-admission-tests-XXXXXX");

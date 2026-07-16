@@ -132,7 +132,7 @@ std::string compact_problem_config() {
 }
 
 void write_template(const fs::path& path, const std::string& contents, const std::string& action) {
-    std::ofstream output(path);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) {
         throw std::runtime_error("failed to " + action + ": " + path.string());
     }
@@ -168,7 +168,7 @@ ConfigValues read_config_values(const fs::path& path) {
 }
 
 void write_config_entries(const fs::path& path, const ConfigEntries& entries) {
-    std::ofstream output(path);
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) {
         throw std::runtime_error("failed to write settings file: " + path.string());
     }
