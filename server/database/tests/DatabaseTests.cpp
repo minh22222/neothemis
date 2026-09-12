@@ -1,6 +1,8 @@
 #include "neothemis/server/Database.hpp"
 
 #include <QCoreApplication>
+#include <QSqlDatabase>
+#include <QSqlQuery>
 #include <QTemporaryDir>
 
 #include <algorithm>
@@ -176,12 +178,24 @@ void test_user_management() {
     require(interrupted.has_value() && interrupted->id == interrupted_admission.submission_id,
             "interrupted-running fixture was not claimed");
     database.recover_running_submission(interrupted->id);
+    database.recover_running_submission(interrupted->id);
+    const auto recovered_rows = database.submissions_for_user(contestant->id, false);
+    const auto& recovered_submission = find_submission(recovered_rows, interrupted->id);
+    require(recovered_submission.status == "queued" &&
+                recovered_submission.source_path == "/tmp/interrupted.cpp" &&
+                recovered_submission.verdict.isEmpty(),
+            "shutdown recovery lost the source snapshot or assigned a failure verdict");
     const auto retry_claim = database.take_next_queued();
     require(retry_claim.has_value() && retry_claim->id == interrupted->id,
             "targeted worker recovery did not requeue its running submission");
+    require(!database.take_next_queued().has_value(),
+            "repeated shutdown recovery produced duplicate queue work");
     const auto ignored_running = database.ignore_submission(retry_claim->id);
     require(ignored_running.has_value() && ignored_running->status == "running",
             "running ignore fixture was unexpectedly terminalized before recovery");
+    database.recover_running_submission(retry_claim->id);
+    require(!database.take_next_queued().has_value(),
+            "targeted shutdown recovery requeued an ignored submission");
     database.recover_interrupted_submissions();
     const auto after_recovery = database.submissions_for_user(contestant->id, false);
     const auto& recovered_ignored = find_submission(after_recovery, interrupted->id);
@@ -277,6 +291,55 @@ void test_user_management() {
                  backup_result == server::RemoveUserResult::Removed),
             "concurrent removal did not preserve exactly one administrator");
     require(database.has_admin(), "concurrent removal deleted every administrator");
+}
+
+void test_secure_password_storage() {
+    QTemporaryDir temporary("neothemis-secure-password-tests-XXXXXX");
+    require(temporary.isValid(), "failed to create secure password directory");
+    const std::filesystem::path path =
+        std::filesystem::path(temporary.path().toStdString()) / "server.db";
+
+    {
+        server::Database legacy_database(path);
+        legacy_database.migrate_schema();
+        legacy_database.create_user("legacy", "legacy-password", "admin");
+    }
+
+    server::Database secure_database(path, true);
+    secure_database.migrate_schema();
+    require(secure_database.authenticate("legacy", "legacy-password").has_value(),
+            "secure storage migration broke an existing password");
+    require(!secure_database.authenticate("legacy", "wrong-password").has_value(),
+            "secure storage accepted an incorrect password");
+    {
+        const QString connection_name = "neothemis_secure_password_inspection";
+        QSqlDatabase raw = QSqlDatabase::addDatabase("QSQLITE", connection_name);
+        raw.setDatabaseName(QString::fromStdString(path.string()));
+        require(raw.open(), "could not inspect migrated password storage");
+        {
+            QSqlQuery query(raw);
+            require(query.exec("SELECT password, salt, hash FROM users WHERE username='legacy'"),
+                    "could not query migrated password storage");
+            require(query.next() && query.value(0).toString().isEmpty() &&
+                        query.value(1).toString().startsWith("pbkdf2:") &&
+                        !query.value(2).toString().isEmpty(),
+                    "migrated password was not replaced by a PBKDF2 hash");
+        }
+        raw.close();
+        QSqlDatabase::removeDatabase(connection_name);
+    }
+    const auto migrated = secure_database.list_users();
+    require(migrated.size() == 1 && migrated.front().password.isEmpty(),
+            "secure storage still exposed a migrated plaintext password");
+
+    secure_database.create_user("new-user", "new-password", "contestant");
+    const auto created = secure_database.list_users();
+    const auto found = std::find_if(created.begin(), created.end(), [](const auto& user) {
+        return user.username == "new-user";
+    });
+    require(found != created.end() && found->password.isEmpty() &&
+                secure_database.authenticate("new-user", "new-password").has_value(),
+            "secure storage did not hash a newly created password");
 }
 
 void test_atomic_submission_admission() {
@@ -582,6 +645,8 @@ int main(int argc, char** argv) {
     try {
         std::cerr << "database tests: user management\n" << std::flush;
         test_user_management();
+        std::cerr << "database tests: secure password storage\n" << std::flush;
+        test_secure_password_storage();
         std::cerr << "database tests: atomic submission admission\n" << std::flush;
         test_atomic_submission_admission();
         std::cerr << "database tests: terminal snapshot retention\n" << std::flush;

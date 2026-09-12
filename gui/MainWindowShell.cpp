@@ -717,14 +717,15 @@ void MainWindow::load_app_settings() {
         sandbox_enabled_ = !settings.value("allow_unsafe_judging", false).toBool();
     }
     temporary_dir_ =
-        settings.value("temporary_dir", QString::fromStdString(default_temporary_dir().string()))
-            .toString()
-            .toStdString();
+        path_from_qstring(settings.value("temporary_dir", qstring_from_path(default_temporary_dir()))
+                              .toString());
     if (temporary_dir_.empty()) {
         temporary_dir_ = default_temporary_dir();
     }
     server_port_ = std::clamp(settings.value("server_port", 8080).toInt(), 1024, 65535);
     server_allow_lan_ = settings.value("server_allow_lan", false).toBool();
+    server_secure_password_storage_ =
+        settings.value("server_secure_password_storage", false).toBool();
     server_join_code_ = settings.value("server_join_code").toString().trimmed();
     if (server_join_code_.isEmpty()) {
         server_join_code_ = generated_server_secret(10);
@@ -733,6 +734,8 @@ void MainWindow::load_app_settings() {
     if (server_admin_password_.isEmpty()) {
         server_admin_password_ = generated_server_secret(14);
     }
+    server_tls_certificate_ = settings.value("server_tls_certificate").toString();
+    server_tls_private_key_ = settings.value("server_tls_private_key").toString();
 }
 
 void MainWindow::save_app_settings() const {
@@ -758,11 +761,14 @@ void MainWindow::save_app_settings() const {
     settings.setValue("sandbox_enabled", sandbox_enabled_);
     settings.remove("allow_unsafe_judging");
     settings.remove("background_blur_radius");
-    settings.setValue("temporary_dir", QString::fromStdString(temporary_dir_.string()));
+    settings.setValue("temporary_dir", qstring_from_path(temporary_dir_));
     settings.setValue("server_port", server_port_);
     settings.setValue("server_allow_lan", server_allow_lan_);
+    settings.setValue("server_secure_password_storage", server_secure_password_storage_);
     settings.setValue("server_join_code", server_join_code_);
     settings.setValue("server_admin_password", server_admin_password_);
+    settings.setValue("server_tls_certificate", server_tls_certificate_);
+    settings.setValue("server_tls_private_key", server_tls_private_key_);
 }
 
 void MainWindow::build_toolbar() {

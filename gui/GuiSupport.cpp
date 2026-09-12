@@ -46,7 +46,7 @@ std::vector<std::string> test_names_for_problem(const fs::path& problem_root) {
 
 fs::path default_temporary_dir() {
     QString qt_temp = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
-    fs::path base = qt_temp.isEmpty() ? fs::temp_directory_path() : fs::path(qt_temp.toStdString());
+    fs::path base = qt_temp.isEmpty() ? fs::temp_directory_path() : path_from_qstring(qt_temp);
     return base / "neothemis";
 }
 
@@ -72,12 +72,12 @@ QPixmap load_logo_pixmap() {
     }
 
     std::vector<fs::path> candidates = {
-        fs::path(QApplication::applicationDirPath().toStdString()) / "materials" / "logo.png",
+        path_from_qstring(QApplication::applicationDirPath()) / "materials" / "logo.png",
         fs::current_path() / "materials" / "logo.png",
         fs::current_path().parent_path() / "materials" / "logo.png"};
     for (const auto& candidate : candidates) {
         if (fs::exists(candidate)) {
-            QPixmap pixmap(QString::fromStdString(candidate.string()));
+            QPixmap pixmap(qstring_from_path(candidate));
             if (!pixmap.isNull()) {
                 return pixmap;
             }
@@ -91,6 +91,14 @@ fs::path path_from_qstring(const QString& value) {
     return fs::path(value.toStdWString());
 #else
     return fs::path(value.toStdString());
+#endif
+}
+
+QString qstring_from_path(const fs::path& value) {
+#ifdef Q_OS_WIN
+    return QString::fromStdWString(value.wstring());
+#else
+    return QString::fromUtf8(value.string());
 #endif
 }
 

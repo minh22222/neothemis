@@ -93,8 +93,14 @@ void print_contest_config_reference(std::ostream& out) {
         << "      Linux enforces this at runtime with RLIMIT_STACK and disables sibling-call optimization.\n"
         << "      Windows passes a compiler/linker stack reserve flag where supported.\n"
         << "  parallel_jobs=0\n"
-        << "      Worker count for compile preparation and judging.\n"
+        << "      Default worker limit for compilation and test execution.\n"
         << "      0 prefers performance cores; manual values are capped at physical cores.\n"
+        << "  compile_jobs=0\n"
+        << "      Compilation worker limit; 0 inherits parallel_jobs.\n"
+        << "  test_jobs=0\n"
+        << "      Test execution worker limit; 0 inherits parallel_jobs.\n"
+        << "  timing_focused=false\n"
+        << "      Run timed tests serially after parallel compilation; preserves test_jobs.\n"
         << "  forbidden_pattern=<text>\n"
         << "      Repeatable case-insensitive source-code security filter; matching submissions get SV.\n";
 }
@@ -489,6 +495,16 @@ int handle_config(int argc, char** argv, const fs::path& contest_root) {
         }
         const std::string key = argv[4];
         const fs::path value = argv[5];
+        if (key == "parallel_jobs" || key == "compile_jobs" || key == "test_jobs") {
+            neothemis::parse_config_worker_count(argv[5], key);
+        } else if (key == "timing_focused") {
+            const std::string boolean = argv[5];
+            if (boolean != "true" && boolean != "false" && boolean != "1" &&
+                boolean != "0" && boolean != "yes" && boolean != "no" &&
+                boolean != "on" && boolean != "off") {
+                throw std::runtime_error("invalid boolean for " + key + ": " + boolean);
+            }
+        }
         neothemis::JudgeOptions proposed;
         proposed.contest_root = contest_root;
         if (key == "contestants_dir") {

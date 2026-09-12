@@ -2,6 +2,7 @@
 
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QtNetwork/QPasswordDigestor>
 #include <QRandomGenerator>
 #include <QSqlDatabase>
 #include <QSqlError>
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -82,11 +84,58 @@ QString legacy_password_hash(const QString& salt, const QString& password) {
     return digest.toHex();
 }
 
+QString secure_password_salt(const QString& salt) {
+    return QStringLiteral("pbkdf2:") + salt;
+}
+
+QString secure_password_hash(const QString& salt, const QString& password) {
+    const QByteArray derived = QPasswordDigestor::deriveKeyPbkdf2(
+        QCryptographicHash::Sha256, password.toUtf8(), salt.toUtf8(), 210000, 32);
+    return QString::fromLatin1(derived.toHex());
+}
+
+bool constant_time_equal(const QByteArray& left, const QByteArray& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    unsigned char difference = 0;
+    for (int i = 0; i < left.size(); ++i) {
+        difference |= static_cast<unsigned char>(left.at(i) ^ right.at(i));
+    }
+    return difference == 0;
+}
+
+void migrate_plaintext_passwords(QSqlDatabase& database) {
+    QSqlQuery select(database);
+    if (!select.exec("SELECT id, password FROM users WHERE password <> ''")) {
+        throw std::runtime_error(select.lastError().text().toStdString());
+    }
+    std::vector<std::tuple<int, QString, QString>> rows;
+    while (select.next()) {
+        const int id = select.value(0).toInt();
+        const QString password = select.value(1).toString();
+        const QString salt = secure_password_salt(random_token(16));
+        rows.emplace_back(id, salt, secure_password_hash(salt, password));
+    }
+    select.finish();
+    for (const auto& [id, salt, hash] : rows) {
+        QSqlQuery update(database);
+        update.prepare("UPDATE users SET salt=?, hash=?, password='' WHERE id=?");
+        update.addBindValue(salt);
+        update.addBindValue(hash);
+        update.addBindValue(id);
+        if (!update.exec()) {
+            throw std::runtime_error(update.lastError().text().toStdString());
+        }
+    }
+}
+
 } // namespace
 
-Database::Database(fs::path path)
+Database::Database(fs::path path, bool secure_password_storage)
     : path_(std::move(path)),
-      instance_id_(next_database_instance.fetch_add(1, std::memory_order_relaxed)) {}
+      instance_id_(next_database_instance.fetch_add(1, std::memory_order_relaxed)),
+      secure_password_storage_(secure_password_storage) {}
 
 Database::~Database() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -169,6 +218,25 @@ void Database::migrate_schema() {
                    "ON test_results(submission_id)");
     ensure_column(database, "test_results", "exit_code", "INTEGER NOT NULL DEFAULT 0");
     ensure_column(database, "users", "password", "TEXT NOT NULL DEFAULT ''");
+    if (!secure_password_storage_) {
+        QSqlQuery secure_marker(database);
+        if (!secure_marker.exec(
+                "SELECT 1 FROM users WHERE salt LIKE 'pbkdf2:%' LIMIT 1")) {
+            throw std::runtime_error(secure_marker.lastError().text().toStdString());
+        }
+        secure_password_storage_ = secure_marker.next();
+    }
+    if (secure_password_storage_) {
+        exec(database, "BEGIN IMMEDIATE");
+        try {
+            migrate_plaintext_passwords(database);
+            exec(database, "COMMIT");
+        } catch (...) {
+            QSqlQuery rollback(database);
+            rollback.exec("ROLLBACK");
+            throw;
+        }
+    }
 }
 
 void Database::recover_interrupted_submissions() {
@@ -228,10 +296,14 @@ bool Database::has_admin() {
 void Database::create_user(const QString& username, const QString& password, const QString& role) {
     std::lock_guard<std::mutex> lock(mutex_);
     QSqlQuery query(connection());
+    const QString salt = secure_password_storage_ ? secure_password_salt(random_token(16)) : "";
+    const QString hash = secure_password_storage_ ? secure_password_hash(salt, password) : "";
     query.prepare("INSERT INTO users(username, salt, hash, password, role, created_at) "
-                  "VALUES(?, '', '', ?, ?, ?)");
+                  "VALUES(?, ?, ?, ?, ?, ?)");
     query.addBindValue(username);
-    query.addBindValue(password);
+    query.addBindValue(salt);
+    query.addBindValue(hash);
+    query.addBindValue(secure_password_storage_ ? QStringLiteral("") : password);
     query.addBindValue(role);
     query.addBindValue(QDateTime::currentSecsSinceEpoch());
     check(query.exec(), query);
@@ -245,7 +317,8 @@ std::vector<ManagedUser> Database::list_users() {
           query);
     std::vector<ManagedUser> users;
     while (query.next()) {
-        users.push_back(ManagedUser{query.value(0).toString(), query.value(1).toString(),
+        users.push_back(ManagedUser{query.value(0).toString(),
+                                    secure_password_storage_ ? QString() : query.value(1).toString(),
                                     query.value(2).toString(), query.value(3).toLongLong()});
     }
     return users;
@@ -257,8 +330,12 @@ bool Database::change_user_password(const QString& username, const QString& pass
     exec(database, "BEGIN IMMEDIATE");
     try {
         QSqlQuery update(database);
-        update.prepare("UPDATE users SET password=?, salt='', hash='' WHERE username=?");
-        update.addBindValue(password);
+        const QString salt = secure_password_storage_ ? secure_password_salt(random_token(16)) : "";
+        const QString hash = secure_password_storage_ ? secure_password_hash(salt, password) : "";
+        update.prepare("UPDATE users SET password=?, salt=?, hash=? WHERE username=?");
+        update.addBindValue(secure_password_storage_ ? QStringLiteral("") : password);
+        update.addBindValue(salt);
+        update.addBindValue(hash);
         update.addBindValue(username);
         check(update.exec(), update);
         if (update.numRowsAffected() != 1) {
@@ -358,10 +435,14 @@ UserSyncResult Database::sync_contestant_users(const std::set<QString>& username
             }
 
             QSqlQuery insert(database);
+            const QString salt = secure_password_storage_ ? secure_password_salt(random_token(16)) : "";
+            const QString hash = secure_password_storage_ ? secure_password_hash(salt, default_password) : "";
             insert.prepare("INSERT INTO users(username, salt, hash, password, role, created_at) "
-                           "VALUES(?, '', '', ?, 'contestant', ?)");
+                           "VALUES(?, ?, ?, ?, 'contestant', ?)");
             insert.addBindValue(username);
-            insert.addBindValue(default_password);
+            insert.addBindValue(salt);
+            insert.addBindValue(hash);
+            insert.addBindValue(secure_password_storage_ ? QStringLiteral("") : default_password);
             insert.addBindValue(QDateTime::currentSecsSinceEpoch());
             check(insert.exec(), insert);
             ++result.created;
@@ -422,10 +503,18 @@ std::optional<User> Database::authenticate(const QString& username, const QStrin
         return std::nullopt;
     }
     const QString stored_password = query.value(4).toString();
-    const bool password_matches = !stored_password.isEmpty()
-                                      ? stored_password == password
-                                      : legacy_password_hash(query.value(2).toString(), password) ==
-                                            query.value(3).toString();
+    const QString salt = query.value(2).toString();
+    const QString stored_hash = query.value(3).toString();
+    bool password_matches = false;
+    if (!stored_hash.isEmpty() && salt.startsWith("pbkdf2:")) {
+        const QString actual = secure_password_hash(salt, password);
+        password_matches = constant_time_equal(actual.toLatin1(), stored_hash.toLatin1());
+    } else if (!stored_hash.isEmpty()) {
+        password_matches = constant_time_equal(
+            legacy_password_hash(salt, password).toLatin1(), stored_hash.toLatin1());
+    } else {
+        password_matches = constant_time_equal(stored_password.toUtf8(), password.toUtf8());
+    }
     if (!password_matches) {
         return std::nullopt;
     }

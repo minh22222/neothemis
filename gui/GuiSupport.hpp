@@ -16,5 +16,6 @@ std::filesystem::path default_temporary_dir();
 QString format_points(double value);
 QPixmap load_logo_pixmap();
 std::filesystem::path path_from_qstring(const QString& value);
+QString qstring_from_path(const std::filesystem::path& value);
 
 } // namespace neothemis::gui

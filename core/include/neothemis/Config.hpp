@@ -27,6 +27,8 @@ ConfigValues read_config_values(const std::filesystem::path& path);
 void write_config_entries(const std::filesystem::path& path, const ConfigEntries& entries);
 void write_config_values(const std::filesystem::path& path, const ConfigValues& values);
 std::string format_config_number(double value);
+// Strict non-negative decimal integer; rejects signs, suffixes and overflow.
+unsigned int parse_config_worker_count(const std::string& value, const std::string& key);
 
 enum class ConfigTemplateStyle { Compact, Documented };
 
@@ -44,6 +46,10 @@ struct ContestConfig {
     std::string compile_flags = "-std=c++14 -O2 -pipe";
     std::uint64_t stack_limit_mb = 64;
     unsigned int parallel_jobs = 0;
+    // A phase-specific zero inherits parallel_jobs (which itself may be automatic).
+    unsigned int compile_jobs = 0;
+    unsigned int test_jobs = 0;
+    bool timing_focused = false;
     std::vector<std::string> forbidden_patterns;
     bool keep_workdir = false;
     bool server_ranking_enabled = false;

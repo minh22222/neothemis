@@ -1,6 +1,7 @@
 add_library(neothemis_core
     src/Config.cpp
     src/Csv.cpp
+    src/CpuScheduling.cpp
     src/JudgeCore.cpp
     src/ContestArchive.cpp
     src/Spreadsheet.cpp

@@ -112,11 +112,15 @@ struct AuthoritativeResultPair {
 
 class Database {
 public:
-    explicit Database(std::filesystem::path path);
+    explicit Database(std::filesystem::path path, bool secure_password_storage = false);
     ~Database();
 
     void migrate_schema();
     void recover_interrupted_submissions();
+
+    [[nodiscard]] bool secure_password_storage_enabled() const noexcept {
+        return secure_password_storage_;
+    }
 
     bool has_admin();
     void create_user(const QString& username, const QString& password, const QString& role);
@@ -173,6 +177,7 @@ private:
 
     std::filesystem::path path_;
     std::uint64_t instance_id_ = 0;
+    bool secure_password_storage_ = false;
     std::mutex mutex_;
 };
 

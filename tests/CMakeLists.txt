@@ -1,6 +1,11 @@
 add_executable(neothemis-core-tests
     core_tests.cpp
 )
+add_executable(neothemis-cpu-scheduling-tests cpu_scheduling_tests.cpp)
+target_include_directories(neothemis-cpu-scheduling-tests PRIVATE ${PROJECT_SOURCE_DIR}/core/src)
+target_link_libraries(neothemis-cpu-scheduling-tests PRIVATE neothemis_core)
+add_test(NAME core.cpu-scheduling COMMAND neothemis-cpu-scheduling-tests)
+set_tests_properties(core.cpu-scheduling PROPERTIES TIMEOUT 15)
 target_link_libraries(neothemis-core-tests PRIVATE neothemis_core)
 target_compile_definitions(neothemis-core-tests PRIVATE
     NEOTHEMIS_TEST_COMPILER="${CMAKE_CXX_COMPILER}"

@@ -11,11 +11,13 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
@@ -1219,11 +1221,14 @@ void test_config_and_csv_modules() {
                                "compile_flags=-O0 -g\n"
                                "stack_limit_mb=32\n"
                                "parallel_jobs=3\n"
+                               "compile_jobs=4\n"
+                               "test_jobs=2\n"
+                               "timing_focused=on\n"
                                "forbidden_pattern=first\n"
                                "forbidden_pattern=second\n");
 
     const auto entries = neothemis::read_config_entries(contest_config);
-    require(entries.size() == 14, "config parser lost entries");
+    require(entries.size() == 17, "config parser lost entries");
     require(entries.front().key == "core" && entries.front().value == "alternate",
             "config parser did not trim key/value text");
     require(entries.front().line_number == 2, "config parser reported the wrong source line");
@@ -1240,6 +1245,8 @@ void test_config_and_csv_modules() {
             "typed boolean contest settings were not loaded");
     require(loaded.stack_limit_mb == 32 && loaded.parallel_jobs == 3,
             "typed numeric contest settings were not loaded");
+    require(loaded.compile_jobs == 4 && loaded.test_jobs == 2 && loaded.timing_focused,
+            "phase-specific worker settings were not loaded");
     require(loaded.forbidden_patterns == std::vector<std::string>({"first", "second"}),
             "typed contest settings lost repeated forbidden patterns");
 
@@ -1251,6 +1258,10 @@ void test_config_and_csv_modules() {
                 rewritten.scoreboard_csv == loaded.scoreboard_csv &&
                 rewritten.forbidden_patterns == loaded.forbidden_patterns &&
                 rewritten.server_ranking_enabled == loaded.server_ranking_enabled &&
+                rewritten.parallel_jobs == loaded.parallel_jobs &&
+                rewritten.compile_jobs == loaded.compile_jobs &&
+                rewritten.test_jobs == loaded.test_jobs &&
+                rewritten.timing_focused == loaded.timing_focused &&
                 rewritten.server_contestant_details_enabled ==
                     loaded.server_contestant_details_enabled,
             "typed contest config writer lost settings");
@@ -1262,6 +1273,66 @@ void test_config_and_csv_modules() {
             "contest settings were not applied to judge options");
     require(options.execution_security == neothemis::ExecutionSecurity::ExplicitlyUnsafe,
             "persisted contest settings changed the runtime sandbox policy");
+    require(options.parallel_jobs == 3 && options.compile_jobs == 4 &&
+                options.test_jobs == 2 && options.timing_focused,
+            "phase-specific settings were not applied to judge options");
+
+    const fs::path scheduling_config = contest / "scheduling.conf";
+    write_file(scheduling_config, "parallel_jobs=3\n");
+    const auto legacy = neothemis::load_contest_config(scheduling_config);
+    require(legacy.parallel_jobs == 3 && legacy.compile_jobs == 0 && legacy.test_jobs == 0 &&
+                !legacy.timing_focused,
+            "legacy contest settings did not preserve worker-limit inheritance");
+    neothemis::apply_contest_config(legacy, options);
+    require(options.parallel_jobs == 3 && options.compile_jobs == 0 && options.test_jobs == 0 &&
+                !options.timing_focused,
+            "applying legacy settings retained stale phase-specific limits");
+    for (const auto style : {neothemis::ConfigTemplateStyle::Compact,
+                             neothemis::ConfigTemplateStyle::Documented}) {
+        neothemis::write_default_contest_config(scheduling_config, style);
+        const auto defaults = neothemis::load_contest_config(scheduling_config);
+        const auto default_values = neothemis::read_config_values(scheduling_config);
+        require(defaults.parallel_jobs == 0 && defaults.compile_jobs == 0 &&
+                    defaults.test_jobs == 0 && !defaults.timing_focused,
+                "default contest template changed scheduling defaults");
+        require(default_values.at("compile_jobs") == std::vector<std::string>({"0"}) &&
+                    default_values.at("test_jobs") == std::vector<std::string>({"0"}) &&
+                    default_values.at("timing_focused") == std::vector<std::string>({"false"}),
+                "default contest template omitted scheduling settings");
+    }
+    const auto maximum_workers = std::numeric_limits<unsigned int>::max();
+    const std::vector<std::string> invalid_worker_counts = {
+        "", "-1", "+1", "1junk", "1.5", "1e2", "0x10", "1 2",
+        std::to_string(static_cast<unsigned long long>(maximum_workers) + 1ULL),
+        "99999999999999999999999999999999999"};
+    for (const std::string key : {"parallel_jobs", "compile_jobs", "test_jobs"}) {
+        for (const auto& invalid : invalid_worker_counts) {
+            write_file(scheduling_config, key + "=" + invalid + "\n");
+            bool rejected = false;
+            try {
+                (void)neothemis::load_contest_config(scheduling_config);
+            } catch (const std::exception& ex) {
+                rejected = std::string(ex.what()).find("invalid worker count for " + key) !=
+                           std::string::npos;
+            }
+            require(rejected, key + " accepted invalid worker count: " + invalid);
+        }
+        write_file(scheduling_config, key + "=" + std::to_string(maximum_workers) + "\n");
+        const auto maximum = neothemis::load_contest_config(scheduling_config);
+        require((key == "parallel_jobs" ? maximum.parallel_jobs
+                 : key == "compile_jobs" ? maximum.compile_jobs : maximum.test_jobs) ==
+                    maximum_workers,
+                key + " rejected or truncated the maximum unsigned worker count");
+    }
+    write_file(scheduling_config, "timing_focused=sometimes\n");
+    bool invalid_timing_mode_rejected = false;
+    try {
+        (void)neothemis::load_contest_config(scheduling_config);
+    } catch (const std::exception& ex) {
+        invalid_timing_mode_rejected =
+            std::string(ex.what()).find("invalid boolean for timing_focused") != std::string::npos;
+    }
+    require(invalid_timing_mode_rejected, "timing-focused mode accepted an invalid boolean");
 
     neothemis::JudgeOptions safe_paths;
     safe_paths.contest_root = contest;
@@ -1484,6 +1555,33 @@ void test_config_and_csv_modules() {
     require(derived_scoreboard.str().find("Alice,2,2\n") != std::string::npos &&
                 derived_scoreboard.str().find("Bob,0,0\n") != std::string::npos,
             "scoreboard was not derived from detailed CSV rows");
+
+    const std::vector<std::pair<std::string, std::string>> invalid_problem_configs = {
+        {"time_limit_ms", "1000junk"},
+        {"memory_limit_mb", "-1"},
+        {"default_points", "nan"},
+        {"test_points.1", "inf"},
+    };
+    for (const auto& [key, value] : invalid_problem_configs) {
+        const fs::path invalid = temporary.path() / ("invalid-" + key + ".conf");
+        write_file(invalid, key + "=" + value + "\n");
+        bool rejected = false;
+        try {
+            (void)neothemis::load_problem_config(invalid);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        require(rejected, "invalid numeric problem setting was accepted: " + key);
+    }
+    const fs::path invalid_contest = temporary.path() / "invalid-stack.conf";
+    write_file(invalid_contest, "stack_limit_mb=64junk\n");
+    bool contest_rejected = false;
+    try {
+        (void)neothemis::load_contest_config(invalid_contest);
+    } catch (const std::exception&) {
+        contest_rejected = true;
+    }
+    require(contest_rejected, "invalid numeric contest setting was accepted");
 }
 
 void test_spreadsheet_xlsx() {

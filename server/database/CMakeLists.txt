@@ -1,4 +1,4 @@
-find_package(Qt6 COMPONENTS Core Sql QUIET)
+find_package(Qt6 COMPONENTS Core Sql Network QUIET)
 if (NOT Qt6_FOUND)
     message(STATUS "Qt6 Core/Sql not found; shared server database target disabled")
     return()
@@ -8,7 +8,7 @@ add_library(neothemis_server_database STATIC
     src/Database.cpp
 )
 target_include_directories(neothemis_server_database PUBLIC include)
-target_link_libraries(neothemis_server_database PUBLIC Qt6::Core Qt6::Sql)
+target_link_libraries(neothemis_server_database PUBLIC Qt6::Core Qt6::Sql Qt6::Network)
 
 if (BUILD_TESTING)
     add_executable(neothemis-server-database-tests

@@ -2,6 +2,7 @@
 #include "neothemis/Config.hpp"
 #include "neothemis/Csv.hpp"
 #include "Sandbox.hpp"
+#include "CpuLease.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -419,51 +420,6 @@ private:
 };
 
 #if defined(__linux__)
-void restrict_child_to_one_cpu() {
-    cpu_set_t available;
-    CPU_ZERO(&available);
-    if (sched_getaffinity(0, sizeof(available), &available) != 0) {
-        _exit(124);
-    }
-
-    int available_count = 0;
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (CPU_ISSET(cpu, &available)) {
-            ++available_count;
-        }
-    }
-    if (available_count == 0) {
-        _exit(124);
-    }
-    int selected_index = static_cast<int>(getpid() % available_count);
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (!CPU_ISSET(cpu, &available)) {
-            continue;
-        }
-        if (selected_index-- != 0) {
-            continue;
-        }
-        cpu_set_t selected;
-        CPU_ZERO(&selected);
-        CPU_SET(cpu, &selected);
-        if (sched_setaffinity(0, sizeof(selected), &selected) != 0) {
-            _exit(124);
-        }
-        return;
-    }
-    _exit(124);
-}
-#endif
-
-#if defined(__linux__)
-unsigned int linux_allowed_cpu_count() {
-    cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-        return 0;
-    }
-    return static_cast<unsigned int>(CPU_COUNT(&allowed));
-}
 
 struct LinuxProcessTreeSample {
     std::uint64_t cpu_time_ms = 0;
@@ -819,178 +775,10 @@ LinuxProcessTreeSample sample_linux_process_tree(pid_t root_pid,
     }
     return sample;
 }
-
-unsigned int linux_performance_core_count() {
-    const fs::path cpu_root = "/sys/devices/system/cpu";
-    std::map<std::pair<std::string, std::string>, std::uint64_t> core_frequencies;
-    std::error_code directory_error;
-    fs::directory_iterator entries(cpu_root, directory_error);
-    if (directory_error) {
-        return 0;
-    }
-
-    for (const auto& entry : entries) {
-        const std::string name = entry.path().filename().string();
-        if (name.size() <= 3 || name.rfind("cpu", 0) != 0 ||
-            !std::all_of(name.begin() + 3, name.end(), [](unsigned char ch) {
-                return std::isdigit(ch) != 0;
-            })) {
-            continue;
-        }
-
-        auto read_value = [&](const fs::path& path, std::string& value) {
-            std::ifstream input(path);
-            return static_cast<bool>(input >> value);
-        };
-        std::string package_id;
-        std::string core_id;
-        std::string maximum_frequency;
-        if (!read_value(entry.path() / "topology" / "physical_package_id", package_id) ||
-            !read_value(entry.path() / "topology" / "core_id", core_id) ||
-            !read_value(entry.path() / "cpufreq" / "cpuinfo_max_freq", maximum_frequency)) {
-            continue;
-        }
-        try {
-            const std::uint64_t frequency = std::stoull(maximum_frequency);
-            auto& stored = core_frequencies[{package_id, core_id}];
-            stored = std::max(stored, frequency);
-        } catch (const std::exception&) {
-        }
-    }
-
-    if (core_frequencies.empty()) {
-        return 0;
-    }
-    std::uint64_t maximum_frequency = 0;
-    for (const auto& [core, frequency] : core_frequencies) {
-        (void)core;
-        maximum_frequency = std::max(maximum_frequency, frequency);
-    }
-    const std::uint64_t performance_threshold = maximum_frequency * 9 / 10;
-    unsigned int performance_cores = 0;
-    for (const auto& [core, frequency] : core_frequencies) {
-        (void)core;
-        if (frequency >= performance_threshold) {
-            ++performance_cores;
-        }
-    }
-    return performance_cores;
-}
-
-unsigned int linux_physical_core_count() {
-    std::ifstream cpuinfo("/proc/cpuinfo");
-    if (!cpuinfo) {
-        return 0;
-    }
-
-    std::set<std::pair<std::string, std::string>> cores;
-    std::string physical_id;
-    std::string core_id;
-
-    auto flush_cpu = [&]() {
-        if (!physical_id.empty() && !core_id.empty()) {
-            cores.emplace(physical_id, core_id);
-        }
-        physical_id.clear();
-        core_id.clear();
-    };
-
-    std::string line;
-    while (std::getline(cpuinfo, line)) {
-        if (trim(line).empty()) {
-            flush_cpu();
-            continue;
-        }
-
-        std::size_t colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
-        }
-
-        std::string key = trim(line.substr(0, colon));
-        std::string value = trim(line.substr(colon + 1));
-        if (key == "physical id") {
-            physical_id = value;
-        } else if (key == "core id") {
-            core_id = value;
-        }
-    }
-    flush_cpu();
-
-    return static_cast<unsigned int>(cores.size());
-}
 #endif
 #endif
 
 #ifdef _WIN32
-unsigned int windows_performance_core_count() {
-    DWORD length = 0;
-    if (GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length) ||
-        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        return 0;
-    }
-
-    std::vector<unsigned char> buffer(length);
-    if (!GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
-            &length)) {
-        return 0;
-    }
-
-    std::map<BYTE, unsigned int> cores_by_efficiency_class;
-    DWORD offset = 0;
-    while (offset < length) {
-        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
-            buffer.data() + offset);
-        if (info->Relationship == RelationProcessorCore) {
-            // Older MinGW headers name the documented EfficiencyClass byte as padding.
-            const auto* relationship_bytes =
-                reinterpret_cast<const unsigned char*>(&info->Processor);
-            ++cores_by_efficiency_class[relationship_bytes[1]];
-        }
-        if (info->Size == 0) {
-            break;
-        }
-        offset += info->Size;
-    }
-    if (cores_by_efficiency_class.empty()) {
-        return 0;
-    }
-    return cores_by_efficiency_class.rbegin()->second;
-}
-
-unsigned int windows_physical_core_count() {
-    DWORD length = 0;
-    if (GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length) ||
-        GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
-        return 0;
-    }
-
-    std::vector<unsigned char> buffer(length);
-    if (!GetLogicalProcessorInformationEx(
-            RelationProcessorCore,
-            reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
-            &length)) {
-        return 0;
-    }
-
-    unsigned int cores = 0;
-    DWORD offset = 0;
-    while (offset < length) {
-        auto* info = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
-            buffer.data() + offset);
-        if (info->Relationship == RelationProcessorCore) {
-            ++cores;
-        }
-        if (info->Size == 0) {
-            break;
-        }
-        offset += info->Size;
-    }
-    return cores;
-}
-
 std::string windows_utf8_text(const wchar_t* value, std::size_t size) {
     if (!value || size == 0) {
         return {};
@@ -1492,10 +1280,24 @@ ProcessResult run_program(const std::vector<std::string>& args,
                           const std::function<bool()>& should_cancel = {},
                           const SandboxRunSpec* sandbox = nullptr,
                           bool attribute_memory_limit = false,
-                          const ProcessLaunchContext* launch_context = nullptr) {
+                          const ProcessLaunchContext* launch_context = nullptr,
+                          const detail::CpuLease* assigned_cpu = nullptr) {
     if (args.empty() || args.front().empty()) {
         throw std::runtime_error("empty program command");
     }
+
+    // Worker leases cover an entire phase, keeping each worker on a stable,
+    // distinct physical core. Standalone launches (checker compilation and the
+    // sandbox probe) participate in the same reservations too. Waiting for a
+    // lease occurs before either CPU or wall-clock execution accounting starts.
+    std::unique_ptr<detail::CpuLease> standalone_cpu;
+    if (!assigned_cpu) {
+        const auto topology = detail::detect_cpu_topology();
+        standalone_cpu = std::make_unique<detail::CpuLease>(
+            topology, detail::resolve_worker_count(0, topology), should_cancel);
+        assigned_cpu = standalone_cpu.get();
+    }
+    const detail::CpuSlot* cpu = assigned_cpu->cpu();
 
     // Required isolation must retain a finite host-safety ceiling even when a
     // contest requests an unlimited or absurd resource value. Explicitly
@@ -1640,12 +1442,11 @@ ProcessResult run_program(const std::vector<std::string>& args,
         }
         close_child_file_descriptors_except(child_keep_fds);
 #if defined(__linux__)
-        if (sandbox) {
-            // Affinity is inherited by compiler children and target threads.
-            // Different invocations select different allowed CPUs, preserving
-            // judge parallelism without letting one invocation fan out across
-            // the whole host.
-            restrict_child_to_one_cpu();
+        // Topology can change while a judge is running (for example when a
+        // container's cpuset is updated). Affinity is an optimization, so a
+        // stale slot must not turn a valid submission into a runtime error.
+        if (cpu) {
+            (void)detail::apply_current_thread_cpu(*cpu);
         }
 #endif
         apply_child_limits(memory_limit_mb, stack_limit_mb, file_limit_mb);
@@ -1994,6 +1795,12 @@ ProcessResult run_program(const std::vector<std::string>& args,
                                  windows_error_message(GetLastError()));
     }
     child_guard.assigned_to_job();
+
+    if (cpu) {
+        // As on Linux, keep the launch usable if a policy or processor-group
+        // change makes this optional affinity assignment unavailable.
+        (void)detail::apply_child_cpu(job.get(), process.get(), primary_thread.get(), *cpu);
+    }
 
     const auto begin = std::chrono::steady_clock::now();
     if (ResumeThread(primary_thread.get()) == static_cast<DWORD>(-1)) {
@@ -3047,7 +2854,8 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
                                       const CompilerContext& compiler_context,
                                       const fs::path& work_root,
                                       const ContestantContext& contestant,
-                                      const ProblemContext& problem) {
+                                      const ProblemContext& problem,
+                                      const detail::CpuLease& cpu) {
     PreparedSubmission prepared;
     prepared.contestant = contestant.name;
     prepared.problem = &problem;
@@ -3131,7 +2939,7 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
                                         &compile_log,
                                         30000, 1024, 256, 64,
                                         options.should_cancel, sandbox, false,
-                                        &compiler_context.launch);
+                                        &compiler_context.launch, &cpu);
     if (compile.sandbox_setup_failed) {
         prepared.immediate_results =
             rows_for_problem_tests(prepared.contestant, problem, Verdict::InternalError,
@@ -3159,7 +2967,8 @@ PreparedSubmission prepare_submission(const JudgeOptions& options,
 }
 
 TestResult judge_test_job(const TestJob& job, const JudgeOptions& options,
-                          const CompilerContext& compiler_context) {
+                          const CompilerContext& compiler_context,
+                          const detail::CpuLease& cpu) {
     const ProblemContext& problem = *job.problem;
     const ProblemContext::TestCase& test = *job.test;
     const std::string& test_name = test.name;
@@ -3236,7 +3045,7 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options,
                                     problem.settings.memory_limit_mb,
                                     options.stack_limit_mb, 64,
                                     options.should_cancel, submission_sandbox_ptr, true,
-                                    &compiler_context.launch);
+                                    &compiler_context.launch, &cpu);
     row.time_ms = run.cpu_time_ms;
     row.exit_code = run.exit_code;
     if (run.sandbox_setup_failed) {
@@ -3302,7 +3111,7 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options,
                 checker_arguments, &run_dir, &checker_stdout, &checker_stderr,
                 problem.settings.time_limit_ms, problem.settings.memory_limit_mb,
                 options.stack_limit_mb, 16, options.should_cancel, checker_sandbox_ptr, true,
-                &compiler_context.launch);
+                &compiler_context.launch, &cpu);
             row.exit_code = checker.exit_code;
             row.message = first_existing_file_text({checker_stdout, checker_stderr});
             if (checker.sandbox_setup_failed) {
@@ -3356,49 +3165,6 @@ TestResult judge_test_job(const TestJob& job, const JudgeOptions& options,
     return row;
 }
 
-unsigned int configured_worker_count(const JudgeOptions& options) {
-    unsigned int physical_cores = 0;
-    unsigned int performance_cores = 0;
-#ifdef _WIN32
-    physical_cores = windows_physical_core_count();
-    performance_cores = windows_performance_core_count();
-#elif defined(__linux__)
-    physical_cores = linux_physical_core_count();
-    performance_cores = linux_performance_core_count();
-#endif
-
-    unsigned int worker_count = options.parallel_jobs;
-    if (worker_count == 0) {
-        worker_count = performance_cores;
-        if (worker_count == 0) {
-            worker_count = physical_cores;
-        }
-        if (worker_count == 0) {
-            worker_count = std::thread::hardware_concurrency();
-            if (worker_count > 1) {
-                worker_count = (worker_count + 1) / 2;
-            }
-        }
-        if (worker_count == 0) {
-            worker_count = 1;
-        }
-    } else {
-        unsigned int cap = physical_cores;
-        if (cap == 0) {
-            cap = std::thread::hardware_concurrency();
-        }
-        if (cap > 0) {
-            worker_count = std::min(worker_count, cap);
-        }
-    }
-#if defined(__linux__)
-    const unsigned int allowed_cpus = linux_allowed_cpu_count();
-    if (allowed_cpus > 0) {
-        worker_count = std::min(worker_count, allowed_cpus);
-    }
-#endif
-    return std::max(1U, worker_count);
-}
 
 fs::path work_root_for_contest(const JudgeOptions& options) {
     static std::atomic<std::uint64_t> invocation_sequence{0};
@@ -3448,6 +3214,14 @@ public:
         fs::path tests_root = options.contest_root / options.tests_dir;
         fs::path work_root = work_root_for_contest(options);
         const CompilerContext compiler_context = make_compiler_context(options);
+        const auto cpu_topology = detail::detect_cpu_topology();
+        const unsigned int compile_worker_limit = detail::resolve_worker_count(
+            options.compile_jobs == 0 ? options.parallel_jobs : options.compile_jobs,
+            cpu_topology);
+        const unsigned int test_worker_limit = options.timing_focused ? 1U
+            : detail::resolve_worker_count(
+                options.test_jobs == 0 ? options.parallel_jobs : options.test_jobs,
+                cpu_topology);
 
         if (options.execution_security == ExecutionSecurity::Required) {
             std::string reason;
@@ -3542,8 +3316,6 @@ public:
             expected_result_count = contestants.size() * tests_per_contestant;
             results.reserve(expected_result_count);
         }
-        unsigned int base_worker_count = configured_worker_count(options);
-
         std::mutex results_mutex;
         std::mutex prepare_progress_mutex;
         std::mutex progress_mutex;
@@ -3568,7 +3340,7 @@ public:
                       });
 
             unsigned int worker_count =
-                std::min<unsigned int>(base_worker_count,
+                std::min<unsigned int>(test_worker_limit,
                                        static_cast<unsigned int>(test_jobs.size()));
             {
                 std::lock_guard<std::mutex> lock(progress_mutex);
@@ -3584,10 +3356,36 @@ public:
             std::atomic<bool> stop_workers{false};
             std::atomic<bool> cancellation_observed{false};
             std::atomic<bool> progress_done{false};
+            std::atomic<bool> progress_callback_failed{false};
             std::mutex progress_wait_mutex;
             std::condition_variable progress_wakeup;
+            JudgeOptions worker_options = options;
+            worker_options.should_cancel = [&] {
+                return stop_workers.load(std::memory_order_relaxed) ||
+                       (options.should_cancel && options.should_cancel());
+            };
+            auto emit_progress = [&](const char* phase) {
+                if (progress_callback_failed.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                try {
+                    std::lock_guard<std::mutex> lock(progress_mutex);
+                    emit_progress_summary(options, progress_state, phase);
+                } catch (...) {
+                    progress_callback_failed.store(true, std::memory_order_relaxed);
+                    stop_workers.store(true, std::memory_order_relaxed);
+                    std::lock_guard<std::mutex> lock(worker_error_mutex);
+                    if (!worker_error) {
+                        worker_error = std::current_exception();
+                    }
+                }
+            };
             auto worker = [&](unsigned int worker_id) {
                 try {
+                    const detail::CpuLease cpu(cpu_topology, test_worker_limit, [&] {
+                        return stop_workers.load() ||
+                               (options.should_cancel && options.should_cancel());
+                    }, options.timing_focused);
                     while (true) {
                         const bool cancel_now =
                             options.should_cancel && options.should_cancel();
@@ -3616,7 +3414,7 @@ public:
                         }
 
                         TestResult job_result =
-                            judge_test_job(job, options, compiler_context);
+                            judge_test_job(job, worker_options, compiler_context, cpu);
                         publish_result(job_result);
                         results[result_offset + job_index] = std::move(job_result);
                         {
@@ -3637,9 +3435,9 @@ public:
             if (options.progress && worker_count > 0) {
                 progress_monitor = std::thread([&]() {
                     while (true) {
-                        {
-                            std::lock_guard<std::mutex> lock(progress_mutex);
-                            emit_progress_summary(options, progress_state, "judge");
+                        emit_progress("judge");
+                        if (progress_callback_failed.load(std::memory_order_relaxed)) {
+                            break;
                         }
                         std::unique_lock<std::mutex> wait_lock(progress_wait_mutex);
                         if (progress_wakeup.wait_for(
@@ -3648,16 +3446,28 @@ public:
                             break;
                         }
                     }
-                    {
-                        std::lock_guard<std::mutex> lock(progress_mutex);
-                        emit_progress_summary(options, progress_state, "judge");
-                    }
+                    emit_progress("judge");
                 });
             }
 
             std::vector<std::thread> workers;
-            for (unsigned int i = 0; i < worker_count; ++i) {
-                workers.emplace_back(worker, i + 1);
+            try {
+                for (unsigned int i = 0; i < worker_count; ++i) {
+                    workers.emplace_back(worker, i + 1);
+                }
+            } catch (...) {
+                stop_workers.store(true, std::memory_order_relaxed);
+                progress_done.store(true, std::memory_order_relaxed);
+                progress_wakeup.notify_all();
+                for (auto& thread : workers) {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+                if (progress_monitor.joinable()) {
+                    progress_monitor.join();
+                }
+                throw;
             }
             for (auto& thread : workers) {
                 thread.join();
@@ -3690,7 +3500,7 @@ public:
         }
         if (!prep_tasks.empty()) {
             unsigned int prepare_worker_count =
-                std::min<unsigned int>(base_worker_count,
+                std::min<unsigned int>(compile_worker_limit,
                                        static_cast<unsigned int>(prep_tasks.size()));
             {
                 std::lock_guard<std::mutex> progress_lock(prepare_progress_mutex);
@@ -3702,12 +3512,22 @@ public:
             std::condition_variable prepare_progress_wakeup;
             std::atomic<bool> stop_prepare_workers{false};
             std::atomic<bool> prepare_cancellation_observed{false};
+            std::atomic<bool> prepare_progress_callback_failed{false};
             std::mutex all_jobs_mutex;
             std::mutex prepare_error_mutex;
             std::exception_ptr prepare_error;
+            JudgeOptions prepare_options = options;
+            prepare_options.should_cancel = [&] {
+                return stop_prepare_workers.load(std::memory_order_relaxed) ||
+                       (options.should_cancel && options.should_cancel());
+            };
 
             auto prepare_worker = [&](unsigned int worker_id) {
                 try {
+                    const detail::CpuLease cpu(cpu_topology, compile_worker_limit, [&] {
+                        return stop_prepare_workers.load() ||
+                               (options.should_cancel && options.should_cancel());
+                    });
                     while (true) {
                         const bool cancel_now =
                             options.should_cancel && options.should_cancel();
@@ -3736,8 +3556,8 @@ public:
                         }
 
                         PreparedSubmission prepared =
-                            prepare_submission(options, compiler_context, work_root,
-                                               *task.contestant, *task.problem);
+                            prepare_submission(prepare_options, compiler_context, work_root,
+                                               *task.contestant, *task.problem, cpu);
                         for (const auto& result : prepared.immediate_results) {
                             publish_result(result);
                         }
@@ -3770,10 +3590,27 @@ public:
             std::thread prepare_progress_monitor;
             if (options.progress && prepare_worker_count > 0) {
                 prepare_progress_monitor = std::thread([&]() {
-                    while (true) {
-                        {
+                    auto emit_prepare_progress = [&]() {
+                        if (prepare_progress_callback_failed.load(std::memory_order_relaxed)) {
+                            return;
+                        }
+                        try {
                             std::lock_guard<std::mutex> lock(prepare_progress_mutex);
                             emit_progress_summary(options, prepare_state, "prepare");
+                        } catch (...) {
+                            prepare_progress_callback_failed.store(true,
+                                                                  std::memory_order_relaxed);
+                            stop_prepare_workers.store(true, std::memory_order_relaxed);
+                            std::lock_guard<std::mutex> lock(prepare_error_mutex);
+                            if (!prepare_error) {
+                                prepare_error = std::current_exception();
+                            }
+                        }
+                    };
+                    while (true) {
+                        emit_prepare_progress();
+                        if (prepare_progress_callback_failed.load(std::memory_order_relaxed)) {
+                            break;
                         }
                         std::unique_lock<std::mutex> wait_lock(
                             prepare_progress_wait_mutex);
@@ -3783,16 +3620,28 @@ public:
                             break;
                         }
                     }
-                    {
-                        std::lock_guard<std::mutex> lock(prepare_progress_mutex);
-                        emit_progress_summary(options, prepare_state, "prepare");
-                    }
+                    emit_prepare_progress();
                 });
             }
 
             std::vector<std::thread> prepare_workers;
-            for (unsigned int i = 0; i < prepare_worker_count; ++i) {
-                prepare_workers.emplace_back(prepare_worker, i + 1);
+            try {
+                for (unsigned int i = 0; i < prepare_worker_count; ++i) {
+                    prepare_workers.emplace_back(prepare_worker, i + 1);
+                }
+            } catch (...) {
+                stop_prepare_workers.store(true, std::memory_order_relaxed);
+                prepare_progress_done.store(true, std::memory_order_relaxed);
+                prepare_progress_wakeup.notify_all();
+                for (auto& thread : prepare_workers) {
+                    if (thread.joinable()) {
+                        thread.join();
+                    }
+                }
+                if (prepare_progress_monitor.joinable()) {
+                    prepare_progress_monitor.join();
+                }
+                throw;
             }
             for (auto& thread : prepare_workers) {
                 thread.join();

@@ -356,7 +356,7 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
   temp_layout->setContentsMargins(0, 0, 0, 0);
   temp_layout->setSpacing(10);
   auto *temp_dir = new QLineEdit(
-      QString::fromStdString(temporary_dir_.string()), temp_widget);
+      qstring_from_path(temporary_dir_), temp_widget);
   auto *browse_temp = new QPushButton(text("browse"), temp_widget);
   temp_layout->addWidget(temp_dir, 1);
   temp_layout->addWidget(browse_temp);
@@ -623,7 +623,7 @@ QWidget *MainWindow::build_visual_tab(QWidget *parent,
       animations_enabled_ = animations->isChecked();
       language_ = language->currentData().toString().toStdString();
       sandbox_enabled_ = sandbox_enabled->isChecked();
-      temporary_dir_ = temp_dir->text().toStdString();
+      temporary_dir_ = path_from_qstring(temp_dir->text());
       if (temporary_dir_.empty()) {
         temporary_dir_ = default_temporary_dir();
       }

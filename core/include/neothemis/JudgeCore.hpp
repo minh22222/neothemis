@@ -43,6 +43,10 @@ struct JudgeOptions {
     std::string compile_flags = "-std=c++14 -O2 -pipe";
     std::uint64_t stack_limit_mb = 64;
     unsigned int parallel_jobs = 0;
+    // Zero inherits parallel_jobs. Timing-focused runs always execute tests serially.
+    unsigned int compile_jobs = 0;
+    unsigned int test_jobs = 0;
+    bool timing_focused = false;
     std::vector<std::string> selected_problems;
     std::vector<std::string> selected_contestants;
     std::vector<std::string> forbidden_patterns;

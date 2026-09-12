@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -64,6 +65,32 @@ bool parse_bool(const std::string& value, const std::string& key) {
     throw std::runtime_error("invalid boolean for " + key + ": " + value);
 }
 
+std::uint64_t parse_config_uint64(const std::string& value, const std::string& key) {
+    if (value.empty() || value.front() == '+' || value.front() == '-') {
+        throw std::runtime_error("invalid non-negative integer for " + key + ": " + value);
+    }
+    std::uint64_t parsed = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed, 10);
+    if (result.ec != std::errc{} || result.ptr != value.data() + value.size()) {
+        throw std::runtime_error("invalid non-negative integer for " + key + ": " + value);
+    }
+    return parsed;
+}
+
+double parse_config_points(const std::string& value, const std::string& key) {
+    std::size_t consumed = 0;
+    double parsed = 0.0;
+    try {
+        parsed = std::stod(value, &consumed);
+    } catch (const std::exception&) {
+        throw std::runtime_error("invalid non-negative number for " + key + ": " + value);
+    }
+    if (consumed != value.size() || !std::isfinite(parsed) || parsed < 0.0) {
+        throw std::runtime_error("invalid non-negative number for " + key + ": " + value);
+    }
+    return parsed;
+}
+
 std::string documented_contest_config() {
     std::ostringstream output;
     output << "# NeoThemis contest settings\n"
@@ -80,6 +107,11 @@ std::string documented_contest_config() {
            << "stack_limit_mb=64\n"
            << "# 0 prefers performance cores. Manual values above physical cores are capped.\n"
            << "parallel_jobs=0\n"
+           << "# Phase limits: 0 inherits parallel_jobs. Tests run after compilation finishes.\n"
+           << "compile_jobs=0\n"
+           << "test_jobs=0\n"
+           << "# Keep parallel compilation but execute timed tests one at a time.\n"
+           << "timing_focused=false\n"
            << "\n"
            << "# Submissions containing these text patterns are rejected with SV.\n";
     for (const auto& pattern : default_forbidden_patterns()) {
@@ -101,7 +133,10 @@ std::string compact_contest_config() {
            << "compiler=g++\n"
            << "compile_flags=-std=c++14 -O2 -pipe\n"
            << "stack_limit_mb=64\n"
-           << "parallel_jobs=0\n";
+           << "parallel_jobs=0\n"
+           << "compile_jobs=0\n"
+           << "test_jobs=0\n"
+           << "timing_focused=false\n";
     for (const auto& pattern : default_forbidden_patterns()) {
         output << "forbidden_pattern=" << pattern << '\n';
     }
@@ -141,7 +176,21 @@ void write_template(const fs::path& path, const std::string& contents, const std
 
 } // namespace
 
+unsigned int parse_config_worker_count(const std::string& value, const std::string& key) {
+    unsigned int count = 0;
+    const auto result = std::from_chars(value.data(), value.data() + value.size(), count);
+    if (value.empty() || result.ec != std::errc{} ||
+        result.ptr != value.data() + value.size()) {
+        throw std::runtime_error("invalid worker count for " + key + ": " + value +
+                                 " (expected a non-negative decimal integer)");
+    }
+    return count;
+}
+
 std::string format_config_number(double value) {
+    if (!std::isfinite(value) || value < 0.0) {
+        throw std::runtime_error("cannot format a negative or non-finite configuration number");
+    }
     char buffer[64];
     const auto result = std::to_chars(buffer, buffer + sizeof(buffer), value,
                                       std::chars_format::general);
@@ -227,9 +276,15 @@ ContestConfig load_contest_config(const fs::path& path, UnknownConfigKeyPolicy u
             // checkers now keep testlib.h in their problem folder.
             config.preserved_entries.push_back(entry);
         } else if (key == "stack_limit_mb") {
-            config.stack_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
+            config.stack_limit_mb = parse_config_uint64(value, key);
         } else if (key == "parallel_jobs") {
-            config.parallel_jobs = static_cast<unsigned int>(std::stoul(value));
+            config.parallel_jobs = parse_config_worker_count(value, key);
+        } else if (key == "compile_jobs") {
+            config.compile_jobs = parse_config_worker_count(value, key);
+        } else if (key == "test_jobs") {
+            config.test_jobs = parse_config_worker_count(value, key);
+        } else if (key == "timing_focused") {
+            config.timing_focused = parse_bool(value, key);
         } else if (key == "forbidden_pattern") {
             config.forbidden_patterns.push_back(value);
         } else if (unknown_keys == UnknownConfigKeyPolicy::Reject) {
@@ -265,6 +320,9 @@ void write_contest_config(const fs::path& path, const ContestConfig& config) {
         {"compile_flags", config.compile_flags, 0},
         {"stack_limit_mb", std::to_string(config.stack_limit_mb), 0},
         {"parallel_jobs", std::to_string(config.parallel_jobs), 0},
+        {"compile_jobs", std::to_string(config.compile_jobs), 0},
+        {"test_jobs", std::to_string(config.test_jobs), 0},
+        {"timing_focused", config.timing_focused ? "true" : "false", 0},
     };
     for (const auto& pattern : config.forbidden_patterns) {
         entries.push_back({"forbidden_pattern", pattern, 0});
@@ -283,6 +341,9 @@ void apply_contest_config(const ContestConfig& config, JudgeOptions& options) {
     options.compile_flags = config.compile_flags;
     options.stack_limit_mb = config.stack_limit_mb;
     options.parallel_jobs = config.parallel_jobs;
+    options.compile_jobs = config.compile_jobs;
+    options.test_jobs = config.test_jobs;
+    options.timing_focused = config.timing_focused;
     options.forbidden_patterns = config.forbidden_patterns;
     options.keep_workdir = config.keep_workdir;
 }
@@ -300,14 +361,14 @@ ProblemConfig load_problem_config(const fs::path& path, UnknownConfigKeyPolicy u
         const std::string& key = entry.key;
         const std::string& value = entry.value;
         if (key == "time_limit_ms") {
-            config.time_limit_ms = static_cast<std::uint64_t>(std::stoull(value));
+            config.time_limit_ms = parse_config_uint64(value, key);
         } else if (key == "memory_limit_mb") {
-            config.memory_limit_mb = static_cast<std::uint64_t>(std::stoull(value));
+            config.memory_limit_mb = parse_config_uint64(value, key);
         } else if (key == "stack_limit_mb") {
             // Legacy per-problem stack settings are ignored; the setting is contest-wide.
             config.preserved_entries.push_back(entry);
         } else if (key == "default_points") {
-            config.default_points = std::stod(value);
+            config.default_points = parse_config_points(value, key);
         } else if (key == "checker") {
             config.checker = value;
         } else if (key.rfind("test_points.", 0) == 0) {
@@ -316,7 +377,7 @@ ProblemConfig load_problem_config(const fs::path& path, UnknownConfigKeyPolicy u
                 throw std::runtime_error("empty test name in " + path.string());
             }
             if (!trim(value).empty()) {
-                config.test_points[test_name] = std::stod(value);
+                config.test_points[test_name] = parse_config_points(value, key);
             }
         } else if (unknown_keys == UnknownConfigKeyPolicy::Reject) {
             throw std::runtime_error("unknown problem setting in " + path.string() + ": " + key);

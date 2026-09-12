@@ -252,7 +252,8 @@ private:
     void open_start_server_dialog();
 
     void start_local_server(int port, bool allow_lan, const QString& join_code,
-                            const QString& admin_password);
+                            const QString& admin_password, const QString& tls_certificate,
+                            const QString& tls_private_key);
 
     void stop_local_server(bool log_message);
 
@@ -477,16 +478,22 @@ private:
     fs::path temporary_dir_;
     int server_port_ = 8080;
     bool server_allow_lan_ = false;
+    bool server_secure_password_storage_ = false;
     bool server_ranking_enabled_ = false;
     bool server_contestant_details_enabled_ = false;
     neothemis::ContestConfig loaded_contest_config_;
     QString server_join_code_;
     QString server_admin_password_;
+    QString server_tls_certificate_;
+    QString server_tls_private_key_;
     fs::path contest_file_path_;
     fs::path active_temp_root_;
     std::vector<fs::path> temporary_roots_;
     std::uint64_t stack_limit_mb_ = 64;
     unsigned int parallel_jobs_ = 0;
+    unsigned int compile_jobs_ = 0;
+    unsigned int test_jobs_ = 0;
+    bool timing_focused_ = false;
     bool keep_workdir_ = false;
     bool contest_from_file_ = false;
     bool contest_dirty_ = false;

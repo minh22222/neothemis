@@ -14,8 +14,13 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QRegularExpression>
+#include <QSslCertificate>
+#include <QSslConfiguration>
+#include <QSslKey>
+#include <QSslServer>
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cmath>
@@ -70,9 +75,16 @@ struct AppConfig {
     QHostAddress host = QHostAddress::LocalHost;
     quint16 port = 8080;
     bool allow_lan = false;
+    bool secure_password_storage = false;
+    fs::path tls_certificate;
+    fs::path tls_private_key;
     QString admin_user = "admin";
     QString admin_password;
     QString join_code;
+
+    [[nodiscard]] bool tls_enabled() const noexcept {
+        return !tls_certificate.empty() && !tls_private_key.empty();
+    }
 };
 
 struct RankingRow {
@@ -107,6 +119,22 @@ bool valid_username(const QString& value) {
     return pattern.match(value).hasMatch() && has_visible.match(value).hasMatch();
 }
 
+QString qstring_from_path(const fs::path& value) {
+#ifdef _WIN32
+    return QString::fromStdWString(value.wstring());
+#else
+    return QString::fromUtf8(value.string());
+#endif
+}
+
+fs::path path_from_qstring(const QString& value) {
+#ifdef _WIN32
+    return fs::path(value.toStdWString());
+#else
+    return fs::path(value.toStdString());
+#endif
+}
+
 QString now_string(std::int64_t epoch) {
     if (epoch <= 0) {
         return "-";
@@ -122,7 +150,7 @@ std::vector<QString> list_problems(const fs::path& contest_root, const ContestCo
     }
     for (const auto& entry : fs::directory_iterator(tests_root)) {
         if (entry.is_directory()) {
-            problems.push_back(QString::fromStdString(entry.path().filename().string()));
+            problems.push_back(qstring_from_path(entry.path().filename()));
         }
     }
     std::sort(problems.begin(), problems.end());
@@ -154,7 +182,7 @@ void write_text_file(const fs::path& path, const std::string& content,
         throw std::runtime_error("failed to inspect " + path.string() + ": " +
                                  exists_error.message());
     }
-    QSaveFile output(QString::fromStdString(path.string()));
+    QSaveFile output(qstring_from_path(path));
     if (!output.open(QIODevice::WriteOnly)) {
         throw std::runtime_error("failed to write " + path.string());
     }
@@ -698,7 +726,7 @@ public:
     LocalJudgeServer(AppConfig config, ContestConfig settings)
         : config_(std::move(config)),
           settings_(std::move(settings)),
-          db_(config_.data_dir / "server.db") {}
+          db_(config_.data_dir / "server.db", config_.secure_password_storage) {}
 
     ~LocalJudgeServer() {
         stop_worker();
@@ -712,6 +740,7 @@ public:
         if (!fs::exists(config_.contest_root / settings_.tests_dir)) {
             throw std::runtime_error("contest tests directory not found");
         }
+        configure_tls();
         std::string sandbox_reason;
         if (!neothemis::secure_sandbox_available(&sandbox_reason)) {
             throw std::runtime_error("secure sandbox unavailable: " + sandbox_reason);
@@ -724,7 +753,7 @@ public:
             validate_server_state_file(config_.data_dir, state_file);
         }
         data_lock_ = std::make_unique<QLockFile>(
-            QString::fromStdString((config_.data_dir / "server.lock").string()));
+            qstring_from_path(config_.data_dir / "server.lock"));
         if (!data_lock_->tryLock()) {
             throw std::runtime_error(
                 "server data folder is already in use by another NeoThemis server");
@@ -751,21 +780,32 @@ public:
         if (!config_.allow_lan && !config_.host.isLoopback()) {
             throw std::runtime_error("refusing non-loopback bind without --allow-lan");
         }
-        QObject::connect(&tcp_server_, &QTcpServer::newConnection, [&]() {
-            while (QTcpSocket* socket = tcp_server_.nextPendingConnection()) {
-                socket->setParent(&tcp_server_);
+        if (config_.allow_lan && !config_.tls_enabled()) {
+            throw std::runtime_error(
+                "LAN access requires TLS; provide --tls-cert and --tls-key");
+        }
+        QTcpServer* listener = &tcp_server_;
+        if (config_.tls_enabled()) {
+            tls_server_.setSslConfiguration(tls_configuration_);
+            tls_server_.setHandshakeTimeout(10 * 1000);
+            listener = &tls_server_;
+        }
+        QObject::connect(listener, &QTcpServer::newConnection, [this, listener]() {
+            while (QTcpSocket* socket = listener->nextPendingConnection()) {
+                socket->setParent(listener);
                 serve_connection(socket, [this](const HttpRequest& request) {
                     return handle(request);
                 });
             }
         });
-        if (!tcp_server_.listen(config_.host, config_.port)) {
-            throw std::runtime_error(tcp_server_.errorString().toStdString());
+        if (!listener->listen(config_.host, config_.port)) {
+            throw std::runtime_error(listener->errorString().toStdString());
         }
         start_worker();
-        std::cout << "NeoThemis server listening on http://"
-                  << tcp_server_.serverAddress().toString().toStdString()
-                  << ":" << tcp_server_.serverPort() << "\n";
+        std::cout << "NeoThemis server listening on "
+                  << (config_.tls_enabled() ? "https://" : "http://")
+                  << listener->serverAddress().toString().toStdString() << ":"
+                  << listener->serverPort() << "\n";
         std::cout << "Contest root: " << config_.contest_root.string() << "\n";
         std::cout << "Data dir: " << config_.data_dir.string() << "\n";
         if (generated_admin_password_) {
@@ -825,7 +865,9 @@ public:
                     db_.delete_session(token);
                 }
                 HttpResponse response = redirect_response("/login");
-                response.headers.push_back("Set-Cookie: NTSID=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict");
+                response.headers.push_back(
+                    QStringLiteral("Set-Cookie: NTSID=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict") +
+                    (config_.tls_enabled() ? QStringLiteral("; Secure") : QString()));
                 return response;
             }
             if (!user) {
@@ -908,7 +950,8 @@ private:
         QString token = db_.create_session(user->id);
         HttpResponse response = redirect_response("/submit");
         response.headers.push_back("Set-Cookie: NTSID=" + token +
-                                   "; Path=/; HttpOnly; SameSite=Strict");
+                                   "; Path=/; HttpOnly; SameSite=Strict" +
+                                   (config_.tls_enabled() ? "; Secure" : ""));
         return response;
     }
 
@@ -1066,7 +1109,7 @@ private:
             source_path = snapshot_directory / (problem.toStdString() + ".cpp");
             write_text_file(source_path, source.toStdString(), true);
             write_text_file(contest_source_path(user.username, problem), source.toStdString());
-            db_.queue_submission(id, QString::fromStdString(source_path.string()));
+            db_.queue_submission(id, qstring_from_path(source_path));
         } catch (const std::exception& ex) {
             db_.finish_submission(id, "failed", "IE", 0.0,
                                   QString::fromUtf8(ex.what()), {});
@@ -1585,8 +1628,7 @@ private:
                 directory.increment(iteration_error);
 
                 bool id_ok = false;
-                const QString id_text =
-                    QString::fromStdString(candidate_directory.filename().string());
+                const QString id_text = qstring_from_path(candidate_directory.filename());
                 const int submission_id = id_text.toInt(&id_ok);
                 if (!id_ok || submission_id <= 0 ||
                     id_text != QString::number(submission_id) ||
@@ -1670,7 +1712,7 @@ private:
     void start_worker() {
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);
-            stopping_ = false;
+            stopping_.store(false, std::memory_order_relaxed);
             work_pending_ = true;
         }
         worker_ = std::thread([this]() { worker_loop(); });
@@ -1679,7 +1721,7 @@ private:
     void stop_worker() {
         {
             std::lock_guard<std::mutex> lock(worker_mutex_);
-            stopping_ = true;
+            stopping_.store(true, std::memory_order_relaxed);
         }
         worker_cv_.notify_all();
         if (worker_.joinable()) {
@@ -1698,8 +1740,10 @@ private:
     void worker_loop() {
         std::unique_lock<std::mutex> lock(worker_mutex_);
         while (true) {
-            worker_cv_.wait(lock, [&]() { return stopping_ || work_pending_; });
-            if (stopping_) {
+            worker_cv_.wait(lock, [&]() {
+                return stopping_.load(std::memory_order_relaxed) || work_pending_;
+            });
+            if (stopping_.load(std::memory_order_relaxed)) {
                 return;
             }
             work_pending_ = false;
@@ -1711,7 +1755,7 @@ private:
                     judge_submission(*submission);
                     claimed_submission_id.reset();
                     std::lock_guard<std::mutex> state_lock(worker_mutex_);
-                    if (stopping_) {
+                    if (stopping_.load(std::memory_order_relaxed)) {
                         return;
                     }
                 }
@@ -1720,12 +1764,14 @@ private:
                 bool recovered = false;
                 while (!recovered) {
                     lock.lock();
-                    if (stopping_) {
+                    if (stopping_.load(std::memory_order_relaxed)) {
                         return;
                     }
                     worker_cv_.wait_for(lock, std::chrono::milliseconds(500),
-                                        [&]() { return stopping_; });
-                    if (stopping_) {
+                                        [&]() {
+                                            return stopping_.load(std::memory_order_relaxed);
+                                        });
+                    if (stopping_.load(std::memory_order_relaxed)) {
                         return;
                     }
                     lock.unlock();
@@ -1763,7 +1809,7 @@ private:
             fs::path copied_problem = contest / "tests" / submission.problem.toStdString();
             safe_copy_problem(original_problem, copied_problem);
 
-            fs::copy_file(fs::path(submission.source_path.toStdString()),
+            fs::copy_file(path_from_qstring(submission.source_path),
                           contest / "contestants" / submission.username.toStdString() /
                               (submission.problem.toStdString() + ".cpp"),
                           fs::copy_options::overwrite_existing);
@@ -1777,10 +1823,17 @@ private:
             options.compile_flags = settings_.compile_flags;
             options.stack_limit_mb = settings_.stack_limit_mb;
             options.parallel_jobs = 1;
+            options.compile_jobs = 1;
+            options.test_jobs = 1;
             options.keep_workdir = false;
             options.selected_contestants = {submission.username.toStdString()};
             options.selected_problems = {submission.problem.toStdString()};
             options.forbidden_patterns = settings_.forbidden_patterns;
+            // Destruction must stop the active compiler/test process tree before
+            // joining the queue worker, even when a problem has many long tests.
+            options.should_cancel = [this]() {
+                return stopping_.load(std::memory_order_relaxed);
+            };
 
             auto core = neothemis::make_judge_core(options.core_name);
             auto results = core->judge(options);
@@ -1793,6 +1846,12 @@ private:
                 std::cerr << "Failed to update contest results.csv: " << ex.what() << "\n";
             }
         } catch (const std::exception& ex) {
+            if (stopping_.load(std::memory_order_relaxed)) {
+                // Shutdown is not a contestant failure. Preserve the snapshot
+                // and let the next server instance retry the interrupted job.
+                db_.recover_running_submission(submission.id);
+                return;
+            }
             try {
                 db_.finish_submission(submission.id, "failed", "IE", 0.0, ex.what(), {});
             } catch (const std::exception& persistence_error) {
@@ -1845,16 +1904,49 @@ private:
         db_.finish_submission(id, "done", QString::fromStdString(summary), score, message, rows);
     }
 
+    void configure_tls() {
+        if (!config_.tls_enabled()) {
+            return;
+        }
+        if (!QSslSocket::supportsSsl()) {
+            throw std::runtime_error("TLS support is unavailable in this Qt installation");
+        }
+        QFile certificate_file(qstring_from_path(config_.tls_certificate));
+        QFile key_file(qstring_from_path(config_.tls_private_key));
+        if (!certificate_file.open(QIODevice::ReadOnly) || !key_file.open(QIODevice::ReadOnly)) {
+            throw std::runtime_error("failed to open TLS certificate or private key");
+        }
+        const QList<QSslCertificate> certificates =
+            QSslCertificate::fromData(certificate_file.readAll(), QSsl::Pem);
+        if (certificates.isEmpty()) {
+            throw std::runtime_error("TLS certificate file does not contain a PEM certificate");
+        }
+        const QByteArray key_data = key_file.readAll();
+        QSslKey private_key(key_data, QSsl::Rsa, QSsl::Pem);
+        if (private_key.isNull()) {
+            private_key = QSslKey(key_data, QSsl::Ec, QSsl::Pem);
+        }
+        if (private_key.isNull()) {
+            throw std::runtime_error("TLS private key is not a supported PEM RSA or EC key");
+        }
+        tls_configuration_ = QSslConfiguration::defaultConfiguration();
+        tls_configuration_.setProtocol(QSsl::TlsV1_2OrLater);
+        tls_configuration_.setLocalCertificateChain(certificates);
+        tls_configuration_.setPrivateKey(private_key);
+    }
+
     AppConfig config_;
     ContestConfig settings_;
     Database db_;
     std::unique_ptr<QLockFile> data_lock_;
     QTcpServer tcp_server_;
+    QSslServer tls_server_;
+    QSslConfiguration tls_configuration_;
     std::thread worker_;
     std::condition_variable worker_cv_;
     std::mutex worker_mutex_;
     mutable std::mutex contest_results_mutex_;
-    bool stopping_ = false;
+    std::atomic<bool> stopping_{false};
     bool work_pending_ = false;
     bool generated_admin_password_ = false;
     bool generated_join_code_ = false;
@@ -1870,7 +1962,10 @@ void print_usage() {
         << "  --admin-user <name>       Admin username. Default: admin\n"
         << "  --admin-password <pass>   Admin password. Generated on first run if omitted\n"
         << "  --join-code <code>        Contestant registration code. Generated if omitted\n"
-        << "  --allow-lan               Required before binding to a non-loopback host\n";
+        << "  --allow-lan               Allow network clients; requires TLS certificate and key\n"
+        << "  --tls-cert <file>         PEM certificate used for HTTPS\n"
+        << "  --tls-key <file>          PEM private key used for HTTPS\n"
+        << "  --secure-password-storage Store account passwords as PBKDF2 hashes\n";
 }
 
 AppConfig parse_args(const QStringList& args) {
@@ -1887,7 +1982,7 @@ AppConfig parse_args(const QStringList& args) {
             print_usage();
             std::exit(0);
         } else if (arg == "--contest") {
-            config.contest_root = require_value(arg).toStdString();
+            config.contest_root = path_from_qstring(require_value(arg));
         } else if (arg == "--host") {
             config.host = QHostAddress(require_value(arg));
             if (config.host.isNull()) {
@@ -1901,7 +1996,7 @@ AppConfig parse_args(const QStringList& args) {
             }
             config.port = static_cast<quint16>(port);
         } else if (arg == "--data") {
-            config.data_dir = require_value(arg).toStdString();
+            config.data_dir = path_from_qstring(require_value(arg));
         } else if (arg == "--admin-user") {
             config.admin_user = require_value(arg);
             if (!valid_username(config.admin_user)) {
@@ -1913,6 +2008,12 @@ AppConfig parse_args(const QStringList& args) {
             config.join_code = require_value(arg);
         } else if (arg == "--allow-lan") {
             config.allow_lan = true;
+        } else if (arg == "--tls-cert") {
+            config.tls_certificate = path_from_qstring(require_value(arg));
+        } else if (arg == "--tls-key") {
+            config.tls_private_key = path_from_qstring(require_value(arg));
+        } else if (arg == "--secure-password-storage") {
+            config.secure_password_storage = true;
         } else {
             throw std::runtime_error(("unknown option: " + arg).toStdString());
         }
@@ -1926,11 +2027,27 @@ AppConfig parse_args(const QStringList& args) {
     if (config.join_code.isEmpty()) {
         config.join_code = qEnvironmentVariable("NEOTHEMIS_SERVER_JOIN_CODE");
     }
+    if (config.tls_certificate.empty() != config.tls_private_key.empty()) {
+        throw std::runtime_error("--tls-cert and --tls-key must be provided together");
+    }
+    config.secure_password_storage =
+        config.secure_password_storage ||
+        qEnvironmentVariable("NEOTHEMIS_SECURE_PASSWORD_STORAGE") == "1";
     config.contest_root = fs::absolute(config.contest_root);
     if (config.data_dir.empty()) {
         config.data_dir = config.contest_root / ".neothemis-server";
     }
     config.data_dir = fs::absolute(config.data_dir);
+    config.tls_certificate = config.tls_certificate.empty()
+                                ? fs::path()
+                                : fs::absolute(config.tls_certificate);
+    config.tls_private_key = config.tls_private_key.empty()
+                                 ? fs::path()
+                                 : fs::absolute(config.tls_private_key);
+    if (config.allow_lan && !config.tls_enabled()) {
+        throw std::runtime_error(
+            "LAN access requires HTTPS; provide --tls-cert and --tls-key");
+    }
     return config;
 }
 

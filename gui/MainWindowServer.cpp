@@ -18,10 +18,10 @@ QString MainWindow::local_server_executable() const {
 #else
         "neothemis-server";
 #endif
-    fs::path alongside =
-        fs::path(QCoreApplication::applicationDirPath().toStdString()) / name.toStdString();
+    fs::path alongside = path_from_qstring(QCoreApplication::applicationDirPath()) /
+                         path_from_qstring(name);
     if (fs::exists(alongside)) {
-        return QString::fromStdString(alongside.string());
+        return qstring_from_path(alongside);
     }
     return name;
 }
@@ -47,7 +47,7 @@ QString MainWindow::server_database_display_path() const {
         if (path.empty()) {
             return text("open_contest_first");
         }
-        return QString::fromStdString(path.string());
+        return qstring_from_path(path);
     } catch (const std::exception& ex) {
         return QString::fromUtf8(ex.what());
     }
@@ -75,7 +75,8 @@ MainWindow::open_server_database(bool create_if_missing) const {
         throw std::runtime_error(text("server_database_missing").toStdString());
     }
 
-    auto database = std::make_unique<neothemis::server::Database>(database_path);
+    auto database = std::make_unique<neothemis::server::Database>(
+        database_path, server_secure_password_storage_);
     database->migrate_schema();
     return database;
 }
@@ -154,7 +155,7 @@ ServerUserSyncResult MainWindow::sync_server_users_from_contest() {
         if (!entry.is_directory()) {
             continue;
         }
-        const QString username = QString::fromStdString(entry.path().filename().string()).trimmed();
+        const QString username = qstring_from_path(entry.path().filename()).trimmed();
         if (!valid_server_username(username)) {
             ++result.skipped;
             continue;
@@ -329,7 +330,7 @@ void MainWindow::open_start_server_dialog() {
 
     auto* dialog = new QDialog(this);
     dialog->setWindowTitle(text("start_local_server"));
-    dialog->resize(520, 320);
+    dialog->resize(560, 420);
     auto* layout = new QVBoxLayout(dialog);
     auto* form = new QFormLayout;
 
@@ -340,6 +341,8 @@ void MainWindow::open_start_server_dialog() {
     allow_lan->setChecked(server_allow_lan_);
     auto* join_code = new QLineEdit(server_join_code_, dialog);
     auto* admin_password = new QLineEdit(server_admin_password_, dialog);
+    auto* tls_certificate = new QLineEdit(server_tls_certificate_, dialog);
+    auto* tls_private_key = new QLineEdit(server_tls_private_key_, dialog);
     auto* data_path = new QLineEdit(server_database_display_path(), dialog);
     data_path->setReadOnly(true);
     auto* warning = new QLabel(text("server_security_warning"), dialog);
@@ -350,6 +353,8 @@ void MainWindow::open_start_server_dialog() {
     form->addRow(text("server_allow_lan"), allow_lan);
     form->addRow(text("server_join_code"), join_code);
     form->addRow(text("server_admin_password"), admin_password);
+    form->addRow(text("server_tls_certificate"), tls_certificate);
+    form->addRow(text("server_tls_private_key"), tls_private_key);
     form->addRow(text("server_database"), data_path);
     layout->addLayout(form);
     layout->addWidget(warning);
@@ -362,14 +367,18 @@ void MainWindow::open_start_server_dialog() {
     close_button->setText(text("close"));
     close_button->setIcon(QIcon());
     QObject::connect(buttons, &QDialogButtonBox::accepted,
-                     [this, dialog, port, allow_lan, join_code, admin_password]() {
+                     [this, dialog, port, allow_lan, join_code, admin_password, tls_certificate,
+                      tls_private_key]() {
                          server_port_ = port->value();
                          server_allow_lan_ = allow_lan->isChecked();
                          server_join_code_ = join_code->text().trimmed();
                          server_admin_password_ = admin_password->text();
+                         server_tls_certificate_ = tls_certificate->text().trimmed();
+                         server_tls_private_key_ = tls_private_key->text().trimmed();
                          save_app_settings();
                          start_local_server(server_port_, server_allow_lan_, server_join_code_,
-                                            server_admin_password_);
+                                            server_admin_password_, server_tls_certificate_,
+                                            server_tls_private_key_);
                          dialog->accept();
                      });
     QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
@@ -379,10 +388,16 @@ void MainWindow::open_start_server_dialog() {
 }
 
 void MainWindow::start_local_server(int port, bool allow_lan, const QString& join_code,
-                                    const QString& admin_password) {
+                                    const QString& admin_password, const QString& tls_certificate,
+                                    const QString& tls_private_key) {
     if (join_code.isEmpty() || admin_password.isEmpty()) {
         QMessageBox::warning(this, text("server_start_failed"),
                              text("server_credentials_required"));
+        return;
+    }
+    if (allow_lan && (tls_certificate.isEmpty() || tls_private_key.isEmpty())) {
+        QMessageBox::warning(this, text("server_start_failed"),
+                             text("server_tls_required_for_lan"));
         return;
     }
 
@@ -403,15 +418,20 @@ void MainWindow::start_local_server(int port, bool allow_lan, const QString& joi
     process->setProperty("stopRequested", false);
     process->setProgram(local_server_executable());
     QStringList args;
-    args << "--contest" << QString::fromStdString(contest_root_.string()) << "--data"
-         << QString::fromStdString(data_dir.string()) << "--port" << QString::number(port);
+    args << "--contest" << qstring_from_path(contest_root_) << "--data"
+         << qstring_from_path(data_dir) << "--port" << QString::number(port);
     if (allow_lan) {
         args << "--host" << "0.0.0.0" << "--allow-lan";
+    }
+    if (!tls_certificate.isEmpty() || !tls_private_key.isEmpty()) {
+        args << "--tls-cert" << tls_certificate << "--tls-key" << tls_private_key;
     }
     process->setArguments(args);
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
     environment.insert("NEOTHEMIS_SERVER_JOIN_CODE", join_code);
     environment.insert("NEOTHEMIS_SERVER_ADMIN_PASSWORD", admin_password);
+    environment.insert("NEOTHEMIS_SECURE_PASSWORD_STORAGE",
+                       server_secure_password_storage_ ? "1" : "0");
     process->setProcessEnvironment(environment);
     process->setProcessChannelMode(QProcess::MergedChannels);
 
@@ -459,11 +479,15 @@ void MainWindow::start_local_server(int port, bool allow_lan, const QString& joi
     }
 
     const QString host = allow_lan ? "0.0.0.0" : "127.0.0.1";
-    const QString url = "http://" + host + ":" + QString::number(port);
+    const QString scheme = (!server_tls_certificate_.isEmpty() &&
+                            !server_tls_private_key_.isEmpty())
+                               ? "https://"
+                               : "http://";
+    const QString url = scheme + host + ":" + QString::number(port);
     log_->appendPlainText(text("server_started") + ": " + url);
     log_->appendPlainText(text("server_database") + ": " + server_database_display_path());
     log_->appendPlainText(text("server_join_code") + ": " + join_code);
-    log_->appendPlainText(text("server_admin_password") + ": " + admin_password);
+    log_->appendPlainText(text("server_credentials_configured"));
     if (allow_lan) {
         log_->appendPlainText(text("server_lan_warning"));
     }
@@ -507,12 +531,16 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
     port->setValue(server_port_);
     auto* allow_lan = new QCheckBox(tab);
     allow_lan->setChecked(server_allow_lan_);
+    auto* secure_password_storage = new QCheckBox(tab);
+    secure_password_storage->setChecked(server_secure_password_storage_);
     auto* enable_ranking = new QCheckBox(tab);
     enable_ranking->setChecked(server_ranking_enabled_);
     auto* enable_details = new QCheckBox(tab);
     enable_details->setChecked(server_contestant_details_enabled_);
     auto* join_code = new QLineEdit(server_join_code_, tab);
     auto* admin_password = new QLineEdit(server_admin_password_, tab);
+    auto* tls_certificate = new QLineEdit(server_tls_certificate_, tab);
+    auto* tls_private_key = new QLineEdit(server_tls_private_key_, tab);
     auto* database = new QLineEdit(server_database_display_path(), tab);
     database->setReadOnly(true);
     auto* warning = new QLabel(text("server_settings_help"), tab);
@@ -522,16 +550,19 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
 
     form->addRow(text("server_port"), port);
     form->addRow(text("server_allow_lan"), allow_lan);
+    form->addRow(text("server_secure_password_storage"), secure_password_storage);
     form->addRow(text("server_enable_ranking"), enable_ranking);
     form->addRow(text("server_enable_contestant_details"), enable_details);
     form->addRow(text("server_join_code"), join_code);
     form->addRow(text("server_admin_bootstrap_password"), admin_password);
+    form->addRow(text("server_tls_certificate"), tls_certificate);
+    form->addRow(text("server_tls_private_key"), tls_private_key);
     form->addRow(text("server_database"), database);
     form->addRow(warning);
     form->addRow(save);
 
-    auto persist = [this, port, allow_lan, enable_ranking, enable_details, join_code,
-                    admin_password](bool notify) {
+    auto persist = [this, port, allow_lan, secure_password_storage, enable_ranking, enable_details,
+                    join_code, admin_password, tls_certificate, tls_private_key](bool notify) {
         const QString join = join_code->text().trimmed();
         const QString admin = admin_password->text();
         if (join.isEmpty() || admin.isEmpty()) {
@@ -540,9 +571,12 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
         }
         const bool changed = server_port_ != port->value() ||
                              server_allow_lan_ != allow_lan->isChecked() ||
+                             server_secure_password_storage_ != secure_password_storage->isChecked() ||
                              server_ranking_enabled_ != enable_ranking->isChecked() ||
                              server_contestant_details_enabled_ != enable_details->isChecked() ||
-                             server_join_code_ != join || server_admin_password_ != admin;
+                             server_join_code_ != join || server_admin_password_ != admin ||
+                             server_tls_certificate_ != tls_certificate->text().trimmed() ||
+                             server_tls_private_key_ != tls_private_key->text().trimmed();
         if (!changed) {
             if (notify) {
                 log_->appendPlainText(text("saved_server_settings"));
@@ -551,10 +585,13 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
         }
         server_port_ = port->value();
         server_allow_lan_ = allow_lan->isChecked();
+        server_secure_password_storage_ = secure_password_storage->isChecked();
         server_ranking_enabled_ = enable_ranking->isChecked();
         server_contestant_details_enabled_ = enable_details->isChecked();
         server_join_code_ = join;
         server_admin_password_ = admin;
+        server_tls_certificate_ = tls_certificate->text().trimmed();
+        server_tls_private_key_ = tls_private_key->text().trimmed();
         try {
             save_app_settings();
             if (!contest_root_.empty()) {
@@ -584,12 +621,15 @@ void MainWindow::refresh_server_users_table(QTableWidget* users_table) {
     }
 
     auto database = open_server_database(false);
+    const bool secure_password_storage = database->secure_password_storage_enabled();
     for (const neothemis::server::ManagedUser& user : database->list_users()) {
         const int row = users_table->rowCount();
         users_table->insertRow(row);
-        const QString stored_password = user.password;
-        const QString password =
-            stored_password.isEmpty() ? text("server_password_reset_required") : stored_password;
+        const QString password = user.password.isEmpty()
+                                      ? (secure_password_storage
+                                             ? text("server_password_hidden")
+                                             : text("server_password_reset_required"))
+                                      : user.password;
         const QString role_display =
             user.role == "admin" ? text("server_role_admin") : text("server_role_contestant");
         const QString created =

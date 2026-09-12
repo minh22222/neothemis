@@ -2,6 +2,8 @@
 
 #include "neothemis/Spreadsheet.hpp"
 
+#include <cmath>
+
 namespace neothemis::gui {
 
 namespace {
@@ -154,6 +156,9 @@ neothemis::ContestConfig MainWindow::current_contest_config() const {
     config.compile_flags = compile_flags_;
     config.stack_limit_mb = stack_limit_mb_;
     config.parallel_jobs = parallel_jobs_;
+    config.compile_jobs = compile_jobs_;
+    config.test_jobs = test_jobs_;
+    config.timing_focused = timing_focused_;
     config.forbidden_patterns = forbidden_patterns_;
     config.keep_workdir = keep_workdir_;
     config.server_ranking_enabled = server_ranking_enabled_;
@@ -172,6 +177,9 @@ void MainWindow::apply_contest_config(const neothemis::ContestConfig& config) {
     compile_flags_ = config.compile_flags;
     stack_limit_mb_ = config.stack_limit_mb;
     parallel_jobs_ = config.parallel_jobs;
+    compile_jobs_ = config.compile_jobs;
+    test_jobs_ = config.test_jobs;
+    timing_focused_ = config.timing_focused;
     forbidden_patterns_ = config.forbidden_patterns;
     keep_workdir_ = config.keep_workdir;
     server_ranking_enabled_ = config.server_ranking_enabled;
@@ -313,7 +321,7 @@ void MainWindow::open_contest() {
         contest_dirty_ = false;
         contest_file_path_.clear();
         load_contest_config();
-        contest_title_->setText(QString::fromStdString(contest_root_.filename().string()));
+        contest_title_->setText(qstring_from_path(contest_root_.filename()));
         refresh_table();
     } catch (const std::exception& ex) {
         contest_root_.clear();
@@ -359,7 +367,7 @@ void MainWindow::open_contest_file(const fs::path& archive_path) {
                             contest_from_file_ = true;
                             contest_dirty_ = false;
                             contest_title_->setText(
-                                QString::fromStdString(contest_file_path_.filename().string()));
+                                qstring_from_path(contest_file_path_.filename()));
                             refresh_table();
                             finish_archive_operation(text("file_operation_complete"));
                         } catch (const std::exception& ex) {
@@ -434,13 +442,12 @@ bool MainWindow::save_contest_container(bool save_as) {
             if (save_as || target.empty()) {
                 QString selected = QFileDialog::getSaveFileName(
                     this, text("save_contest_file_as"),
-                    QString::fromStdString(
-                        (target.empty() ? fs::path("contest.ncontest") : target).string()),
+                    qstring_from_path(target.empty() ? fs::path("contest.ncontest") : target),
                     text("ncontest_save_filter"));
                 if (selected.isEmpty()) {
                     return false;
                 }
-                target = ensure_ncontest_extension(selected.toStdString());
+                target = ensure_ncontest_extension(path_from_qstring(selected));
             }
             fs::path source_root = contest_root_;
             bool was_save_as = save_as;
@@ -455,11 +462,11 @@ bool MainWindow::save_contest_container(bool save_as) {
                             contest_file_path_ = target;
                             contest_dirty_ = false;
                             contest_title_->setText(
-                                QString::fromStdString(contest_file_path_.filename().string()));
+                                qstring_from_path(contest_file_path_.filename()));
                             finish_archive_operation(text("file_operation_complete"));
                             log_->appendPlainText(
                                 text(was_save_as ? "save_as_complete" : "save_complete") + ": " +
-                                QString::fromStdString(target.string()));
+                                qstring_from_path(target));
                             if (pending_close_after_save_) {
                                 pending_close_after_save_ = false;
                                 QTimer::singleShot(0, this, &QWidget::close);
@@ -479,18 +486,19 @@ bool MainWindow::save_contest_container(bool save_as) {
                 }
             });
         } else {
-            fs::path default_target = contest_file_path_.empty()
-                                          ? contest_root_.parent_path() /
-                                                (contest_root_.filename().string() + ".ncontest")
-                                          : contest_file_path_;
+            fs::path default_target = contest_file_path_;
+            if (default_target.empty()) {
+                default_target = contest_root_.parent_path() / contest_root_.filename();
+                default_target += ".ncontest";
+            }
             QString selected = QFileDialog::getSaveFileName(
                 this, text(save_as ? "save_contest_file_as" : "save_contest_file"),
-                QString::fromStdString(default_target.string()), text("ncontest_save_filter"));
+                qstring_from_path(default_target), text("ncontest_save_filter"));
             if (selected.isEmpty()) {
                 return false;
             }
             fs::path source_root = contest_root_;
-            fs::path target = ensure_ncontest_extension(selected.toStdString());
+            fs::path target = ensure_ncontest_extension(path_from_qstring(selected));
             bool was_save_as = save_as;
             begin_archive_operation(text("saving_contest_file"));
             ArchiveProgress progress = archive_progress_callback();
@@ -504,11 +512,11 @@ bool MainWindow::save_contest_container(bool save_as) {
                             contest_from_file_ = true;
                             contest_dirty_ = false;
                             contest_title_->setText(
-                                QString::fromStdString(contest_file_path_.filename().string()));
+                                qstring_from_path(contest_file_path_.filename()));
                             finish_archive_operation(text("file_operation_complete"));
                             log_->appendPlainText(
                                 text(was_save_as ? "save_as_complete" : "save_complete") + ": " +
-                                QString::fromStdString(target.string()));
+                                qstring_from_path(target));
                             if (pending_close_after_save_) {
                                 pending_close_after_save_ = false;
                                 QTimer::singleShot(0, this, &QWidget::close);
@@ -552,23 +560,23 @@ void MainWindow::convert_old_contest_to_ncontest(bool source_is_folder) {
         return;
     }
 
-    fs::path source_path = source.toStdString();
+    fs::path source_path = path_from_qstring(source);
     fs::path default_output = source_path;
     if (source_is_folder) {
-        default_output =
-            source_path.parent_path() / (source_path.filename().string() + ".ncontest");
+        default_output = source_path.parent_path() / source_path.filename();
+        default_output += ".ncontest";
     } else {
         default_output.replace_extension(".ncontest");
     }
 
     QString selected_output = QFileDialog::getSaveFileName(
-        this, text("convert_old_contest_file"), QString::fromStdString(default_output.string()),
+        this, text("convert_old_contest_file"), qstring_from_path(default_output),
         text("ncontest_save_filter"));
     if (selected_output.isEmpty()) {
         return;
     }
 
-    fs::path output_path = ensure_ncontest_extension(selected_output.toStdString());
+    fs::path output_path = ensure_ncontest_extension(path_from_qstring(selected_output));
     begin_archive_operation(text("converting_contest_file"));
     ArchiveProgress ui_progress = archive_progress_callback();
     neothemis::ArchiveProgress core_progress =
@@ -584,10 +592,10 @@ void MainWindow::convert_old_contest_to_ncontest(bool source_is_folder) {
                 [this, output_path]() {
                     finish_archive_operation(text("convert_complete"));
                     log_->appendPlainText(text("convert_complete") + ": " +
-                                          QString::fromStdString(output_path.string()));
+                                          qstring_from_path(output_path));
                     QMessageBox::information(this, text("converter"),
                                              text("convert_complete") + "\n" +
-                                                 QString::fromStdString(output_path.string()));
+                                                 qstring_from_path(output_path));
                 },
                 Qt::QueuedConnection);
         } catch (const std::exception& ex) {
@@ -634,7 +642,7 @@ void MainWindow::add_contestants_from_folder() {
         int skipped = 0;
         fs::create_directories(destination_root);
         for (const fs::path& source : sources) {
-            std::string name = source.filename().string();
+            const fs::path name = source.filename();
             if (name.empty() || name == "." || name == "..") {
                 ++skipped;
                 continue;
@@ -685,7 +693,7 @@ void MainWindow::refresh_table(bool log_opened) {
         populate_table();
         if (log_opened) {
             log_->appendPlainText(text("opened") + " " +
-                                  QString::fromStdString(contest_root_.string()));
+                                  qstring_from_path(contest_root_));
         }
     } catch (const std::exception& ex) {
         contestants_.clear();
@@ -704,13 +712,13 @@ void MainWindow::refresh_table(bool log_opened) {
 fs::path MainWindow::choose_export_path(const std::string& filename) {
     QString default_path = contest_root_.empty()
                                ? QString::fromStdString(filename)
-                               : QString::fromStdString((contest_root_ / filename).string());
+                               : qstring_from_path(contest_root_ / filename);
     QString selected = QFileDialog::getSaveFileName(this, text("export_workbook"), default_path,
                                                     text("xlsx_filter"));
     if (selected.isEmpty()) {
         return {};
     }
-    fs::path path = selected.toStdString();
+    fs::path path = path_from_qstring(selected);
     if (path.extension().string() != ".xlsx") {
         path += ".xlsx";
     }
@@ -774,9 +782,9 @@ void MainWindow::export_scoreboard_xlsx() {
     widths[0] = 28.0;
     try {
         neothemis::write_xlsx_file(path, "Scoreboard", rows, widths);
-        log_->appendPlainText(text("exported") + " " + QString::fromStdString(path.string()));
+        log_->appendPlainText(text("exported") + " " + qstring_from_path(path));
         QMessageBox::information(this, text("export_complete"),
-                                 text("exported") + " " + QString::fromStdString(path.string()));
+                                 text("exported") + " " + qstring_from_path(path));
     } catch (const std::exception& ex) {
         QMessageBox::critical(this, text("export_failed"), ex.what());
     }
@@ -807,9 +815,9 @@ void MainWindow::export_data_xlsx() {
     std::vector<double> widths{28.0, 14.0, 12.0, 10.0, 12.0, 12.0, 12.0, 14.0, 48.0};
     try {
         neothemis::write_xlsx_file(path, "Data", rows, widths);
-        log_->appendPlainText(text("exported") + " " + QString::fromStdString(path.string()));
+        log_->appendPlainText(text("exported") + " " + qstring_from_path(path));
         QMessageBox::information(this, text("export_complete"),
-                                 text("exported") + " " + QString::fromStdString(path.string()));
+                                 text("exported") + " " + qstring_from_path(path));
     } catch (const std::exception& ex) {
         QMessageBox::critical(this, text("export_failed"), ex.what());
     }
@@ -832,9 +840,25 @@ QWidget* MainWindow::build_contest_tab(QWidget* parent, SettingsDialog* settings
     auto* stack = new QSpinBox(tab);
     stack->setRange(0, 1024 * 1024);
     stack->setValue(static_cast<int>(stack_limit_mb_));
-    auto* parallel = new QSpinBox(tab);
-    parallel->setRange(0, 256);
-    parallel->setValue(static_cast<int>(parallel_jobs_));
+    auto worker_setting = [tab](unsigned int count) {
+        auto* setting = new QSpinBox(tab);
+        setting->setRange(0, std::numeric_limits<int>::max());
+        setting->setValue(static_cast<int>(std::min(
+            count, static_cast<unsigned int>(std::numeric_limits<int>::max()))));
+        return setting;
+    };
+    auto* parallel = worker_setting(parallel_jobs_);
+    parallel->setSpecialValueText(text("automatic"));
+    auto* compile_jobs = worker_setting(compile_jobs_);
+    compile_jobs->setSpecialValueText(text("inherit_worker_limit"));
+    auto* test_jobs = worker_setting(test_jobs_);
+    test_jobs->setSpecialValueText(text("inherit_worker_limit"));
+    auto* timing_focused = new QCheckBox(tab);
+    timing_focused->setChecked(timing_focused_);
+    timing_focused->setToolTip(text("timing_focused_hint"));
+    test_jobs->setEnabled(!timing_focused_);
+    QObject::connect(timing_focused, &QCheckBox::toggled, test_jobs,
+                     [test_jobs](bool checked) { test_jobs->setEnabled(!checked); });
     auto* keep = new QCheckBox(tab);
     keep->setChecked(keep_workdir_);
     auto* save = new QPushButton(text("save_contest_config"), tab);
@@ -845,6 +869,9 @@ QWidget* MainWindow::build_contest_tab(QWidget* parent, SettingsDialog* settings
     form->addRow(text("tests_dir"), tests);
     form->addRow(text("stack_mb"), stack);
     form->addRow(text("parallel_jobs"), parallel);
+    form->addRow(text("compile_jobs"), compile_jobs);
+    form->addRow(text("test_jobs"), test_jobs);
+    form->addRow(text("timing_focused"), timing_focused);
     form->addRow(text("keep_workdir"), keep);
     form->addRow(save);
 
@@ -861,7 +888,8 @@ QWidget* MainWindow::build_contest_tab(QWidget* parent, SettingsDialog* settings
         }
     });
 
-    auto persist = [this, compiler, flags, contestants, tests, stack, parallel, keep](bool notify) {
+    auto persist = [this, compiler, flags, contestants, tests, stack, parallel,
+                    compile_jobs, test_jobs, timing_focused, keep](bool notify) {
         if (contest_root_.empty()) {
             return;
         }
@@ -870,11 +898,24 @@ QWidget* MainWindow::build_contest_tab(QWidget* parent, SettingsDialog* settings
         const std::string new_contestants = contestants->text().toStdString();
         const std::string new_tests = tests->text().toStdString();
         const auto new_stack = static_cast<std::uint64_t>(stack->value());
-        const auto new_parallel = static_cast<unsigned int>(parallel->value());
+        auto worker_value = [](const QSpinBox* setting, unsigned int original) {
+            // QSpinBox is signed; leave larger valid file values intact unless edited.
+            if (original > static_cast<unsigned int>(setting->maximum()) &&
+                setting->value() == setting->maximum()) {
+                return original;
+            }
+            return static_cast<unsigned int>(setting->value());
+        };
+        const auto new_parallel = worker_value(parallel, parallel_jobs_);
+        const auto new_compile_jobs = worker_value(compile_jobs, compile_jobs_);
+        const auto new_test_jobs = worker_value(test_jobs, test_jobs_);
+        const bool new_timing_focused = timing_focused->isChecked();
         const bool new_keep = keep->isChecked();
         const bool changed = compiler_ != new_compiler || compile_flags_ != new_flags ||
                              contestants_dir_ != new_contestants || tests_dir_ != new_tests ||
                              stack_limit_mb_ != new_stack || parallel_jobs_ != new_parallel ||
+                             compile_jobs_ != new_compile_jobs || test_jobs_ != new_test_jobs ||
+                             timing_focused_ != new_timing_focused ||
                              keep_workdir_ != new_keep;
         if (!changed) {
             if (notify) {
@@ -890,6 +931,9 @@ QWidget* MainWindow::build_contest_tab(QWidget* parent, SettingsDialog* settings
             proposed.tests_dir = new_tests;
             proposed.stack_limit_mb = new_stack;
             proposed.parallel_jobs = new_parallel;
+            proposed.compile_jobs = new_compile_jobs;
+            proposed.test_jobs = new_test_jobs;
+            proposed.timing_focused = new_timing_focused;
             proposed.keep_workdir = new_keep;
             validate_contest_config_paths(contest_root_, proposed);
             neothemis::write_contest_config(
@@ -1044,8 +1088,13 @@ QWidget* MainWindow::build_problem_tab(QWidget* parent, SettingsDialog* settings
                     return;
                 }
                 std::size_t parsed = 0;
-                (void)std::stod(value, &parsed);
-                if (parsed != value.size()) {
+                double number = 0.0;
+                try {
+                    number = std::stod(value, &parsed);
+                } catch (const std::exception&) {
+                    throw std::runtime_error(text("invalid_points_detail").toStdString());
+                }
+                if (parsed != value.size() || !std::isfinite(number) || number < 0.0) {
                     throw std::runtime_error(text("invalid_points_detail").toStdString());
                 }
             };

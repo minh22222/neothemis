@@ -100,8 +100,10 @@ contest-local users can be created from `Settings` -> `Server Users`. The
 `neothemis-server` executable must be in the same folder as `neothemis-gui` or
 available on `PATH`; CI packages include it beside the GUI.
 
-The Server Users tab shows each account password and supports changing or
-removing an account later. Removing an account also removes its server sessions
+The Server Users tab supports changing or removing an account later. With the
+default settings it can show account passwords for local administration. Enable
+the `Secure password storage (PBKDF2)` setting before creating accounts when
+passwords must not be recoverable. Removing an account also removes its server sessions
 and submission records, but does not remove its contestant folder. Its retained
 snapshot files are safely reclaimed on the next server startup. NeoThemis
 prevents removal of the final admin account.
@@ -177,11 +179,12 @@ Admin User,admin-secret,admin
 The header row is optional. `role` is optional and defaults to `contestant`.
 Invalid rows and duplicate usernames are skipped and reported after import.
 
-LAN mode must be explicit:
+LAN mode must be explicit and use HTTPS:
 
 ```sh
 ./build/neothemis-server --contest /path/to/contest \
   --host 0.0.0.0 --port 8080 --allow-lan \
+  --tls-cert server.crt --tls-key server.key \
   --admin-password change-this --join-code contest-join-code
 ```
 
@@ -192,20 +195,22 @@ Useful options:
 --admin-user <name>       Admin username, default: admin
 --admin-password <pass>   Admin password
 --join-code <code>        Required for contestant self-registration
---allow-lan               Required for non-loopback bind addresses
+--allow-lan               Required for network bind; requires TLS certificate and key
+--tls-cert <file>         PEM certificate used for HTTPS
+--tls-key <file>          PEM private key used for HTTPS
+--secure-password-storage Store account passwords as PBKDF2 hashes
 ```
 
 Security model:
 
 - The default bind address is loopback only. LAN exposure requires
-  `--allow-lan`.
+  `--allow-lan`, `--tls-cert`, and `--tls-key`; plain HTTP LAN mode is rejected.
 - Contestant registration requires the join code.
-- Passwords are stored as plain text in the contest-local database so they can
-  be shown and managed in the desktop GUI. Anyone who can read the contest
-  folder or a saved `.ncontest` archive can read these passwords. Use unique
-  contest-only passwords and protect the contest files. Databases created by an
-  older version keep accepting their legacy password hashes until each password
-  is reset in the GUI.
+- Password storage is plaintext by default for compatibility with the local GUI.
+  Enable `--secure-password-storage` (or the GUI setting) to migrate existing
+  plaintext rows and store new passwords as salted PBKDF2 hashes. In secure mode
+  the GUI never displays the password value.
+- LAN sessions use HTTPS and mark session cookies `Secure`.
 - Sessions use random HttpOnly SameSite cookies and POST submissions require a
   CSRF token.
 - Admin submission-ignore actions also require the admin session CSRF token.
@@ -273,8 +278,9 @@ Security model:
   not aggregate cgroup CPU or memory quotas.
 - The judge also applies the configured `forbidden_pattern` source filters as a
   contest-policy convenience; these text filters are not the security boundary.
-- The server runs one judge worker and uses `parallel_jobs=1` per submitted
-  source to avoid one contestant consuming all CPU cores.
+- The server runs one judge worker and forces `parallel_jobs=1`, `compile_jobs=1`
+  and `test_jobs=1` per submitted source, regardless of the contest's desktop/CLI
+  worker settings, to avoid one contestant consuming all CPU cores.
 - Result publication is backed by a transactional SQLite outbox. The server
   repairs all database-owned contestant/problem cells on startup, retries
   unacknowledged generations, and acknowledges only the exact generation it
@@ -377,12 +383,31 @@ Within a retained invocation, submission executables live under
 `internal/checkers` namespace. User-controlled names therefore cannot replace
 an executable, log, run directory, or checker artifact.
 
-`parallel_jobs=0` limits workers to the highest Windows CPU efficiency class or
-the highest-capacity Linux physical cores when the OS exposes heterogeneous CPU
-information. It falls back to physical cores, then half the logical thread
-count. Work remains in one shared queue, so faster P-core workers naturally take
-more tests than slower workers. Set it to `1` for serial judging or a positive
-number to override the automatic cap.
+`parallel_jobs=0` chooses an automatic worker limit, preferring detected
+performance cores on heterogeneous CPUs and falling back to physical cores or
+half the logical thread count. Positive limits are capped by available physical
+cores. `compile_jobs` and `test_jobs` override that default independently; a zero
+phase limit inherits `parallel_jobs`. Compilation finishes before timed tests
+begin, so compiler processes from the same judging run do not compete with tests.
+
+On Linux and Windows, test workers are assigned distinct physical cores when
+the OS exposes usable topology and affinity controls. Core reservations are
+shared across judging runs in the same NeoThemis process. The
+assignment prefers detected performance cores and avoids running simultaneous
+tests on hardware threads that share one physical core. This is not exclusive
+ownership of the machine: other applications, separate NeoThemis processes, shared
+cache/memory bandwidth, CPU power limits and temperature can still affect timing.
+
+Enable `timing_focused=true` for parallel compilation followed by serial test
+execution. Its timed phase also waits for other reserved judging work in the same
+process to finish and blocks new judging work there until that phase completes.
+This ignores, but preserves, `test_jobs`, so switching the mode off
+restores the configured testing limit. In the GUI these controls are in
+Settings → Contest. For example, `compile_jobs=4`, `test_jobs=2` keeps compilation
+parallel while limiting simultaneous timed tests to two; turning timing-focused
+judging on runs one test at a time instead. Use an otherwise idle machine when
+comparing timing-sensitive results; CPU-time accounting does not eliminate
+resource contention.
 
 Compiler warnings never cause `CE`: NeoThemis removes warning-as-error flags,
 adds the compiler's warning-tolerant option, and accepts the build whenever a
@@ -530,6 +555,9 @@ compiler=g++
 compile_flags=-std=c++14 -O2 -pipe
 stack_limit_mb=64
 parallel_jobs=0
+compile_jobs=0
+test_jobs=0
+timing_focused=false
 
 forbidden_pattern=system(
 forbidden_pattern=popen(
@@ -600,9 +628,23 @@ enabled, so simple recursive submissions cannot be optimized into a loop. On
 Windows, supported compilers receive a stack reserve linker flag.
 
 `parallel_jobs`
-: Number of worker jobs for compilation preparation and test judging. Default:
+: Default worker limit for compilation preparation and test judging. Default:
 `0`, which prefers detected performance cores on heterogeneous CPUs and falls
-back to physical cores or half the logical thread count.
+back to physical cores or half the logical thread count. Positive limits are
+capped by available physical cores. Worker counts must be non-negative decimal
+integers; negative, fractional, trailing-text and overflowing values are rejected.
+
+`compile_jobs`
+: Compilation worker limit. Default: `0`, meaning inherit `parallel_jobs`.
+
+`test_jobs`
+: Timed test worker limit. Default: `0`, meaning inherit `parallel_jobs`.
+The same physical-core cap applies to both phase-specific limits.
+
+`timing_focused`
+: Default: `false`. When enabled, compilation still uses its configured worker
+limit, but tests execute one at a time. The saved `test_jobs` value is retained
+and takes effect again when this mode is disabled.
 
 `forbidden_pattern`
 : Repeatable source-code text filter. Matching is case-insensitive.
