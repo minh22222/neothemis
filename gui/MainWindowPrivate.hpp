@@ -251,9 +251,9 @@ private:
 
     void open_start_server_dialog();
 
-    void start_local_server(int port, bool allow_lan, const QString& join_code,
-                            const QString& admin_password, const QString& tls_certificate,
-                            const QString& tls_private_key);
+    bool start_local_server(int port, bool allow_lan, bool https_enabled,
+                            const QString& join_code, const QString& admin_password,
+                            const QString& tls_certificate, const QString& tls_private_key);
 
     void stop_local_server(bool log_message);
 
@@ -478,6 +478,7 @@ private:
     fs::path temporary_dir_;
     int server_port_ = 8080;
     bool server_allow_lan_ = false;
+    bool server_https_enabled_ = false;
     bool server_secure_password_storage_ = false;
     bool server_ranking_enabled_ = false;
     bool server_contestant_details_enabled_ = false;

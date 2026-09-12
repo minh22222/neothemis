@@ -179,7 +179,7 @@ Admin User,admin-secret,admin
 The header row is optional. `role` is optional and defaults to `contestant`.
 Invalid rows and duplicate usernames are skipped and reported after import.
 
-LAN mode must be explicit and use HTTPS:
+LAN mode must be explicit. HTTPS is optional and is disabled unless both TLS files are supplied:
 
 ```sh
 ./build/neothemis-server --contest /path/to/contest \
@@ -195,22 +195,24 @@ Useful options:
 --admin-user <name>       Admin username, default: admin
 --admin-password <pass>   Admin password
 --join-code <code>        Required for contestant self-registration
---allow-lan               Required for network bind; requires TLS certificate and key
---tls-cert <file>         PEM certificate used for HTTPS
---tls-key <file>          PEM private key used for HTTPS
+--allow-lan               Required for network bind; HTTP is used unless TLS is enabled
+--tls-cert <file>         PEM certificate; enables HTTPS with --tls-key
+--tls-key <file>          PEM private key; enables HTTPS with --tls-cert
 --secure-password-storage Store account passwords as PBKDF2 hashes
 ```
 
 Security model:
 
-- The default bind address is loopback only. LAN exposure requires
-  `--allow-lan`, `--tls-cert`, and `--tls-key`; plain HTTP LAN mode is rejected.
+- The default bind address is loopback only. LAN exposure requires `--allow-lan`.
+  HTTPS is optional; provide `--tls-cert` and `--tls-key` to encrypt LAN traffic.
 - Contestant registration requires the join code.
 - Password storage is plaintext by default for compatibility with the local GUI.
   Enable `--secure-password-storage` (or the GUI setting) to migrate existing
   plaintext rows and store new passwords as salted PBKDF2 hashes. In secure mode
   the GUI never displays the password value.
-- LAN sessions use HTTPS and mark session cookies `Secure`.
+- HTTPS sessions mark session cookies `Secure`; HTTP sessions omit that attribute.
+- When HTTPS is disabled, LAN traffic is plain HTTP and is suitable only for a trusted,
+  isolated network.
 - Sessions use random HttpOnly SameSite cookies and POST submissions require a
   CSRF token.
 - Admin submission-ignore actions also require the admin session CSRF token.

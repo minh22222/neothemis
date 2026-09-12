@@ -330,7 +330,7 @@ void MainWindow::open_start_server_dialog() {
 
     auto* dialog = new QDialog(this);
     dialog->setWindowTitle(text("start_local_server"));
-    dialog->resize(560, 420);
+    dialog->resize(560, 480);
     auto* layout = new QVBoxLayout(dialog);
     auto* form = new QFormLayout;
 
@@ -339,6 +339,8 @@ void MainWindow::open_start_server_dialog() {
     port->setValue(server_port_);
     auto* allow_lan = new QCheckBox(dialog);
     allow_lan->setChecked(server_allow_lan_);
+    auto* https_enabled = new QCheckBox(dialog);
+    https_enabled->setChecked(server_https_enabled_);
     auto* join_code = new QLineEdit(server_join_code_, dialog);
     auto* admin_password = new QLineEdit(server_admin_password_, dialog);
     auto* tls_certificate = new QLineEdit(server_tls_certificate_, dialog);
@@ -351,6 +353,7 @@ void MainWindow::open_start_server_dialog() {
 
     form->addRow(text("server_port"), port);
     form->addRow(text("server_allow_lan"), allow_lan);
+    form->addRow(text("server_enable_https"), https_enabled);
     form->addRow(text("server_join_code"), join_code);
     form->addRow(text("server_admin_password"), admin_password);
     form->addRow(text("server_tls_certificate"), tls_certificate);
@@ -358,6 +361,20 @@ void MainWindow::open_start_server_dialog() {
     form->addRow(text("server_database"), data_path);
     layout->addLayout(form);
     layout->addWidget(warning);
+
+    auto update_tls_fields = [https_enabled, tls_certificate, tls_private_key]() {
+        const bool enabled = https_enabled->isChecked();
+        tls_certificate->setEnabled(enabled);
+        tls_private_key->setEnabled(enabled);
+    };
+    QObject::connect(https_enabled, &QCheckBox::toggled, [this, update_tls_fields](bool enabled) {
+        update_tls_fields();
+        if (enabled) {
+            QMessageBox::warning(this, text("server_https_warning_title"),
+                                 text("server_https_warning"));
+        }
+    });
+    update_tls_fields();
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dialog);
     auto* start_button = buttons->button(QDialogButtonBox::Ok);
@@ -367,19 +384,22 @@ void MainWindow::open_start_server_dialog() {
     close_button->setText(text("close"));
     close_button->setIcon(QIcon());
     QObject::connect(buttons, &QDialogButtonBox::accepted,
-                     [this, dialog, port, allow_lan, join_code, admin_password, tls_certificate,
-                      tls_private_key]() {
+                     [this, dialog, port, allow_lan, https_enabled, join_code, admin_password,
+                      tls_certificate, tls_private_key]() {
                          server_port_ = port->value();
                          server_allow_lan_ = allow_lan->isChecked();
+                         server_https_enabled_ = https_enabled->isChecked();
                          server_join_code_ = join_code->text().trimmed();
                          server_admin_password_ = admin_password->text();
                          server_tls_certificate_ = tls_certificate->text().trimmed();
                          server_tls_private_key_ = tls_private_key->text().trimmed();
                          save_app_settings();
-                         start_local_server(server_port_, server_allow_lan_, server_join_code_,
-                                            server_admin_password_, server_tls_certificate_,
-                                            server_tls_private_key_);
-                         dialog->accept();
+                         if (start_local_server(server_port_, server_allow_lan_,
+                                                 server_https_enabled_, server_join_code_,
+                                                 server_admin_password_, server_tls_certificate_,
+                                                 server_tls_private_key_)) {
+                             dialog->accept();
+                         }
                      });
     QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
     layout->addWidget(buttons);
@@ -387,18 +407,19 @@ void MainWindow::open_start_server_dialog() {
     dialog->show();
 }
 
-void MainWindow::start_local_server(int port, bool allow_lan, const QString& join_code,
-                                    const QString& admin_password, const QString& tls_certificate,
+bool MainWindow::start_local_server(int port, bool allow_lan, bool https_enabled,
+                                    const QString& join_code, const QString& admin_password,
+                                    const QString& tls_certificate,
                                     const QString& tls_private_key) {
     if (join_code.isEmpty() || admin_password.isEmpty()) {
         QMessageBox::warning(this, text("server_start_failed"),
                              text("server_credentials_required"));
-        return;
+        return false;
     }
-    if (allow_lan && (tls_certificate.isEmpty() || tls_private_key.isEmpty())) {
+    if (https_enabled && (tls_certificate.isEmpty() || tls_private_key.isEmpty())) {
         QMessageBox::warning(this, text("server_start_failed"),
-                             text("server_tls_required_for_lan"));
-        return;
+                             text("server_tls_files_required"));
+        return false;
     }
 
     fs::path data_dir;
@@ -411,7 +432,7 @@ void MainWindow::start_local_server(int port, bool allow_lan, const QString& joi
                                    "server database shared memory");
     } catch (const std::exception& ex) {
         QMessageBox::critical(this, text("server_start_failed"), ex.what());
-        return;
+        return false;
     }
 
     auto* process = new QProcess(this);
@@ -423,7 +444,7 @@ void MainWindow::start_local_server(int port, bool allow_lan, const QString& joi
     if (allow_lan) {
         args << "--host" << "0.0.0.0" << "--allow-lan";
     }
-    if (!tls_certificate.isEmpty() || !tls_private_key.isEmpty()) {
+    if (https_enabled) {
         args << "--tls-cert" << tls_certificate << "--tls-key" << tls_private_key;
     }
     process->setArguments(args);
@@ -475,14 +496,11 @@ void MainWindow::start_local_server(int port, bool allow_lan, const QString& joi
         server_process_ = nullptr;
         process->deleteLater();
         update_server_actions();
-        return;
+        return false;
     }
 
     const QString host = allow_lan ? "0.0.0.0" : "127.0.0.1";
-    const QString scheme = (!server_tls_certificate_.isEmpty() &&
-                            !server_tls_private_key_.isEmpty())
-                               ? "https://"
-                               : "http://";
+    const QString scheme = https_enabled ? "https://" : "http://";
     const QString url = scheme + host + ":" + QString::number(port);
     log_->appendPlainText(text("server_started") + ": " + url);
     log_->appendPlainText(text("server_database") + ": " + server_database_display_path());
@@ -490,10 +508,14 @@ void MainWindow::start_local_server(int port, bool allow_lan, const QString& joi
     log_->appendPlainText(text("server_credentials_configured"));
     if (allow_lan) {
         log_->appendPlainText(text("server_lan_warning"));
+        if (!https_enabled) {
+            log_->appendPlainText(text("server_http_warning"));
+        }
     }
     mark_contest_dirty();
     start_server_auto_refresh();
     update_server_actions();
+    return true;
 }
 
 void MainWindow::stop_local_server(bool log_message) {
@@ -531,6 +553,8 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
     port->setValue(server_port_);
     auto* allow_lan = new QCheckBox(tab);
     allow_lan->setChecked(server_allow_lan_);
+    auto* https_enabled = new QCheckBox(tab);
+    https_enabled->setChecked(server_https_enabled_);
     auto* secure_password_storage = new QCheckBox(tab);
     secure_password_storage->setChecked(server_secure_password_storage_);
     auto* enable_ranking = new QCheckBox(tab);
@@ -550,6 +574,7 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
 
     form->addRow(text("server_port"), port);
     form->addRow(text("server_allow_lan"), allow_lan);
+    form->addRow(text("server_enable_https"), https_enabled);
     form->addRow(text("server_secure_password_storage"), secure_password_storage);
     form->addRow(text("server_enable_ranking"), enable_ranking);
     form->addRow(text("server_enable_contestant_details"), enable_details);
@@ -561,8 +586,23 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
     form->addRow(warning);
     form->addRow(save);
 
+    auto update_tls_fields = [https_enabled, tls_certificate, tls_private_key]() {
+        const bool enabled = https_enabled->isChecked();
+        tls_certificate->setEnabled(enabled);
+        tls_private_key->setEnabled(enabled);
+    };
+    QObject::connect(https_enabled, &QCheckBox::toggled, [this, update_tls_fields](bool enabled) {
+        update_tls_fields();
+        if (enabled) {
+            QMessageBox::warning(this, text("server_https_warning_title"),
+                                 text("server_https_warning"));
+        }
+    });
+    update_tls_fields();
+
     auto persist = [this, port, allow_lan, secure_password_storage, enable_ranking, enable_details,
-                    join_code, admin_password, tls_certificate, tls_private_key](bool notify) {
+                    https_enabled, join_code, admin_password, tls_certificate,
+                    tls_private_key](bool notify) {
         const QString join = join_code->text().trimmed();
         const QString admin = admin_password->text();
         if (join.isEmpty() || admin.isEmpty()) {
@@ -571,6 +611,7 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
         }
         const bool changed = server_port_ != port->value() ||
                              server_allow_lan_ != allow_lan->isChecked() ||
+                             server_https_enabled_ != https_enabled->isChecked() ||
                              server_secure_password_storage_ != secure_password_storage->isChecked() ||
                              server_ranking_enabled_ != enable_ranking->isChecked() ||
                              server_contestant_details_enabled_ != enable_details->isChecked() ||
@@ -585,6 +626,7 @@ QWidget* MainWindow::build_server_settings_tab(QWidget* parent, SettingsDialog* 
         }
         server_port_ = port->value();
         server_allow_lan_ = allow_lan->isChecked();
+        server_https_enabled_ = https_enabled->isChecked();
         server_secure_password_storage_ = secure_password_storage->isChecked();
         server_ranking_enabled_ = enable_ranking->isChecked();
         server_contestant_details_enabled_ = enable_details->isChecked();

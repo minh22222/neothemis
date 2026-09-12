@@ -780,10 +780,6 @@ public:
         if (!config_.allow_lan && !config_.host.isLoopback()) {
             throw std::runtime_error("refusing non-loopback bind without --allow-lan");
         }
-        if (config_.allow_lan && !config_.tls_enabled()) {
-            throw std::runtime_error(
-                "LAN access requires TLS; provide --tls-cert and --tls-key");
-        }
         QTcpServer* listener = &tcp_server_;
         if (config_.tls_enabled()) {
             tls_server_.setSslConfiguration(tls_configuration_);
@@ -818,6 +814,9 @@ public:
         }
         if (!config_.host.isLoopback()) {
             std::cout << "LAN mode is enabled. Run this inside a trusted network only.\n";
+            if (!config_.tls_enabled()) {
+                std::cout << "WARNING: HTTPS is disabled; network traffic is unencrypted.\n";
+            }
         }
     }
 
@@ -1962,9 +1961,9 @@ void print_usage() {
         << "  --admin-user <name>       Admin username. Default: admin\n"
         << "  --admin-password <pass>   Admin password. Generated on first run if omitted\n"
         << "  --join-code <code>        Contestant registration code. Generated if omitted\n"
-        << "  --allow-lan               Allow network clients; requires TLS certificate and key\n"
-        << "  --tls-cert <file>         PEM certificate used for HTTPS\n"
-        << "  --tls-key <file>          PEM private key used for HTTPS\n"
+        << "  --allow-lan               Allow network clients (HTTP unless TLS files are supplied)\n"
+        << "  --tls-cert <file>         PEM certificate; enables HTTPS when paired with --tls-key\n"
+        << "  --tls-key <file>          PEM private key; enables HTTPS when paired with --tls-cert\n"
         << "  --secure-password-storage Store account passwords as PBKDF2 hashes\n";
 }
 
@@ -2044,10 +2043,6 @@ AppConfig parse_args(const QStringList& args) {
     config.tls_private_key = config.tls_private_key.empty()
                                  ? fs::path()
                                  : fs::absolute(config.tls_private_key);
-    if (config.allow_lan && !config.tls_enabled()) {
-        throw std::runtime_error(
-            "LAN access requires HTTPS; provide --tls-cert and --tls-key");
-    }
     return config;
 }
 

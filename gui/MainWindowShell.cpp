@@ -724,6 +724,7 @@ void MainWindow::load_app_settings() {
     }
     server_port_ = std::clamp(settings.value("server_port", 8080).toInt(), 1024, 65535);
     server_allow_lan_ = settings.value("server_allow_lan", false).toBool();
+    server_https_enabled_ = settings.value("server_https_enabled", false).toBool();
     server_secure_password_storage_ =
         settings.value("server_secure_password_storage", false).toBool();
     server_join_code_ = settings.value("server_join_code").toString().trimmed();
@@ -764,6 +765,7 @@ void MainWindow::save_app_settings() const {
     settings.setValue("temporary_dir", qstring_from_path(temporary_dir_));
     settings.setValue("server_port", server_port_);
     settings.setValue("server_allow_lan", server_allow_lan_);
+    settings.setValue("server_https_enabled", server_https_enabled_);
     settings.setValue("server_secure_password_storage", server_secure_password_storage_);
     settings.setValue("server_join_code", server_join_code_);
     settings.setValue("server_admin_password", server_admin_password_);

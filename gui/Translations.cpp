@@ -37,6 +37,7 @@ const UiTextEntry kUiText[] = {
      u8"Máy chủ chấm cục bộ đang chạy."},
     {"server_port", "Port", u8"Cổng"},
     {"server_allow_lan", "Allow LAN access", u8"Cho phép truy cập LAN"},
+    {"server_enable_https", "Enable HTTPS", u8"Bật HTTPS"},
     {"server_secure_password_storage", "Secure password storage (PBKDF2)",
      u8"Lưu mật khẩu an toàn (PBKDF2)"},
     {"server_tls_certificate", "TLS certificate (PEM)", u8"Chứng chỉ TLS (PEM)"},
@@ -51,11 +52,11 @@ const UiTextEntry kUiText[] = {
     {"server_users", "Server Users", u8"Người dùng máy chủ"},
     {"server_settings_help",
      "Server accounts, submissions, and jobs are stored in the open contest folder under "
-     ".neothemis-server. Password storage can be enabled with PBKDF2; LAN access requires TLS "
-     "certificate and private key files.",
+     ".neothemis-server. Password storage can be enabled with PBKDF2. HTTPS is optional and "
+     "is off by default; HTTP LAN traffic is unencrypted.",
      u8"Tài khoản, bài nộp và tác vụ máy chủ được lưu trong thư mục kỳ thi đang mở dưới "
-     u8".neothemis-server. Có thể bật lưu mật khẩu bằng PBKDF2; truy cập LAN yêu cầu tệp chứng chỉ "
-     u8"và khóa riêng TLS."},
+     u8".neothemis-server. Có thể bật lưu mật khẩu bằng PBKDF2. HTTPS là tùy chọn và mặc định "
+     u8"tắt; lưu lượng HTTP qua LAN không được mã hóa."},
     {"save_server_settings", "Save Server Settings", u8"Lưu cài đặt máy chủ"},
     {"saved_server_settings", "Saved server settings.", u8"Đã lưu cài đặt máy chủ."},
     {"server_enable_ranking", "Enable web ranking", u8"Bật bảng xếp hạng web"},
@@ -111,15 +112,23 @@ const UiTextEntry kUiText[] = {
     {"created_at", "Created", u8"Đã tạo"},
     {"server_security_warning",
      "LAN mode lets other devices submit C++ to this machine. Use a trusted network or an isolated "
-     "VM/container.",
+     "VM/container. HTTPS is optional; when disabled, login credentials and submissions are sent "
+     "without transport encryption.",
      u8"Chế độ LAN cho phép thiết bị khác gửi C++ vào máy này. Hãy dùng mạng tin cậy hoặc "
-     u8"VM/container cô lập."},
+     u8"VM/container cô lập. HTTPS là tùy chọn; khi tắt, thông tin đăng nhập và bài nộp được gửi "
+     u8"mà không mã hóa kết nối."},
     {"server_start_failed", "Server start failed", u8"Khởi động máy chủ thất bại"},
     {"server_process_error", "Server process error", u8"Lỗi tiến trình máy chủ"},
     {"server_credentials_required", "Join code and admin password are required.",
      u8"Cần mã tham gia và mật khẩu quản trị."},
-    {"server_tls_required_for_lan", "LAN access requires a TLS certificate and private key.",
-     u8"Truy cập LAN yêu cầu chứng chỉ và khóa riêng TLS."},
+    {"server_tls_files_required", "HTTPS requires both a PEM certificate and private key.",
+     u8"HTTPS yêu cầu cả chứng chỉ PEM và khóa riêng."},
+    {"server_https_warning_title", "HTTPS certificate warning", u8"Cảnh báo chứng chỉ HTTPS"},
+    {"server_https_warning",
+     "A client browser may show a security warning if this certificate is not trusted. "
+     "Some browsers let the client continue; installing a trusted certificate avoids the warning.",
+     u8"Trình duyệt của thiết bị khách có thể hiển thị cảnh báo bảo mật nếu không tin cậy chứng chỉ "
+     u8"này. Một số trình duyệt cho phép tiếp tục; cài chứng chỉ đáng tin cậy sẽ tránh cảnh báo."},
     {"server_credentials_configured", "Server credentials configured.",
      u8"Đã cấu hình thông tin đăng nhập máy chủ."},
     {"server_password_hidden", "Stored securely", u8"Đã lưu an toàn"},
@@ -127,6 +136,9 @@ const UiTextEntry kUiText[] = {
     {"server_lan_warning",
      "LAN server is exposed to the network. Use only on a trusted or isolated network.",
      u8"Máy chủ LAN đang mở ra mạng. Chỉ dùng trên mạng tin cậy hoặc cô lập."},
+    {"server_http_warning",
+     "HTTPS is disabled. Login credentials and submissions travel without transport encryption.",
+     u8"HTTPS đang tắt. Thông tin đăng nhập và bài nộp truyền đi không có mã hóa kết nối."},
     {"server_crashed", "Server crashed", u8"Máy chủ bị lỗi"},
     {"server_stopped", "Server stopped", u8"Máy chủ đã dừng"},
     {"stopping_server", "Stopping server...", u8"Đang dừng máy chủ..."},

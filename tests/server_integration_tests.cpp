@@ -232,6 +232,8 @@ int main(int argc, char** argv) {
             process->start(QString::fromLocal8Bit(argv[1]),
                            {"--contest", QString::fromStdString(contest.string()),
                             "--data", QString::fromStdString(data.string()),
+                            "--host", "0.0.0.0",
+                            "--allow-lan",
                             "--port", QString::number(port),
                             "--join-code", "integration-code",
                             "--admin-password", "integration-admin"});
